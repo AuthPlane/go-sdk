@@ -1,0 +1,70 @@
+version: 2
+
+updates:
+  # Go SDK core module
+  - package-ecosystem: gomod
+    directory: /core
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      gomod-all:
+        patterns:
+          - "*"
+
+  # Go SDK http adapter
+  - package-ecosystem: gomod
+    directory: /http
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      gomod-all:
+        patterns:
+          - "*"
+
+  # Go SDK MCP adapter
+  - package-ecosystem: gomod
+    directory: /mcp
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      gomod-all:
+        patterns:
+          - "*"
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 5
+    groups:
+      actions-all:
+        patterns:
+          - "*"

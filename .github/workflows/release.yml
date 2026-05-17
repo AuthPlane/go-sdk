@@ -1,0 +1,343 @@
+name: Release
+
+# Step 2 of the single-branch release: take the stabilized release/v* or
+# hotfix/v* branch, bump `require core vX.Y.Z` in mcp/http, run
+# `go mod tidy`, run tests (incl. conformance), commit, tag the four
+# refs, atomic-push the branch + tags, create the GitHub Release, and
+# delete the source branch on success.
+#
+# There is no merge into the default branch and no external-registry
+# publish step. `proxy.golang.org` polls tags and serves the new module
+# versions within seconds of the push — the atomic tag push IS the
+# publish.
+#
+# The require-bump commit lives only on the release branch (now
+# deleted). It is reachable from the four annotated tags, so the proxy
+# resolves byte-identical hashes when consumers `go get` any of them.
+# The default branch keeps its `require core v0.0.0` placeholder; the
+# go.work + replace directive cover local dev.
+#
+# Branch conventions:
+#   - release/v<X.Y.Z>: current-line release off the default branch.
+#   - hotfix/v<X.Y.Z>: patch for an older minor line. The workflow refuses
+#     dispatch unless (branch.major, branch.minor) is strictly older than
+#     the default branch's latest v<X.Y.Z> tag — current-line patches must
+#     use release/v*.
+#
+# Default-branch propagation is NOT handled here. Stabilization fixes that
+# landed on the release branch (and current-line hotfixes) reach the
+# default branch via the Backport fixes workflow
+# (.github/workflows/backport-fixes.yml) or scripts/backport-fixes.sh
+# run locally — a cherry-pick-based mechanism that preserves per-fix
+# attribution.
+#
+# Trigger: maintainer dispatches from the Actions UI with a release/v*
+# or hotfix/v* branch selected. Branch name is the source of truth for
+# the version that will become the tags.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: 'Dry run: stage require-bump, tidy, tests, create local tags; skip atomic push, GitHub Release, and branch deletion.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse if not dispatched from a release/v* or hotfix/v* branch
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ ! "$ref" =~ ^(release|hotfix)/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::This workflow must be dispatched from a release/v<X.Y.Z> or hotfix/v<X.Y.Z> branch (got: $ref)"
+            exit 1
+          fi
+          echo "Dispatched from $ref"
+
+      # Fail fast if the AuthPlane Release Bot App secrets aren't available
+      # (e.g. a fork or unconfigured clone). The token-mint step would
+      # otherwise fail with a generic actions/create-github-app-token error.
+      - name: Refuse if Release Bot secrets are missing
+        env:
+          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$APP_ID" || -z "$PRIVATE_KEY" ]]; then
+            echo "::error::Release Bot App secrets (RELEASE_BOT_APP_ID / RELEASE_BOT_PRIVATE_KEY) are unavailable in this run. They live as AuthPlane org secrets scoped to the OSS release repo; forks and unconfigured clones cannot run release.yml end-to-end and must follow the manual tagging fallback."
+            exit 1
+          fi
+
+      # Tag/branch rulesets reject GHA bot pushes for v* tags. Mint a
+      # short-lived installation token for the AuthPlane Release Bot App
+      # (bypass actor on the ruleset) and pass it to checkout so the
+      # atomic push and source-branch delete use the App's identity.
+      - name: Mint release-bot token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Check out repo with full history and all tags
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Check out shared conformance catalog
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: AuthPlane/conformance
+          path: conformance
+          fetch-depth: 1
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: '1.25'
+
+      - name: Derive version from branch name
+        id: version
+        run: |
+          ref="${{ github.ref_name }}"
+          version="${ref##*/v}"
+          {
+            echo "version=$version"
+            echo "coreTag=core/v$version"
+            echo "mcpTag=mcp/v$version"
+            echo "httpTag=http/v$version"
+            echo "versionTag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if any of the four tags already exist
+        run: |
+          for tag in \
+              "${{ steps.version.outputs.coreTag }}" \
+              "${{ steps.version.outputs.mcpTag }}" \
+              "${{ steps.version.outputs.httpTag }}" \
+              "${{ steps.version.outputs.versionTag }}"; do
+            if git ls-remote --exit-code --tags origin "$tag" >/dev/null; then
+              echo "::error::Tag $tag already exists. Aborting."
+              exit 1
+            fi
+          done
+
+      # hotfix/v* is reserved for patches to an older minor line. Refuse
+      # dispatch if the branch's (major, minor) is not strictly less than
+      # the default branch's latest released (major, minor). Current-line
+      # patches should use release/v*, not hotfix/v*.
+      - name: Refuse if hotfix branch is not strictly an older-line patch
+        if: startsWith(github.ref_name, 'hotfix/')
+        run: |
+          default="${{ github.event.repository.default_branch }}"
+          git fetch origin "$default" --tags --no-recurse-submodules
+          if ! main_tag=$(git describe --tags --abbrev=0 "origin/$default" --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null); then
+            echo "::error::Cannot determine $default's latest tag — has a release ever shipped? If not, use release/v* for the first release."
+            exit 1
+          fi
+          echo "$default's latest tag: $main_tag"
+
+          if ! [[ "$main_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::$default's latest tag '$main_tag' does not match vX.Y.Z."
+            exit 1
+          fi
+          main_major="${BASH_REMATCH[1]}"
+          main_minor="${BASH_REMATCH[2]}"
+
+          v="${{ steps.version.outputs.version }}"
+          [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          br_major="${BASH_REMATCH[1]}"
+          br_minor="${BASH_REMATCH[2]}"
+
+          if (( br_major > main_major )) || { (( br_major == main_major )) && (( br_minor >= main_minor )); }; then
+            echo "::error::hotfix/v${v} is on line v${br_major}.${br_minor}, which is not strictly older than $default's line v${main_major}.${main_minor}."
+            echo "::error::Current-line patches must use release/v*, not hotfix/v*."
+            exit 1
+          fi
+          echo "Confirmed older-line patch: v${br_major}.${br_minor} < v${main_major}.${main_minor}"
+
+      - name: Verify CHANGELOG entry exists for this version
+        run: |
+          if ! grep -q "^## \[${{ steps.version.outputs.version }}\]" CHANGELOG.md 2>/dev/null; then
+            echo "::error::CHANGELOG.md has no entry for ## [${{ steps.version.outputs.version }}]"
+            exit 1
+          fi
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Install golangci-lint and vet/lint all three modules before any
+      # state-mutating steps. A linting failure here leaves the workspace
+      # clean (no partial go.mod edits to roll back).
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.11.4
+          install-only: true
+
+      - name: Vet and lint all three modules
+        run: |
+          for mod in core mcp http; do
+            (cd "$mod" && go vet ./...)
+            (cd "$mod" && golangci-lint run ./...)
+          done
+
+      # Bump require core in mcp and http, then go mod tidy. go.work + the
+      # replace directive mean go mod tidy resolves core locally, so the
+      # hash it writes matches what proxy.golang.org will later serve from
+      # the about-to-be-created core/vX.Y.Z tag. Consumers get
+      # byte-identical checksums.
+      - name: Bump require core in mcp and http, then go mod tidy
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for mod in mcp http; do
+            (cd "$mod" && go mod edit -require=github.com/authplane/go-sdk/core@v"$v" && go mod tidy)
+          done
+
+      - name: Run tests in all three modules
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          (cd core && go test ./...)
+          (cd mcp  && go test ./...)
+          (cd http && go test ./...)
+
+      # Single release commit on the release/hotfix branch containing the
+      # require bumps. Tag points at this commit. Lives only on the
+      # release branch (deleted after publish) — never reaches the default
+      # branch. Reachable from the four annotated tags so proxy.golang.org
+      # serves it correctly.
+      - name: Commit require-bumps on the release branch
+        run: |
+          git add -A
+          git commit --allow-empty -m "release: v${{ steps.version.outputs.version }}"
+
+      - name: Capture release commit SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create four annotated tags locally
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          git tag -a "core/v$v" -m "core v$v"
+          git tag -a "mcp/v$v"  -m "mcp v$v"
+          git tag -a "http/v$v" -m "http v$v"
+          git tag -a "v$v"      -m "Release v$v"
+
+      # --- Everything below this point mutates the remote or external state. ---
+      # Dry-run short-circuit: report and skip the mutating phase. The local
+      # state (release commit + four tags on the runner) is verified but
+      # thrown away when the runner tears down.
+      - name: Dry run short-circuit notice
+        if: ${{ inputs.dryRun }}
+        run: |
+          echo "::notice::Dry run — skipping atomic push, GitHub Release, and branch deletion. Require-bump, tidy, tests, and local tag creation all succeeded. Would-be released commit: ${{ steps.sha.outputs.sha }}"
+
+      # Atomic push of the release/hotfix branch tip (with the release
+      # commit) + four tags. Either everything lands or nothing does.
+      # The branch is listed first so the commit referenced by the tags
+      # exists on the remote after the transaction.
+      - name: Atomic push of release branch and four tags
+        if: ${{ !inputs.dryRun }}
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          git push --atomic origin \
+            "$GITHUB_REF_NAME" \
+            "core/v$v" "mcp/v$v" "http/v$v" "v$v"
+          echo "::notice::Released commit: ${{ steps.sha.outputs.sha }}"
+
+      # --------- From here on, the release is live on proxy.golang.org. ---------
+      # proxy.golang.org polls tags and will serve the new module versions
+      # within seconds. The steps below (release notes, GitHub Release entry,
+      # branch delete) are best-effort: if they fail, the module versions
+      # are still published.
+
+      - name: Extract CHANGELOG entry for release notes
+        if: ${{ !inputs.dryRun }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          {
+            echo "_Released commit: \`$sha\`_"
+            echo ""
+            awk "/^## \[$version\]/{flag=1;next} /^## \[/{flag=0} flag" CHANGELOG.md
+          } > /tmp/release-notes.md
+          # If CHANGELOG extraction returned nothing beyond the SHA line, add a fallback.
+          if [[ $(wc -l < /tmp/release-notes.md) -le 2 ]]; then
+            echo "See CHANGELOG.md for details." >> /tmp/release-notes.md
+          fi
+
+      # Single GitHub Release per version, anchored at the umbrella vX.Y.Z
+      # tag so the Releases sidebar shows one entry. Intentionally omits
+      # `--target` — the tag already points at the correct commit on the
+      # release branch (which exists on the remote until the next step
+      # deletes it; the tag keeps the commit alive).
+      - name: Create GitHub Release
+        if: ${{ !inputs.dryRun }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.versionTag }}" \
+            --title "${{ steps.version.outputs.versionTag }}" \
+            --notes-file /tmp/release-notes.md
+
+      # Delete the source branch (release/v* or hotfix/v*) on success.
+      # Branch protection (when enabled later) must allow the bot to
+      # delete this branch. If this fails, warn loudly but do not fail
+      # the workflow — the release is already live.
+      - name: Delete source branch on remote
+        if: ${{ !inputs.dryRun }}
+        continue-on-error: true
+        id: delete
+        run: |
+          git push origin --delete "$GITHUB_REF_NAME"
+
+      - name: Warn if delete failed
+        if: ${{ !inputs.dryRun && steps.delete.outcome == 'failure' }}
+        run: |
+          echo "::warning::Source branch delete failed. Run manually: git push origin --delete $GITHUB_REF_NAME"
+
+      - name: Summary
+        if: always()
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          if [[ "${{ inputs.dryRun }}" == "true" ]]; then
+            {
+              echo "### Dry run complete"
+              echo ""
+              echo "- **Version**: \`$v\` (not published)"
+              echo "- **Would-be released commit**: \`$sha\`"
+              echo "- Require-bump, tidy, tests, local commit, and local tag creation — all succeeded."
+              echo "- Atomic push, GitHub Release, and branch delete were skipped."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Release published"
+              echo ""
+              echo "- **Version**: \`$v\`"
+              echo "- **Released commit**: \`$sha\`"
+              echo "- **Tags pushed**: \`core/v$v\`, \`mcp/v$v\`, \`http/v$v\`, \`v$v\`"
+              echo "- **Go module proxy**: https://proxy.golang.org/github.com/authplane/go-sdk/core/@v/v$v.info"
+              echo "- **GitHub Release**: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v$v"
+              if [[ "${{ steps.delete.outcome }}" != "success" ]]; then
+                echo ""
+                echo "⚠️ **Branch delete failed — run manually:** \`git push origin --delete $GITHUB_REF_NAME\`"
+              fi
+              echo ""
+              echo "**Follow-up:**"
+              echo "- If any commits on this branch should reach the default branch, dispatch **Backport fixes** with \`fromBranch=v$v\` (the tag — the branch is deleted)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

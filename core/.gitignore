@@ -1,0 +1,6 @@
+conformance-report.json
+conformance-report.md
+docs/superpowers/
+cover.out
+coverage.out
+*.test

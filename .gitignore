@@ -1,0 +1,15 @@
+go.work.sum
+
+# Conformance test harness outputs (regenerated each run; not source).
+conformance-report.json
+conformance-report.md
+
+# Local environment files (demo credentials, etc.)
+.env
+.env.local
+
+# Local superpowers workspace (plans/specs not part of the repo)
+docs/superpowers/
+
+# Local pre-launch audit — embeds legacy-name strings; stays out of the tree.
+scripts/preflip-audit.sh

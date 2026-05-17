@@ -1,0 +1,98 @@
+# Authplane Go SDK — LLM Guide
+
+Short guide. For complete context and detailed examples, read `llm-full.txt`.
+
+## What this repo provides
+
+A Go workspace containing the framework-agnostic Authplane SDK and two
+framework adapters for protecting MCP servers and OAuth 2.1 resource servers
+with tokens issued by an Authplane authorization server.
+
+Modules:
+- `core/` — module `github.com/authplane/go-sdk/core` — metadata + JWKS
+  discovery and caching, token verification, scope checks, DPoP, OAuth helpers
+  (client credentials, token exchange, introspection, revocation), circuit
+  breaker, stateful token cache.
+- `mcp/` — module `github.com/authplane/go-sdk/mcp` — thin adapter for the
+  official MCP Go SDK's HTTP transport.
+- `http/` — module `github.com/authplane/go-sdk/http` — `net/http` middleware
+  with DPoP sender-constrained token support.
+
+## First files to read
+
+- `README.md` (root) — overview and layout
+- `core/README.md`, `core/go.mod`, `core/authplane/` (public facade)
+- `core/resource/`, `core/resource/verifier/`
+- `mcp/README.md`, `mcp/pkg/authplanemcp/`
+- `http/README.md`, `http/pkg/authplanehttp/`
+
+## Architecture rules
+
+- All protocol verification and AS interaction lives in `core/`.
+- Adapters (`mcp/`, `http/`) are thin: they translate framework request
+  contexts into core-verifier calls and translate core errors into framework
+  responses.
+- Keep MCP and HTTP adapter behavior aligned where equivalent.
+- Do not duplicate shared behavior across modules — put it in `core/`.
+- Keep protocol helpers stateless; keep cache/resilience/orchestration in
+  stateful client structures.
+
+## Minimal usage example
+
+```go
+import (
+    "context"
+
+    "github.com/authplane/go-sdk/core/authplane"
+    "github.com/authplane/go-sdk/core/resource"
+)
+
+ctx := context.Background()
+
+client, err := authplane.NewClient(ctx, "https://auth.example.com",
+    authplane.WithClientCredentials("my-client", "s3cret"),
+)
+if err != nil { panic(err) }
+defer client.Close()
+
+res, err := client.Resource("https://api.example.com",
+    resource.WithScopes("tools/read"),
+)
+if err != nil { panic(err) }
+
+claims, err := res.VerifyToken(ctx, token)
+```
+
+For a runnable end-to-end example see `http/demo/` (net/http resource server)
+or `mcp/demo/` (MCP adapter using the official MCP Go SDK).
+
+## Key public types
+
+- `authplane.Client` — owns AS metadata + JWKS caches, token cache, circuit
+  breaker, DPoP signer. Construct with `NewClient`; tear down with `Close()`.
+- `authplane.FetchSettings` — SSRF / HTTP transport tuning. Use
+  `DefaultFetchSettings()` (production) or `DevModeFetchSettings()` (local
+  dev) and pass via `WithFetchSettings(...)`. Env var
+  `AUTHPLANE_DEV_MODE=1` selects dev settings without code changes.
+- `resource.Resource` — protected-resource facade. Verifies tokens via
+  `VerifyToken(ctx, token, opts...)`; emits RFC 9728 PRM via `PRMJSON()` /
+  `WellKnownPRMPath()`.
+- `verifier.VerifiedClaims` — validated JWT claims (sub, client_id,
+  scopes, audience, exp, etc.). For DPoP-bound tokens, `DPoPProof()`
+  returns the validated `*VerifiedDPoPProof` (jti, htm, htu, iat,
+  KeyThumbprint, nonce); nil for bearer tokens.
+- `authplane.DPoPSigner` / `DPoPKeyMaterial` — outbound DPoP proof
+  generation with automatic nonce-retry.
+- `verifier.DPoPReplayStore` — pluggable inbound replay detection
+  (`InMemoryDPoPReplayStore` provided; supply a Redis-backed impl for
+  multi-replica deployments).
+
+## Go version floor
+
+- `core/`, `http/`: Go 1.24+.
+- `mcp/`: Go 1.25+ (forced by `github.com/modelcontextprotocol/go-sdk`).
+
+## Cross-repo references
+
+- Authplane authorization server: `https://github.com/AuthPlane/authserver`
+- Conformance catalog: `https://github.com/AuthPlane/conformance`

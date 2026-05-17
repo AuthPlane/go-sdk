@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each module's Go version is taken from its own go.mod (toolchain
+        # directive preferred, falls back to go directive) — see Setup Go
+        # step below. Keeps ci.yml and the go.mod files from drifting.
+        module:
+          - core
+          - mcp
+          - http
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Only core consumes the catalog (mcp/http have no conformance suite).
+      - name: Check out shared conformance catalog
+        if: matrix.module == 'core'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: AuthPlane/conformance
+          path: conformance
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          # v6 reads both the `go` and `toolchain` directives from the file;
+          # if `toolchain` is present, that version is installed.
+          go-version-file: "${{ matrix.module }}/go.mod"
+          # Fetch the latest patch matching the directive even when an older
+          # patch is pre-installed on the runner, so security-relevant stdlib
+          # fixes land without waiting for a runner image refresh.
+          check-latest: true
+          cache-dependency-path: "${{ matrix.module }}/go.sum"
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      # golangci-lint runs per module — it doesn't traverse go.work. The
+      # repo-root .golangci.yml is picked up automatically via config
+      # walk-up from each module directory.
+      - name: Lint
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.11.4
+          working-directory: ${{ matrix.module }}
+
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          # Per-module coverage floors. Adapters (http, mcp) are thinner than
+          # core so their floors are lower, but they still need a floor to
+          # prevent silent regressions when wiring or error mapping changes.
+          case "${{ matrix.module }}" in
+            core) FLOOR=80 ;;
+            http) FLOOR=70 ;;
+            mcp)  FLOOR=60 ;;
+            *)    FLOOR=0  ;;
+          esac
+          if [ "${{ matrix.module }}" = "core" ]; then
+            # core excludes conformancetests/ from the coverage measurement —
+            # it's a test-surface-area package, not production code — and
+            # runs it separately below so the harness emits its report.
+            go list ./... | awk '!/\/conformancetests$/' | xargs -r go test -race -coverprofile=coverage.out
+            go test ./conformancetests/ -v
+          else
+            # Adapters exclude their demo/ package — runnable examples, not
+            # production code — so it does not drag down the coverage total.
+            go list ./... | awk '!/\/demo$/' | xargs -r go test -race -coverprofile=coverage.out
+          fi
+          go tool cover -func=coverage.out \
+            | awk -v floor="$FLOOR" '/^total:/ { gsub("%","",$3); if ($3+0 < floor+0) { printf("Coverage %.2f below %.2f\n", $3, floor); exit 1 } }'
+
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
