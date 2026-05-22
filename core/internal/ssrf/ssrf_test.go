@@ -399,6 +399,74 @@ func TestFormatIPForURL(t *testing.T) {
 	}
 }
 
+func TestHostHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		v    ValidatedURL
+		want string
+	}{
+		{"https default port omitted", ValidatedURL{Scheme: "https", Host: "auth.example.com", Port: 443}, "auth.example.com"},
+		{"http default port omitted", ValidatedURL{Scheme: "http", Host: "example.com", Port: 80}, "example.com"},
+		{"https non-default port included", ValidatedURL{Scheme: "https", Host: "auth.example.com", Port: 9000}, "auth.example.com:9000"},
+		{"http non-default port included", ValidatedURL{Scheme: "http", Host: "localhost", Port: 9000}, "localhost:9000"},
+		{"ipv6 literal bracketed with port", ValidatedURL{Scheme: "http", Host: "::1", Port: 9000}, "[::1]:9000"},
+		{"ipv6 literal bracketed default port", ValidatedURL{Scheme: "https", Host: "::1", Port: 443}, "[::1]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostHeader(tc.v); got != tc.want {
+				t.Errorf("hostHeader() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSSRFSafeGet_PinnedMode_HostHeaderIncludesPort is the regression test for
+// the pinned Host header: it must carry the non-default port so an Authorization
+// Server reconstructing the request URI (RFC 9110 §7.2) sees the same authority
+// as the DPoP proof's htu (RFC 9449). httptest serves on 127.0.0.1:<ephemeral-port>,
+// which is never 80/443.
+func TestSSRFSafeGet_PinnedMode_HostHeaderIncludesPort(t *testing.T) {
+	var receivedHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	wantHost := strings.TrimPrefix(server.URL, "http://")
+	settings := DevModeFetchSettings()
+	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, nil, MaxJWKSSize); err != nil {
+		t.Fatalf("pinnedGet should succeed: %v", err)
+	}
+	if receivedHost != wantHost {
+		t.Errorf("Host header = %q, want %q (port must be preserved for DPoP htu)", receivedHost, wantHost)
+	}
+}
+
+// TestSSRFSafePost_PinnedMode_HostHeaderIncludesPort covers the DPoP-relevant
+// path: a token-endpoint POST to an AS on a non-default port must send the port
+// in the Host header.
+func TestSSRFSafePost_PinnedMode_HostHeaderIncludesPort(t *testing.T) {
+	var receivedHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	wantHost := strings.TrimPrefix(server.URL, "http://")
+	settings := DevModeFetchSettings()
+	opts := PostOptions{
+		FormData: map[string][]string{"grant_type": {"client_credentials"}},
+		MaxSize:  MaxMetadataSize,
+	}
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+		t.Fatalf("pinnedPost should succeed: %v", err)
+	}
+	if receivedHost != wantHost {
+		t.Errorf("Host header = %q, want %q (port must be preserved for DPoP htu)", receivedHost, wantHost)
+	}
+}
+
 func TestParseJSONResponse_Valid(t *testing.T) {
 	resp := &HTTPResponse{Body: []byte(`{"issuer":"https://auth.example.com"}`)}
 	var result map[string]any
@@ -620,5 +688,224 @@ func TestSSRFSafeGet_DevModeAllowsLocalhost(t *testing.T) {
 	}
 	if resp.Status != 200 {
 		t.Errorf("expected 200, got %d", resp.Status)
+	}
+}
+
+// newIPv6LoopbackServer starts an httptest server bound to the IPv6 loopback
+// ([::1]) so the pinned-mode Host-header path is exercised with a bracketed
+// IPv6 authority (RFC 3986 §3.2.2). Skips if IPv6 loopback is unavailable.
+func newIPv6LoopbackServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	var lc net.ListenConfig
+	l, err := lc.Listen(context.Background(), "tcp", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(handler)
+	_ = srv.Listener.Close()
+	srv.Listener = l
+	srv.Start()
+	return srv
+}
+
+// TestSSRFSafeGet_PinnedMode_IPv6HostHeaderBracketed is the IPv6 companion to
+// the Host-header regression test: an IPv6 literal must reach the wire bracketed
+// and with its non-default port, e.g. Host: [::1]:<port>.
+func TestSSRFSafeGet_PinnedMode_IPv6HostHeaderBracketed(t *testing.T) {
+	var receivedHost string
+	server := newIPv6LoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	wantHost := strings.TrimPrefix(server.URL, "http://")
+	settings := DevModeFetchSettings()
+	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, nil, MaxJWKSSize); err != nil {
+		t.Fatalf("pinnedGet should succeed: %v", err)
+	}
+	if receivedHost != wantHost {
+		t.Errorf("Host header = %q, want %q (IPv6 literal must be bracketed with port)", receivedHost, wantHost)
+	}
+}
+
+func TestSSRFSafePost_PinnedMode_IPv6HostHeaderBracketed(t *testing.T) {
+	var receivedHost string
+	server := newIPv6LoopbackServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHost = r.Host
+		w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	wantHost := strings.TrimPrefix(server.URL, "http://")
+	settings := DevModeFetchSettings()
+	// MaxSize left zero to exercise the default-size branch in pinnedPost.
+	opts := PostOptions{FormData: map[string][]string{"grant_type": {"client_credentials"}}}
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+		t.Fatalf("pinnedPost should succeed: %v", err)
+	}
+	if receivedHost != wantHost {
+		t.Errorf("Host header = %q, want %q (IPv6 literal must be bracketed with port)", receivedHost, wantHost)
+	}
+}
+
+// TestSSRFSafeGet_UnprotectedMode covers the unsafeGet path (SSRFProtection
+// disabled), including the nil-client default-client construction.
+func TestSSRFSafeGet_UnprotectedMode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxMetadataSize)
+	if err != nil {
+		t.Fatalf("unprotected GET should succeed: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Errorf("expected 200, got %d", resp.Status)
+	}
+}
+
+// TestSSRFSafePost_UnprotectedMode covers the unsafePost path, the form-encoding
+// branch, extra headers, and the default-size branch (MaxSize left zero).
+func TestSSRFSafePost_UnprotectedMode(t *testing.T) {
+	var gotCT, gotXHdr string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		gotXHdr = r.Header.Get("X-Test")
+		fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	opts := PostOptions{
+		FormData:     map[string][]string{"grant_type": {"client_credentials"}},
+		ExtraHeaders: map[string]string{"X-Test": "v"},
+	}
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+		t.Fatalf("unprotected POST should succeed: %v", err)
+	}
+	if gotCT != "application/x-www-form-urlencoded" {
+		t.Errorf("Content-Type = %q, want form-urlencoded", gotCT)
+	}
+	if gotXHdr != "v" {
+		t.Errorf("X-Test = %q, want %q", gotXHdr, "v")
+	}
+}
+
+// TestReadLimitedResponse_ContentLengthTooLarge hits the early Content-Length
+// guard in readLimitedResponse.
+func TestReadLimitedResponse_ContentLengthTooLarge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, 200)) // Content-Length set by the server
+	}))
+	defer server.Close()
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 50)
+	if err == nil {
+		t.Fatal("expected error for response exceeding Content-Length limit")
+	}
+}
+
+// TestReadLimitedResponse_BodyExceedsWithoutContentLength forces a chunked
+// response (no Content-Length) so the post-read body-size guard fires.
+func TestReadLimitedResponse_BodyExceedsWithoutContentLength(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("ResponseWriter is not a Flusher")
+		}
+		w.Write(make([]byte, 40))
+		fl.Flush() // forces chunked transfer; ContentLength becomes -1
+		w.Write(make([]byte, 40))
+	}))
+	defer server.Close()
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 50)
+	if err == nil {
+		t.Fatal("expected error for body exceeding limit without Content-Length")
+	}
+}
+
+func TestValidateURL_InvalidURL(t *testing.T) {
+	_, err := ValidateURL(context.Background(), "http://exa\x7fmple.com", DevModeFetchSettings())
+	if err == nil {
+		t.Fatal("expected parse error for malformed URL")
+	}
+}
+
+func TestValidateURL_DNSResolutionFails(t *testing.T) {
+	// .invalid never resolves (RFC 6761), exercising the DNS-failure branch.
+	_, err := ValidateURL(context.Background(), "https://nonexistent.invalid/path", DevModeFetchSettings())
+	if err == nil {
+		t.Fatal("expected DNS resolution failure for .invalid host")
+	}
+}
+
+func TestIsIPAllowed_MalformedIP(t *testing.T) {
+	// A net.IP of invalid length yields nil from To16().
+	if IsIPAllowed(net.IP{1, 2, 3}, DevModeFetchSettings()) {
+		t.Error("malformed IP must not be allowed")
+	}
+}
+
+func TestExtractEmbeddedIPv4(t *testing.T) {
+	cases := []struct {
+		name string
+		in   net.IP
+		want string // "" means nil expected
+	}{
+		{"malformed length", net.IP{1, 2, 3}, ""},
+		{"6to4 maps embedded v4", net.ParseIP("2002:0102:0304::1"), "1.2.3.4"},
+		{"teredo blocked server returns server", net.ParseIP("2001:0000:a9fe:0001:0000:0000:0000:0000"), "169.254.0.1"},
+		{"teredo all-global returns nil", net.ParseIP("2001:0000:0809:0a0b:0000:0000:0000:0000"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractEmbeddedIPv4(tc.in)
+			if tc.want == "" {
+				if got != nil {
+					t.Errorf("extractEmbeddedIPv4() = %v, want nil", got)
+				}
+				return
+			}
+			if got == nil || got.String() != tc.want {
+				t.Errorf("extractEmbeddedIPv4() = %v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSSRFSafePost_PinnedMode_InvalidURL(t *testing.T) {
+	// SSRFProtection on → ValidateURL runs and rejects the malformed URL.
+	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
+	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", DevModeFetchSettings(), nil, opts); err == nil {
+		t.Fatal("expected validation error for malformed URL in pinned POST")
+	}
+}
+
+func TestSSRFSafeGet_UnprotectedMode_InvalidURL(t *testing.T) {
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	if _, err := SSRFSafeGet(context.Background(), "http://exa\x7fmple.com", settings, nil, MaxMetadataSize); err == nil {
+		t.Fatal("expected request-creation error for malformed URL in unsafe GET")
+	}
+}
+
+func TestSSRFSafePost_UnprotectedMode_InvalidURL(t *testing.T) {
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
+	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", settings, nil, opts); err == nil {
+		t.Fatal("expected request-creation error for malformed URL in unsafe POST")
+	}
+}
+
+// TestSSRFSafePost_UnprotectedMode_RedirectBlocked exercises the CheckRedirect
+// guard on the unsafe POST client: redirects must be refused.
+func TestSSRFSafePost_UnprotectedMode_RedirectBlocked(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://example.com/", http.StatusFound)
+	}))
+	defer server.Close()
+	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
+	if _, err := SSRFSafePost(context.Background(), server.URL, settings, nil, opts); err == nil {
+		t.Fatal("expected redirect to be blocked in unsafe POST")
 	}
 }

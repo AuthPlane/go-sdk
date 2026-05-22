@@ -291,7 +291,7 @@ func pinnedGet(ctx context.Context, v *ValidatedURL, settings FetchSettings, _ *
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrSSRFBlocked, err)
 	}
-	req.Host = v.Host
+	req.Host = hostHeader(*v)
 	pinnedClient := pinnedHTTPClient(settings, v.Host)
 	resp, err := pinnedClient.Do(req)
 	if err != nil {
@@ -315,7 +315,7 @@ func pinnedPost(ctx context.Context, v *ValidatedURL, settings FetchSettings, _ 
 	if err != nil {
 		return nil, fmt.Errorf("%w: create request: %v", ErrSSRFBlocked, err)
 	}
-	req.Host = v.Host
+	req.Host = hostHeader(*v)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -438,6 +438,28 @@ func readLimitedResponse(resp *http.Response, maxSize int64) (*HTTPResponse, err
 		Headers: resp.Header,
 		Status:  resp.StatusCode,
 	}, nil
+}
+
+// hostHeader returns the value for the outbound HTTP Host header.
+//
+// Per RFC 9110 §7.2 the Host header must mirror the URI authority, including
+// the port when it is not the scheme's default. This is required for RFC 9449
+// DPoP htu validation: the Authorization Server reconstructs the request URI
+// from the Host header and compares it against the proof's htu, so dropping a
+// non-default port (e.g. :9000) breaks the match. IPv6 literals are bracketed
+// per RFC 3986 §3.2.2.
+func hostHeader(v ValidatedURL) string {
+	defaultPort := 80
+	if v.Scheme == "https" {
+		defaultPort = 443
+	}
+	if v.Port == defaultPort {
+		if strings.Contains(v.Host, ":") {
+			return "[" + v.Host + "]"
+		}
+		return v.Host
+	}
+	return net.JoinHostPort(v.Host, strconv.Itoa(v.Port))
 }
 
 func formatIPForURL(ip net.IP) string {
