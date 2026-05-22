@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-22
+
 ### Fixed
 
 - DPoP `htu` validation against Authorization Servers on non-default ports. The
