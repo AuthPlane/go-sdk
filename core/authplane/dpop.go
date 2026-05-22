@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -140,7 +141,7 @@ func NewDPoPSignerWithKey(key stdcrypto.Signer, alg jose.SignatureAlgorithm) (*D
 // GenerateProof generates a DPoP proof JWT for the given HTTP method and URL.
 // Per RFC 9449 §4.3, the htu claim is set to the target URI excluding query and fragment.
 func (d *DPoPSigner) GenerateProof(method, rawURL string, opts *DPoPProofOptions) (string, error) {
-	htu := stripQueryFragment(rawURL)
+	htu := normalizeHTU(rawURL)
 	now := time.Now()
 	claims := map[string]any{
 		"jti": generateJTI(),
@@ -178,15 +179,32 @@ func (d *DPoPSigner) Thumbprint() string {
 	return d.jkt
 }
 
-// stripQueryFragment removes query and fragment from a URL per RFC 9449 §4.3.
-func stripQueryFragment(rawURL string) string {
+// normalizeHTU derives the DPoP htu claim from a target URL. Per RFC 9449 §4.3
+// the htu is the target URI without query and fragment; the target URI carries
+// no userinfo (RFC 9110 §7.1), so credentials are stripped rather than leaked
+// into the signed proof. The authority is also normalized to mirror the outbound
+// Host header (RFC 9110 §7.2): an explicit default port (:80 for http, :443 for
+// https) is dropped while non-default ports are kept. Without this, an htu
+// carrying an explicit default port would not match the host the AS reconstructs
+// from a port-less Host header. IPv6 literals stay bracketed.
+func normalizeHTU(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
+	u.User = nil
 	u.RawQuery = ""
 	u.Fragment = ""
 	u.RawFragment = ""
+	if port := u.Port(); port != "" {
+		if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+			host := u.Hostname()
+			if strings.Contains(host, ":") {
+				host = "[" + host + "]"
+			}
+			u.Host = host
+		}
+	}
 	return u.String()
 }
 

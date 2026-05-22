@@ -216,6 +216,78 @@ func TestGenerateProof_HTUStripsQueryAndFragment(t *testing.T) {
 	}
 }
 
+// htu must mirror the outbound Host header's default-port rule (RFC 9110 §7.2):
+// an explicit :80/:443 is dropped, non-default ports are kept, and IPv6 literals
+// stay bracketed. Otherwise an AS reconstructing the request URI from a port-less
+// Host header would see a host mismatch against an htu carrying an explicit
+// default port. See core/internal/ssrf hostHeader and verifier/dpop validateHTU.
+func TestGenerateProof_HTUNormalizesDefaultPort(t *testing.T) {
+	signer, _ := NewDPoPSigner(jose.ES256)
+
+	tests := []struct {
+		name    string
+		url     string
+		wantHTU string
+	}{
+		{"explicit https default port stripped", "https://auth.example.com:443/token", "https://auth.example.com/token"},
+		{"explicit http default port stripped", "http://auth.example.com:80/token", "http://auth.example.com/token"},
+		{"https non-default port preserved", "https://auth.example.com:9000/token", "https://auth.example.com:9000/token"},
+		{"http non-default port preserved", "http://localhost:9000/token", "http://localhost:9000/token"},
+		{"ipv6 default port stripped, brackets kept", "https://[::1]:443/token", "https://[::1]/token"},
+		{"ipv6 non-default port preserved", "http://[::1]:9000/token", "http://[::1]:9000/token"},
+		{"no port unchanged", "https://auth.example.com/token", "https://auth.example.com/token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proof, err := signer.GenerateProof("POST", tt.url, nil)
+			if err != nil {
+				t.Fatalf("GenerateProof: %v", err)
+			}
+			claims, err := testutil.ParseSignedToken(proof)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if claims["htu"] != tt.wantHTU {
+				t.Errorf("htu = %v, want %v", claims["htu"], tt.wantHTU)
+			}
+		})
+	}
+}
+
+// Per RFC 9449 §4.3 the htu is the target URI, which carries no userinfo
+// (RFC 9110 §7.1). Credentials must never leak into the signed proof, and an AS
+// reconstructs the request URI without userinfo, so it must be stripped.
+func TestGenerateProof_HTUStripsUserinfo(t *testing.T) {
+	signer, _ := NewDPoPSigner(jose.ES256)
+
+	tests := []struct {
+		name    string
+		url     string
+		wantHTU string
+	}{
+		{"user and password stripped", "https://user:pass@auth.example.com/token", "https://auth.example.com/token"},
+		{"user only stripped", "https://user@auth.example.com/token", "https://auth.example.com/token"},
+		{"userinfo with non-default port", "https://user:pass@auth.example.com:9000/token", "https://auth.example.com:9000/token"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proof, err := signer.GenerateProof("POST", tt.url, nil)
+			if err != nil {
+				t.Fatalf("GenerateProof: %v", err)
+			}
+			claims, err := testutil.ParseSignedToken(proof)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if claims["htu"] != tt.wantHTU {
+				t.Errorf("htu = %v, want %v", claims["htu"], tt.wantHTU)
+			}
+		})
+	}
+}
+
 func TestNewDPoPSignerWithKey_ES256(t *testing.T) {
 	key, err := testutil.GenerateES256Key()
 	if err != nil {
