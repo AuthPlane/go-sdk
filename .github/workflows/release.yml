@@ -182,7 +182,7 @@ jobs:
       # state-mutating steps. A linting failure here leaves the workspace
       # clean (no partial go.mod edits to roll back).
       - name: Install golangci-lint
-        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
         with:
           version: v2.11.4
           install-only: true
