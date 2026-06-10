@@ -1,10 +1,11 @@
 name: Release
 
 # Step 2 of the single-branch release: take the stabilized release/v* or
-# hotfix/v* branch, bump `require core vX.Y.Z` in mcp/http, run
-# `go mod tidy`, run tests (incl. conformance), commit, tag the four
-# refs, atomic-push the branch + tags, create the GitHub Release, and
-# delete the source branch on success.
+# hotfix/v* branch, bump `require core vX.Y.Z` in mcp/http/mark3labs (and
+# `require http vX.Y.Z` in mark3labs, which wraps http), run `go mod
+# tidy`, run tests (incl. conformance), commit, tag the five refs,
+# atomic-push the branch + tags, create the GitHub Release, and delete
+# the source branch on success.
 #
 # There is no merge into the default branch and no external-registry
 # publish step. `proxy.golang.org` polls tags and serves the new module
@@ -12,10 +13,11 @@ name: Release
 # publish.
 #
 # The require-bump commit lives only on the release branch (now
-# deleted). It is reachable from the four annotated tags, so the proxy
+# deleted). It is reachable from the five annotated tags, so the proxy
 # resolves byte-identical hashes when consumers `go get` any of them.
-# The default branch keeps its `require core v0.0.0` placeholder; the
-# go.work + replace directive cover local dev.
+# The default branch keeps its `require core v0.0.0` (and
+# `require http v0.0.0` for mark3labs) placeholders; the go.work +
+# replace directive cover local dev.
 #
 # Branch conventions:
 #   - release/v<X.Y.Z>: current-line release off the default branch.
@@ -116,15 +118,17 @@ jobs:
             echo "coreTag=core/v$version"
             echo "mcpTag=mcp/v$version"
             echo "httpTag=http/v$version"
+            echo "mark3labsTag=mark3labs/v$version"
             echo "versionTag=v$version"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if any of the four tags already exist
+      - name: Refuse if any of the five tags already exist
         run: |
           for tag in \
               "${{ steps.version.outputs.coreTag }}" \
               "${{ steps.version.outputs.mcpTag }}" \
               "${{ steps.version.outputs.httpTag }}" \
+              "${{ steps.version.outputs.mark3labsTag }}" \
               "${{ steps.version.outputs.versionTag }}"; do
             if git ls-remote --exit-code --tags origin "$tag" >/dev/null; then
               echo "::error::Tag $tag already exists. Aborting."
@@ -178,7 +182,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # Install golangci-lint and vet/lint all three modules before any
+      # Install golangci-lint and vet/lint all four modules before any
       # state-mutating steps. A linting failure here leaves the workspace
       # clean (no partial go.mod edits to roll back).
       - name: Install golangci-lint
@@ -187,37 +191,47 @@ jobs:
           version: v2.11.4
           install-only: true
 
-      - name: Vet and lint all three modules
+      - name: Vet and lint all four modules
         run: |
-          for mod in core mcp http; do
+          for mod in core mcp http mark3labs; do
             (cd "$mod" && go vet ./...)
             (cd "$mod" && golangci-lint run ./...)
           done
 
-      # Bump require core in mcp and http, then go mod tidy. go.work + the
-      # replace directive mean go mod tidy resolves core locally, so the
-      # hash it writes matches what proxy.golang.org will later serve from
-      # the about-to-be-created core/vX.Y.Z tag. Consumers get
-      # byte-identical checksums.
-      - name: Bump require core in mcp and http, then go mod tidy
+      # Bump require core in mcp, http, and mark3labs, then go mod tidy.
+      # mark3labs also depends on http, so its go.mod gets a second
+      # require-bump in the step below. go.work + the replace directive
+      # mean go mod tidy resolves siblings locally, so the hash it writes
+      # matches what proxy.golang.org will later serve from the
+      # about-to-be-created tags. Consumers get byte-identical checksums.
+      - name: Bump require core in mcp, http, and mark3labs, then go mod tidy
         run: |
           v="${{ steps.version.outputs.version }}"
-          for mod in mcp http; do
+          for mod in mcp http mark3labs; do
             (cd "$mod" && go mod edit -require=github.com/authplane/go-sdk/core@v"$v" && go mod tidy)
           done
 
-      - name: Run tests in all three modules
+      # mark3labs wraps the http adapter, so it also needs require http
+      # pinned to the matching vX.Y.Z. Done after the core-require loop
+      # so the previous `go mod tidy` already wrote a stable core hash.
+      - name: Bump require http in mark3labs, then go mod tidy
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          (cd mark3labs && go mod edit -require=github.com/authplane/go-sdk/http@v"$v" && go mod tidy)
+
+      - name: Run tests in all four modules
         env:
           CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
-          (cd core && go test ./...)
-          (cd mcp  && go test ./...)
-          (cd http && go test ./...)
+          (cd core      && go test ./...)
+          (cd mcp       && go test ./...)
+          (cd http      && go test ./...)
+          (cd mark3labs && go test ./...)
 
       # Single release commit on the release/hotfix branch containing the
       # require bumps. Tag points at this commit. Lives only on the
       # release branch (deleted after publish) — never reaches the default
-      # branch. Reachable from the four annotated tags so proxy.golang.org
+      # branch. Reachable from the five annotated tags so proxy.golang.org
       # serves it correctly.
       - name: Commit require-bumps on the release branch
         run: |
@@ -228,17 +242,18 @@ jobs:
         id: sha
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Create four annotated tags locally
+      - name: Create five annotated tags locally
         run: |
           v="${{ steps.version.outputs.version }}"
-          git tag -a "core/v$v" -m "core v$v"
-          git tag -a "mcp/v$v"  -m "mcp v$v"
-          git tag -a "http/v$v" -m "http v$v"
-          git tag -a "v$v"      -m "Release v$v"
+          git tag -a "core/v$v"      -m "core v$v"
+          git tag -a "mcp/v$v"       -m "mcp v$v"
+          git tag -a "http/v$v"      -m "http v$v"
+          git tag -a "mark3labs/v$v" -m "mark3labs v$v"
+          git tag -a "v$v"           -m "Release v$v"
 
       # --- Everything below this point mutates the remote or external state. ---
       # Dry-run short-circuit: report and skip the mutating phase. The local
-      # state (release commit + four tags on the runner) is verified but
+      # state (release commit + five tags on the runner) is verified but
       # thrown away when the runner tears down.
       - name: Dry run short-circuit notice
         if: ${{ inputs.dryRun }}
@@ -246,16 +261,16 @@ jobs:
           echo "::notice::Dry run — skipping atomic push, GitHub Release, and branch deletion. Require-bump, tidy, tests, and local tag creation all succeeded. Would-be released commit: ${{ steps.sha.outputs.sha }}"
 
       # Atomic push of the release/hotfix branch tip (with the release
-      # commit) + four tags. Either everything lands or nothing does.
+      # commit) + five tags. Either everything lands or nothing does.
       # The branch is listed first so the commit referenced by the tags
       # exists on the remote after the transaction.
-      - name: Atomic push of release branch and four tags
+      - name: Atomic push of release branch and five tags
         if: ${{ !inputs.dryRun }}
         run: |
           v="${{ steps.version.outputs.version }}"
           git push --atomic origin \
             "$GITHUB_REF_NAME" \
-            "core/v$v" "mcp/v$v" "http/v$v" "v$v"
+            "core/v$v" "mcp/v$v" "http/v$v" "mark3labs/v$v" "v$v"
           echo "::notice::Released commit: ${{ steps.sha.outputs.sha }}"
 
       # --------- From here on, the release is live on proxy.golang.org. ---------
@@ -329,7 +344,7 @@ jobs:
               echo ""
               echo "- **Version**: \`$v\`"
               echo "- **Released commit**: \`$sha\`"
-              echo "- **Tags pushed**: \`core/v$v\`, \`mcp/v$v\`, \`http/v$v\`, \`v$v\`"
+              echo "- **Tags pushed**: \`core/v$v\`, \`mcp/v$v\`, \`http/v$v\`, \`mark3labs/v$v\`, \`v$v\`"
               echo "- **Go module proxy**: https://proxy.golang.org/github.com/authplane/go-sdk/core/@v/v$v.info"
               echo "- **GitHub Release**: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v$v"
               if [[ "${{ steps.delete.outcome }}" != "success" ]]; then
