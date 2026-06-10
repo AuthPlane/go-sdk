@@ -62,6 +62,15 @@ func TestRFC6750ErrorResponseMustMapErrorCodes(t *testing.T) {
 		{"dpop_replay → invalid_token DPoP", verifier.ErrDPoPReplayDetected, "DPoP", "invalid_token", 401},
 		{"dpop_key_mismatch → invalid_token DPoP", verifier.ErrDPoPKeyMismatch, "DPoP", "invalid_token", 401},
 		{"dpop_required → invalid_token DPoP", verifier.ErrDPoPRequired, "DPoP", "invalid_token", 401},
+		// NOTE: `ErrMultipleDpopProofs → invalid_dpop_proof / DPoP / 401`
+		// is intentionally NOT in this catalog-aligned table. The
+		// shared `rfc6750-error-response-must-map-error-codes` catalog
+		// entry only enumerates `dpop_error → invalid_token / DPoP`, so
+		// adding a row with a different `error_code` here would diverge
+		// from the catalog. The mapping is covered at the package level
+		// in `core/resource/auth_error_response_test.go` until the
+		// catalog gains a `rfc9449-verifier-must-reject-multiple-dpop-headers`
+		// row (catalog ID does not exist yet).
 	}
 
 	for _, tt := range tests {

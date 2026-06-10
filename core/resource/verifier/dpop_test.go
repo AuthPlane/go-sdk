@@ -107,6 +107,22 @@ func newTestECKey(t *testing.T) *ecdsa.PrivateKey {
 	return key
 }
 
+// mustCtx routes every test that exercises validateDPoPProof through
+// NewDPoPContext so the factory remains the only entry point — direct
+// struct literals would bypass §4.3 enforcement and defeat the
+// architectural guarantee this PR established. Errors from
+// NewDPoPContext are fatal because the tests below always pass a
+// single non-blank proof; the constructor only errors for cardinality
+// violations.
+func mustCtx(t *testing.T, method, url, proof string) *DPoPContext {
+	t.Helper()
+	ctx, err := NewDPoPContext(method, url, []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext(%q, %q, [...]): %v", method, url, err)
+	}
+	return ctx
+}
+
 // inMemoryReplayStore is a simple in-memory DPoP replay store for tests.
 type inMemoryReplayStore struct {
 	seen map[string]time.Time
@@ -154,7 +170,7 @@ func TestValidateDPoPProof_Valid(t *testing.T) {
 	})
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), rawToken)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -187,7 +203,7 @@ func TestValidateDPoPProof_HTMMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, "GET", htu, "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: "POST", URL: htu, Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, "POST", htu, proof), "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -199,9 +215,68 @@ func TestValidateDPoPProof_HTUMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, "https://example.com/resource", "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: "https://example.com/other", Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/other", proof), "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
+	}
+}
+
+// Encoded slash in the proof's htu must NOT match a literal slash in the
+// request path. url.URL.Path is percent-decoded, so the previous
+// `htuParsed.Path != reqParsed.Path` check conflated `%2F` with `/`,
+// weakening the RFC 9449 §4.3 htu binding (RFC 3986 §6.2.2.2 only permits
+// decoding *unreserved* chars when comparing URLs). The fix compares
+// EscapedPath instead.
+func TestValidateDPoPProof_EncodedSlashIsNotPlainSlash(t *testing.T) {
+	key := newTestECKey(t)
+	method := "GET"
+	proof := generateDPoPProof(t, key, method, "https://example.com/foo%2Fbar", "", nil)
+
+	v := newDPoPTestVerifier(t, nil)
+	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo/bar", proof), "")
+	if !errors.Is(err, ErrDPoPInvalid) {
+		t.Fatalf("expected ErrDPoPInvalid for %%2F vs / mismatch, got: %v", err)
+	}
+}
+
+// Percent-encoded triplets MUST compare case-sensitively. RFC 3986
+// §6.2.2.1 *allows* `%2f` and `%2F` to be considered equivalent, but the
+// verifier deliberately compares byte-for-byte — folding case unilaterally
+// would let the verifier accept a proof that a byte-exact signer rejects.
+// Pin the current contract here so a future "let's just uppercase the
+// triplets" patch can't land without the question being answered.
+func TestValidateDPoPProof_PercentEncodedCaseIsNotFolded(t *testing.T) {
+	key := newTestECKey(t)
+	method := "GET"
+	// Proof's htu carries lower-case `%2f`; request path carries
+	// upper-case `%2F`. Same byte semantics under RFC 3986 §6.2.2.1,
+	// but the verifier intentionally treats them as distinct to keep
+	// the htu binding byte-exact.
+	proof := generateDPoPProof(t, key, method, "https://example.com/foo%2fbar", "", nil)
+
+	v := newDPoPTestVerifier(t, nil)
+	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo%2Fbar", proof), "")
+	if !errors.Is(err, ErrDPoPInvalid) {
+		t.Fatalf("expected ErrDPoPInvalid for %%2f vs %%2F mismatch, got: %v", err)
+	}
+}
+
+// Bare-origin htu (no path component) must compare equal to a request whose
+// path is `/`. The verifier collapses `""` to `"/"` before comparing via the
+// shared dpop.NormalizePath helper. Without the collapse, a client that
+// signed a bare origin would silently fail against a server where every
+// inbound `r.URL.EscapedPath()` is at least `/`.
+func TestValidateDPoPProof_EmptyPathEqualsSlash(t *testing.T) {
+	key := newTestECKey(t)
+	method := "GET"
+	// Proof signed for `https://example.com` (no path) — matches what the
+	// outbound `normalizeHTU` emits for a bare-origin URL.
+	proof := generateDPoPProof(t, key, method, "https://example.com", "", nil)
+
+	v := newDPoPTestVerifier(t, nil)
+	// Inbound request always carries at least `/`.
+	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/", proof), ""); err != nil {
+		t.Fatalf("expected empty-path htu to match request path `/`, got: %v", err)
 	}
 }
 
@@ -212,7 +287,7 @@ func TestValidateDPoPProof_MissingJTI(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", map[string]any{"jti": nil})
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -227,7 +302,7 @@ func TestValidateDPoPProof_StaleProof(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", map[string]any{"iat": oldIAT})
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -241,7 +316,7 @@ func TestValidateDPoPProof_ATHMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "token-A", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "token-B")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "token-B")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -254,7 +329,7 @@ func TestValidateDPoPProof_WrongTyp(t *testing.T) {
 	proof := generateDPoPProofWithTyp(t, key, method, htu, "JWT")
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -270,13 +345,13 @@ func TestValidateDPoPProof_ReplayDetection(t *testing.T) {
 
 	v := newDPoPTestVerifier(t, store)
 	// First use: should succeed.
-	_, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if err != nil {
 		t.Fatalf("first use: expected no error, got: %v", err)
 	}
 
 	// Second use of the same proof: replay detected.
-	_, err = v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	_, err = v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if !errors.Is(err, ErrDPoPReplayDetected) {
 		t.Fatalf("second use: expected ErrDPoPReplayDetected, got: %v", err)
 	}
@@ -290,7 +365,7 @@ func TestValidateDPoPProof_ValidNoAccessToken(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: htu, Proof: proof}, "")
+	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -410,7 +485,7 @@ func TestVerifyToken_DPoPBound_ValidProof(t *testing.T) {
 	proof := generateDPoPProof(t, dpopKey, method, reqURL, rawToken, nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: reqURL, Proof: proof}, rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken)
 	if err != nil {
 		t.Fatalf("validateDPoPProof: %v", err)
 	}
@@ -440,7 +515,7 @@ func TestVerifyToken_DPoPBound_WrongKey(t *testing.T) {
 	proof := generateDPoPProof(t, dpopKey2, method, reqURL, rawToken, nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(&DPoPContext{Method: method, URL: reqURL, Proof: proof}, rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken)
 	if err != nil {
 		t.Fatalf("validateDPoPProof: %v", err)
 	}

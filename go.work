@@ -1,7 +1,8 @@
-go 1.25.0
+go 1.25.5
 
 use (
 	./core
 	./http
 	./mcp
+	./mark3labs
 )

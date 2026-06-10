@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/authplane/go-sdk/core/internal/dpop"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 )
@@ -58,9 +59,9 @@ const DefaultDPoPProofLifetime = 300 * time.Second
 //
 // rawToken may be empty when validating DPoP proofs not bound to an access
 // token (e.g., outbound proofs sent to a token endpoint).
-func (v *TokenVerifier) validateDPoPProof(dpop *DPoPContext, rawToken string) (*VerifiedDPoPProof, error) {
+func (v *TokenVerifier) validateDPoPProof(dpopCtx *DPoPContext, rawToken string) (*VerifiedDPoPProof, error) {
 	cfg := v.inboundDPoP
-	parsed, err := jwt.ParseSigned(dpop.Proof, cfg.algorithms)
+	parsed, err := jwt.ParseSigned(dpopCtx.Proof(), cfg.algorithms)
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse: %v", ErrDPoPInvalid, err)
 	}
@@ -87,10 +88,10 @@ func (v *TokenVerifier) validateDPoPProof(dpop *DPoPContext, rawToken string) (*
 	if claims.JTI == "" {
 		return nil, fmt.Errorf("%w: missing jti", ErrDPoPInvalid)
 	}
-	if claims.HTM != dpop.Method {
+	if claims.HTM != dpopCtx.Method {
 		return nil, fmt.Errorf("%w: htm mismatch", ErrDPoPInvalid)
 	}
-	if err := validateHTU(claims.HTU, dpop.URL); err != nil {
+	if err := validateHTU(claims.HTU, dpopCtx.URL); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrDPoPInvalid, err)
 	}
 
@@ -204,10 +205,22 @@ func validateHTU(htu, reqURL string) error {
 	if !strings.EqualFold(htuParsed.Scheme, reqParsed.Scheme) {
 		return fmt.Errorf("scheme mismatch")
 	}
-	if !strings.EqualFold(htuParsed.Host, reqParsed.Host) {
+	// Default-port stripping (RFC 9110 §7.2) is shared with the outbound
+	// signer (`core/authplane.normalizeHTU`) via the internal helper so the
+	// two sides cannot drift: an operator configuring the resource as
+	// `http://api.example.com:80/mcp` would otherwise mismatch any client
+	// that signed the port-less form, and vice versa.
+	if !strings.EqualFold(dpop.NormalizeHost(htuParsed), dpop.NormalizeHost(reqParsed)) {
 		return fmt.Errorf("host mismatch")
 	}
-	if htuParsed.Path != reqParsed.Path {
+	// Compare the raw escaped form rather than url.URL.Path: the latter is
+	// percent-decoded, which conflates `%2F` with `/` and weakens the
+	// RFC 9449 §4.3 `htu` binding (RFC 3986 §6.2.2.2 only permits decoding
+	// unreserved characters when comparing URLs). Collapse an empty path
+	// to "/" on both sides so a bare-origin htu (e.g. `https://host`,
+	// EscapedPath `""`) still matches an inbound request whose
+	// `r.URL.EscapedPath()` is always at least `"/"`.
+	if dpop.NormalizePath(htuParsed.EscapedPath()) != dpop.NormalizePath(reqParsed.EscapedPath()) {
 		return fmt.Errorf("path mismatch")
 	}
 	return nil

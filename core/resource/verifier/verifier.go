@@ -216,7 +216,7 @@ func (v *TokenVerifier) VerifyToken(ctx context.Context, rawToken string, dpop *
 		// Bearer-only resource, bearer token: no DPoP enforcement.
 
 	case v.inboundDPoP != nil && boundToToken:
-		if dpop == nil || dpop.Proof == "" {
+		if dpop == nil || dpop.Proof() == "" {
 			return nil, ErrDPoPRequired
 		}
 		proof, err := v.validateDPoPProof(dpop, rawToken)
@@ -235,7 +235,7 @@ func (v *TokenVerifier) VerifyToken(ctx context.Context, rawToken string, dpop *
 		// Supported mode, bearer token. Reject if a proof is attached: the proof's
 		// ath claim has nothing to bind to (RFC 9449 §7). Accepting it silently
 		// would let a misconfigured client believe its proof was honored.
-		if dpop != nil && dpop.Proof != "" {
+		if dpop != nil && dpop.Proof() != "" {
 			return nil, fmt.Errorf("%w: DPoP proof presented with a bearer-only access token (no cnf.jkt to bind to)", ErrDPoPBindingMismatch)
 		}
 	}

@@ -52,7 +52,7 @@ func main() {
 }
 ```
 
-That's a complete, secure, standards-compliant MCP resource server. For a plain HTTP resource server, see the [`http` adapter](http/README.md).
+That's a complete, secure, standards-compliant MCP resource server. For a plain HTTP resource server, see the [`http` adapter](http/README.md); for `mark3labs/mcp-go` servers, see the [`mark3labs` adapter](mark3labs/README.md).
 
 ## Packages
 
@@ -61,12 +61,13 @@ That's a complete, secure, standards-compliant MCP resource server. For a plain 
 | [`core`](core/README.md) | `go get github.com/authplane/go-sdk/core` | Framework-agnostic JWT validation, JWKS caching, DPoP, introspection, token exchange, PRM. |
 | [`http`](http/README.md) | `go get github.com/authplane/go-sdk/http` | `net/http` middleware with Bearer and DPoP sender-constrained token support. |
 | [`mcp`](mcp/README.md) | `go get github.com/authplane/go-sdk/mcp` | Adapter for the [official MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk). |
+| [`mark3labs`](mark3labs/README.md) | `go get github.com/authplane/go-sdk/mark3labs` | Adapter for [`mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go), wrapping the `net/http` adapter for bearer + DPoP auth and RFC 9728 PRM. |
 
 Each package has its own quickstart and user guide; start at the package README that matches your integration target.
 
 ## Requirements
 
-- Go 1.24+ (`core`, `http`) / Go 1.25+ (`mcp`, forced by `github.com/modelcontextprotocol/go-sdk`)
+- Go 1.24+ (`core`, `http`) / Go 1.25+ (`mcp`, forced by `github.com/modelcontextprotocol/go-sdk`; `mark3labs`, forced by `github.com/mark3labs/mcp-go`)
 
 ## Capabilities
 
@@ -100,6 +101,7 @@ Each package has its own quickstart and user guide; start at the package README 
 
 - [`net/http`](http/README.md) middleware for plain resource servers.
 - [MCP Go SDK](mcp/README.md) adapter, including URL elicitation mapping for RFC 8693 consent flows.
+- [`mark3labs/mcp-go`](mark3labs/README.md) adapter, wrapping `net/http` for bearer + DPoP auth with `HTTPContextFunc` integration.
 
 ### Observability
 
@@ -107,8 +109,8 @@ Each package has its own quickstart and user guide; start at the package README 
 
 ## Documentation
 
-- Package READMEs — [`core`](core/README.md) · [`http`](http/README.md) · [`mcp`](mcp/README.md)
-- Package user guides — [`core`](core/docs/user-guide.md) · [`http`](http/docs/user-guide.md) · [`mcp`](mcp/docs/user-guide.md)
+- Package READMEs — [`core`](core/README.md) · [`http`](http/README.md) · [`mcp`](mcp/README.md) · [`mark3labs`](mark3labs/README.md)
+- Package user guides — [`core`](core/docs/user-guide.md) · [`http`](http/docs/user-guide.md) · [`mcp`](mcp/docs/user-guide.md) · [`mark3labs`](mark3labs/docs/user-guide.md)
 - [`CHANGELOG.md`](CHANGELOG.md)
 - [`SECURITY.md`](SECURITY.md) — reporting vulnerabilities
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — development setup and PR guidelines
@@ -121,6 +123,7 @@ Each package has its own quickstart and user guide; start at the package README 
 | `core` | [![Go Reference](https://pkg.go.dev/badge/github.com/authplane/go-sdk/core.svg)](https://pkg.go.dev/github.com/authplane/go-sdk/core) |
 | `http` | [![Go Reference](https://pkg.go.dev/badge/github.com/authplane/go-sdk/http.svg)](https://pkg.go.dev/github.com/authplane/go-sdk/http) |
 | `mcp`  | [![Go Reference](https://pkg.go.dev/badge/github.com/authplane/go-sdk/mcp.svg)](https://pkg.go.dev/github.com/authplane/go-sdk/mcp) |
+| `mark3labs` | [![Go Reference](https://pkg.go.dev/badge/github.com/authplane/go-sdk/mark3labs.svg)](https://pkg.go.dev/github.com/authplane/go-sdk/mark3labs) |
 
 ## License
 

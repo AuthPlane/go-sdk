@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -129,6 +130,120 @@ func TestVerifiedClaims_RequireScope(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInsufficientScope) {
 		t.Errorf("expected ErrInsufficientScope, got %v", err)
+	}
+}
+
+func TestVerifiedClaims_RequireScope_EnrichedErrorString(t *testing.T) {
+	// RequireScope now delegates to RequireScopes, which means the singular
+	// path also carries the `required scope "X"; token has scopes: …`
+	// rich shape. Pin the wire body so a future refactor that reverts the
+	// delegation (or changes the message format) fails this test instead
+	// of silently regressing the adapter's WWW-Authenticate error_description.
+	c := ParseClaims(testClaims(), "kid")
+	err := c.RequireScope("delete")
+	if err == nil {
+		t.Fatal("RequireScope('delete') should fail")
+	}
+	msg := err.Error()
+	// Positive pins.
+	for _, want := range []string{
+		`required scope "delete"`,
+		"token has scopes:",
+		"read", // any one of the granted scopes must surface
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("RequireScope error %q missing %q", msg, want)
+		}
+	}
+	// Negative pin: must not regress to the pre-enrichment terser shape.
+	if strings.Contains(msg, `required "delete"`) {
+		t.Errorf("RequireScope error %q regressed to the pre-enrichment shape", msg)
+	}
+}
+
+func TestVerifiedClaims_RequireScopes_EmptyInputIsNoOp(t *testing.T) {
+	// Empty input must not error — matches the adapter-middleware
+	// `(*Adapter).RequireScopes(...)` semantic in http/pkg/authplanehttp.
+	// A handler that calls `claims.RequireScopes()` with no args should
+	// not need to special-case the empty-slice path.
+	c := ParseClaims(testClaims(), "kid")
+	if err := c.RequireScopes(); err != nil {
+		t.Errorf("RequireScopes() (no args) should be a no-op, got %v", err)
+	}
+	if err := c.RequireScopes([]string{}...); err != nil {
+		t.Errorf("RequireScopes(<empty slice>) should be a no-op, got %v", err)
+	}
+}
+
+func TestVerifiedClaims_RequireScopes_AllPresent(t *testing.T) {
+	// testClaims() carries "read write admin". The union must succeed.
+	c := ParseClaims(testClaims(), "kid")
+	if err := c.RequireScopes("read", "write", "admin"); err != nil {
+		t.Errorf("RequireScopes('read', 'write', 'admin') should succeed: %v", err)
+	}
+}
+
+func TestVerifiedClaims_RequireScopes_SingleMissing(t *testing.T) {
+	c := ParseClaims(testClaims(), "kid")
+	err := c.RequireScopes("read", "delete")
+	if err == nil {
+		t.Fatal("RequireScopes('read', 'delete') should fail")
+	}
+	if !errors.Is(err, ErrInsufficientScope) {
+		t.Errorf("expected ErrInsufficientScope, got %v", err)
+	}
+	// Error names the missing scope (singular "scope") and the available set.
+	msg := err.Error()
+	if !strings.Contains(msg, `"delete"`) {
+		t.Errorf("error %q should mention missing scope %q", msg, "delete")
+	}
+	if strings.Contains(msg, "required scopes ") {
+		t.Errorf("error %q should use singular \"required scope\" form for one missing entry", msg)
+	}
+	if !strings.Contains(msg, "token has scopes:") {
+		t.Errorf("error %q should surface the token's available scopes", msg)
+	}
+}
+
+func TestVerifiedClaims_RequireScopes_MultipleMissing(t *testing.T) {
+	c := ParseClaims(testClaims(), "kid")
+	// Both "delete" and "billing" are NOT in the test fixture (which has
+	// "read write admin"), so both must be reported.
+	err := c.RequireScopes("delete", "billing")
+	if err == nil {
+		t.Fatal("RequireScopes('delete', 'billing') should fail")
+	}
+	if !errors.Is(err, ErrInsufficientScope) {
+		t.Errorf("expected ErrInsufficientScope, got %v", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{`"delete"`, `"billing"`, "required scopes "} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q should contain %q", msg, want)
+		}
+	}
+}
+
+func TestVerifiedClaims_RequireScopes_NoScopesToken(t *testing.T) {
+	// A token without any scopes claim must render "token has scopes:
+	// (none)" so a debugging operator can tell the difference between
+	// "wrong scope" and "no scopes at all".
+	raw := map[string]any{
+		"sub":       "user_1",
+		"client_id": "client_1",
+		"iss":       "https://issuer.example.com",
+		"aud":       "https://api.example.com",
+		"exp":       float64(9_999_999_999),
+		"iat":       float64(1_700_000_000),
+		"jti":       "jti-1",
+	}
+	c := ParseClaims(raw, "kid")
+	err := c.RequireScopes("read")
+	if err == nil {
+		t.Fatal("expected RequireScopes('read') to fail on a scope-less token")
+	}
+	if !strings.Contains(err.Error(), "(none)") {
+		t.Errorf("error %q should surface \"(none)\" for a scope-less token", err)
 	}
 }
 

@@ -2,7 +2,7 @@ module github.com/authplane/go-sdk/http
 
 go 1.24.0
 
-toolchain go1.25.0
+toolchain go1.25.5
 
 require github.com/authplane/go-sdk/core v0.0.0
 

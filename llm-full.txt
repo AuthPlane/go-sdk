@@ -2,8 +2,8 @@
 
 > Go workspace for protecting MCP servers and OAuth 2.1 resource servers with
 > tokens issued by an Authplane authorization server. This repository contains
-> the framework-agnostic SDK (`core/`) and two framework adapters (`mcp/`,
-> `http/`) as three independent Go modules.
+> the framework-agnostic SDK (`core/`) and three framework adapters (`mcp/`,
+> `http/`, `mark3labs/`) as four independent Go modules.
 
 ## When To Use This Repository
 
@@ -14,6 +14,7 @@ Use this repo when you need to:
   introspection, revocation)
 - wire the verifier into the official MCP Go SDK's HTTP transport (`mcp/`)
 - wire the verifier into a plain `net/http` resource server (`http/`)
+- wire the verifier into a `mark3labs/mcp-go` server (`mark3labs/`)
 
 ## Repository Structure
 
@@ -28,18 +29,21 @@ Use this repo when you need to:
 | `mcp/pkg/authplanemcp/` | public adapter API |
 | `http/` | HTTP middleware adapter — module `github.com/authplane/go-sdk/http` |
 | `http/pkg/authplanehttp/` | public middleware API |
+| `mark3labs/` | `mark3labs/mcp-go` adapter — module `github.com/authplane/go-sdk/mark3labs` |
+| `mark3labs/pkg/authplanemark3labs/` | public adapter API (wraps `authplanehttp.Adapter`) |
 | `scripts/` | end-to-end test helpers |
 
 ## Layering Rules (Important)
 
 1. Protocol verification, AS interaction, caching, and resilience logic must
    live in `core/`.
-2. Adapter code (`mcp/`, `http/`) must stay thin: translate framework
-   requests into `core` calls and translate `core` errors into framework
-   responses.
+2. Adapter code (`mcp/`, `http/`, `mark3labs/`) must stay thin: translate
+   framework requests into `core` calls and translate `core` errors into
+   framework responses. The `mark3labs/` adapter is itself a thin wrapper
+   over `http/` so common DPoP/PRM behavior stays single-sourced.
 3. Do not duplicate verifier or protocol logic across modules.
-4. Keep MCP and HTTP adapter semantics (errors, challenges, headers)
-   aligned where equivalent.
+4. Keep adapter semantics (errors, challenges, headers) aligned where
+   equivalent.
 5. Each module has its own `go.mod` and can be versioned and published
    independently.
 
@@ -49,8 +53,9 @@ Install the module(s) you need:
 
 ```bash
 go get github.com/authplane/go-sdk/core@latest
-go get github.com/authplane/go-sdk/http@latest   # net/http middleware
-go get github.com/authplane/go-sdk/mcp@latest    # MCP adapter
+go get github.com/authplane/go-sdk/http@latest        # net/http middleware
+go get github.com/authplane/go-sdk/mcp@latest         # official MCP Go SDK
+go get github.com/authplane/go-sdk/mark3labs@latest   # mark3labs/mcp-go
 ```
 
 See the API Examples below, the per-module READMEs, and `docs/user-guide.md`
@@ -60,6 +65,7 @@ in each module for full integration walkthroughs.
 
 - `core/`, `http/`: Go 1.24+.
 - `mcp/`: Go 1.25+ (forced by `github.com/modelcontextprotocol/go-sdk`).
+- `mark3labs/`: Go 1.25+ (forced by `github.com/mark3labs/mcp-go`).
 
 ## API Examples
 
@@ -145,12 +151,40 @@ http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler
 http.Handle("/mcp", adapter.AuthMiddleware(handler))
 ```
 
+### 4) mark3labs/mcp-go adapter (`mark3labs/`)
+
+`mark3labs/demo/main.go` is the canonical end-to-end example. The adapter
+wraps `*authplanehttp.Adapter` so bearer + DPoP auth, RFC 9728 PRM, and
+`WWW-Authenticate` semantics come for free from `http/`:
+
+```go
+import "github.com/authplane/go-sdk/mark3labs/pkg/authplanemark3labs"
+
+adapter, _ := authplanemark3labs.NewAdapter(ctx, authplanemark3labs.Options{
+    Issuer:        issuer,
+    Resource:      resourceURL,
+    Scopes:        []string{"tools/add", "tools/multiply"},
+    DevMode:       true, // local dev only
+    ClientOptions: []authplane.Option{
+        authplane.WithClientCredentials(clientID, clientSecret),
+    },
+})
+defer adapter.Close()
+
+mux := http.NewServeMux()
+mux.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
+mux.Handle("/mcp", adapter.AuthMiddleware(mcpHandler))
+
+http.ListenAndServe(":8080", mux)
+```
+
 ## Practical Example Locations
 
 | Example Type | Location |
 |---|---|
 | User guide (core) | `core/docs/user-guide.md` |
-| MCP integration | `mcp/README.md`, `mcp/docs/user-guide.md`, `mcp/demo/` |
+| MCP integration (official Go SDK) | `mcp/README.md`, `mcp/docs/user-guide.md`, `mcp/demo/` |
+| MCP integration (mark3labs/mcp-go) | `mark3labs/README.md`, `mark3labs/docs/user-guide.md`, `mark3labs/demo/` |
 | HTTP integration | `http/README.md`, `http/docs/user-guide.md`, `http/demo/` |
 
 ## Public Surface (core)

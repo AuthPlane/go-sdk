@@ -42,11 +42,11 @@ func TestVerifyToken_Policy_NotConfigured_DPoPBoundToken(t *testing.T) {
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	_, err = v.VerifyToken(context.Background(), token, &verifier.DPoPContext{
-		Method: method,
-		URL:    url,
-		Proof:  proof,
-	})
+	dpopCtx, err := verifier.NewDPoPContext(method, url, []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext: %v", err)
+	}
+	_, err = v.VerifyToken(context.Background(), token, dpopCtx)
 	if !errors.Is(err, verifier.ErrDPoPNotSupported) {
 		t.Fatalf("expected ErrDPoPNotSupported, got %v", err)
 	}
@@ -140,11 +140,11 @@ func TestVerifyToken_DPoPProof_FutureIatRejected(t *testing.T) {
 		t.Fatalf("serialize proof: %v", err)
 	}
 
-	_, err = v.VerifyToken(context.Background(), token, &verifier.DPoPContext{
-		Method: method,
-		URL:    url,
-		Proof:  proof,
-	})
+	dpopCtx, err := verifier.NewDPoPContext(method, url, []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext: %v", err)
+	}
+	_, err = v.VerifyToken(context.Background(), token, dpopCtx)
 	if !errors.Is(err, verifier.ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid for future-iat proof, got %v", err)
 	}

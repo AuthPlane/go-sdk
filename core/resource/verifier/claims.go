@@ -99,11 +99,78 @@ func (c *VerifiedClaims) HasScope(scope string) bool {
 }
 
 // RequireScope returns ErrInsufficientScope if the token lacks the given scope.
+//
+// Thin wrapper over [RequireScopes] so the singular helper carries the
+// same enriched `required scope "X"; token has scopes: …` shape the
+// plural one does. The wire body produced from this path is byte-identical
+// to a `claims.RequireScopes(scope)` call. Note that the adapter middleware
+// at github.com/authplane/go-sdk/http/pkg/authplanehttp.Adapter.RequireScopes
+// still loops over scopes and returns on the first miss, so a multi-scope
+// adapter failure names only one scope; a direct
+// `claims.RequireScopes("a", "b", ...)` call names every missing scope.
+// The two paths converge only on the single-missing-scope case until the
+// adapter is switched over to the plural helper.
 func (c *VerifiedClaims) RequireScope(scope string) error {
-	if !c.HasScope(scope) {
-		return fmt.Errorf("%w: required %q", ErrInsufficientScope, scope)
+	return c.RequireScopes(scope)
+}
+
+// RequireScopes returns ErrInsufficientScope unless the token carries every
+// scope in scopes. Empty input is a no-op (no required scopes ⇒ always
+// satisfied), matching the adapter-middleware
+// github.com/authplane/go-sdk/http/pkg/authplanehttp.Adapter.RequireScopes
+// semantic.
+//
+// On failure the returned error names every missing scope and the scopes
+// the token does carry, so the adapter can surface it verbatim in the
+// `error_description` of the `WWW-Authenticate` challenge without an
+// out-of-band log lookup. The error wraps ErrInsufficientScope, so
+// adapters that already branch on `errors.Is(err, ErrInsufficientScope)`
+// (e.g. `resource.HTTPStatus`) keep producing a 403 with the right
+// `scope="..."` parameter when the surrounding ScopeError carries the
+// full required-scope list.
+func (c *VerifiedClaims) RequireScopes(scopes ...string) error {
+	if len(scopes) == 0 {
+		return nil
 	}
-	return nil
+	var missing []string
+	for _, scope := range scopes {
+		if !c.HasScope(scope) {
+			missing = append(missing, scope)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	plural := ""
+	if len(missing) > 1 {
+		plural = "s"
+	}
+	available := "(none)"
+	if len(c.scopes) > 0 {
+		available = strings.Join(c.scopes, " ")
+	}
+	return fmt.Errorf(
+		"%w: required scope%s %s; token has scopes: %s",
+		ErrInsufficientScope,
+		plural,
+		strings.Join(quoteAll(missing), ", "),
+		available,
+	)
+}
+
+// quoteAll wraps each entry in %q-style double-quotes so the rendered
+// error_description visually delimits each scope and stays unambiguous
+// even if a malformed token carries scope tokens containing control
+// characters. RFC 6749 §3.3 (`scope-token = 1*( %x21 / %x23-5B /
+// %x5D-7E )`) explicitly forbids whitespace inside a scope, so this is
+// defense against non-conformant inputs rather than a spec-permitted
+// case.
+func quoteAll(values []string) []string {
+	out := make([]string, len(values))
+	for i, v := range values {
+		out[i] = fmt.Sprintf("%q", v)
+	}
+	return out
 }
 
 // HasClaim returns true if the raw claims contain the given key.

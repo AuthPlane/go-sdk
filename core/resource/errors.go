@@ -52,7 +52,8 @@ func HTTPStatus(err error) int {
 		errors.Is(err, verifier.ErrDPoPInvalid),
 		errors.Is(err, verifier.ErrDPoPKeyMismatch),
 		errors.Is(err, verifier.ErrDPoPBindingMismatch),
-		errors.Is(err, verifier.ErrDPoPReplayDetected):
+		errors.Is(err, verifier.ErrDPoPReplayDetected),
+		errors.Is(err, verifier.ErrMultipleDpopProofs):
 		return http.StatusUnauthorized
 	case errors.Is(err, verifier.ErrSSRFBlocked),
 		errors.Is(err, verifier.ErrProtocolError):
@@ -79,6 +80,12 @@ func AuthErrorResponse(err error, realm ...string) (status int, headers map[stri
 		errors.Is(err, verifier.ErrDPoPBindingMismatch),
 		errors.Is(err, verifier.ErrDPoPReplayDetected):
 		scheme = "DPoP"
+	case errors.Is(err, verifier.ErrMultipleDpopProofs):
+		// RFC 9449 §7.1 prescribes invalid_dpop_proof for §4.3 rejections,
+		// not the SDK's historical invalid_token used by the other ErrDPoP*
+		// shapes. Scoped to this error; a broader sweep is a separate change.
+		scheme = "DPoP"
+		errorCode = "invalid_dpop_proof"
 	// ErrDPoPNotSupported deliberately falls through to the default "Bearer"
 	// scheme: the resource does not support DPoP, so the client should retry
 	// with a non-DPoP-bound token.
