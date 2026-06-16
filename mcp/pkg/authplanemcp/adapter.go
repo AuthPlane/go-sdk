@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/authplane/go-sdk/core/authplane"
@@ -110,17 +109,10 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 		return nil, err
 	}
 
-	resourceURL, err := url.Parse(options.Resource)
-	if err != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("authplane-mcp: invalid resource URL: %w", err)
-	}
-	prmURL := resourceURL.ResolveReference(&url.URL{Path: res.WellKnownPRMPath()}).String()
-
 	return &Adapter{
 		client:   client,
 		resource: res,
-		prmURL:   prmURL,
+		prmURL:   res.PRMURL(),
 	}, nil
 }
 
@@ -131,17 +123,23 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 //
 // Use this when you need to share a single client across multiple adapters, or
 // when you need full control over client and resource construction.
+//
+// Returns an error if client or res is nil. The (*Adapter, error) signature
+// mirrors NewAdapter (which legitimately fails on discovery) so the two
+// constructors stay swappable; the resource URL no longer needs parsing here
+// because resource.Resource precomputes the absolute PRM URL at construction
+// time.
 func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource) (*Adapter, error) {
-	resourceURL, err := url.Parse(res.URI())
-	if err != nil {
-		return nil, fmt.Errorf("authplane-mcp: invalid resource URL: %w", err)
+	if client == nil {
+		return nil, errors.New("authplane-mcp: client must not be nil")
 	}
-	prmURL := resourceURL.ResolveReference(&url.URL{Path: res.WellKnownPRMPath()}).String()
-
+	if res == nil {
+		return nil, errors.New("authplane-mcp: res must not be nil")
+	}
 	return &Adapter{
 		client:   client,
 		resource: res,
-		prmURL:   prmURL,
+		prmURL:   res.PRMURL(),
 	}, nil
 }
 

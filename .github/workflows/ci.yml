@@ -19,18 +19,25 @@ jobs:
           - core
           - mcp
           - http
+          - mark3labs
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # Only core consumes the catalog (mcp/http have no conformance suite).
-      - name: Check out shared conformance catalog
+      # AuthPlane/conformance is the public sibling repo carrying the shared
+      # oauth-sdk-conformance-catalog.yaml. Cloned to $RUNNER_TEMP — outside
+      # $GITHUB_WORKSPACE — so the catalog stays out of the working tree and
+      # never trips `go list ./...` or coverage glob patterns. Plain git
+      # clone is enough: the repo is public read-only, no auth or
+      # persist-credentials features needed.
+      # Only `core` consumes the catalog (mcp/http/mark3labs have no
+      # conformance suite).
+      - name: Clone shared conformance catalog (out of tree)
         if: matrix.module == 'core'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: AuthPlane/conformance
-          path: conformance
-          fetch-depth: 1
+        run: |
+          git -c advice.detachedHead=false clone --depth=1 \
+            https://github.com/AuthPlane/conformance.git \
+            "$RUNNER_TEMP/conformance"
 
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -60,7 +67,7 @@ jobs:
       - name: Test
         working-directory: ${{ matrix.module }}
         env:
-          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
           # Per-module coverage floors. Adapters (http, mcp) are thinner than
           # core so their floors are lower, but they still need a floor to

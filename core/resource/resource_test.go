@@ -157,6 +157,64 @@ func TestPRMResponse_ReturnsCopy(t *testing.T) {
 	}
 }
 
+func TestPRMURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		resourceURI string
+		want        string
+	}{
+		{
+			name:        "root resource",
+			resourceURI: "https://api.example.com",
+			want:        "https://api.example.com/.well-known/oauth-protected-resource",
+		},
+		{
+			name:        "single-segment path",
+			resourceURI: "https://api.example.com/mcp",
+			want:        "https://api.example.com/.well-known/oauth-protected-resource/mcp",
+		},
+		{
+			name:        "multi-segment path",
+			resourceURI: "https://api.example.com/v2/mcp",
+			want:        "https://api.example.com/.well-known/oauth-protected-resource/v2/mcp",
+		},
+		{
+			// url.ResolveReference preserves trailing slashes in the resource path;
+			// pin that here so the contract doesn't drift.
+			name:        "trailing slash preserved",
+			resourceURI: "https://api.example.com/mcp/",
+			want:        "https://api.example.com/.well-known/oauth-protected-resource/mcp/",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			key, err := testutil.GenerateES256Key()
+			if err != nil {
+				t.Fatalf("generate key: %v", err)
+			}
+			jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, testKID)
+			if err != nil {
+				t.Fatalf("build jwks: %v", err)
+			}
+			jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+				FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
+					return jwksData, nil, nil
+				},
+				DefaultTTL: time.Hour,
+			})
+			t.Cleanup(jc.Close)
+
+			res, err := resource.New(tc.resourceURI, testIssuer, jc)
+			if err != nil {
+				t.Fatalf("resource.New: %v", err)
+			}
+			if got := res.PRMURL(); got != tc.want {
+				t.Errorf("PRMURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPRMResponse_DPoPNotConfigured_OmitsDPoPFields(t *testing.T) {
 	res, _ := makeResource(t)
 	prm := res.PRMResponse()
@@ -196,6 +254,68 @@ func TestPRMResponse_DPoPRequired(t *testing.T) {
 	}
 	if _, ok := prm["dpop_signing_alg_values_supported"]; !ok {
 		t.Error("dpop_signing_alg_values_supported should be present when DPoP is configured")
+	}
+}
+
+func TestPRMConfig_BaseFields(t *testing.T) {
+	res, _ := makeResource(t, resource.WithScopes("read", "write"))
+	cfg := res.PRMConfig()
+
+	if cfg.Resource != testResource {
+		t.Errorf("Resource = %q, want %q", cfg.Resource, testResource)
+	}
+	if got := cfg.AuthorizationServers; len(got) != 1 || got[0] != testIssuer {
+		t.Errorf("AuthorizationServers = %v, want [%q]", got, testIssuer)
+	}
+	if got := cfg.BearerMethodsSupported; len(got) != 1 || got[0] != "header" {
+		t.Errorf("BearerMethodsSupported = %v, want [header]", got)
+	}
+	if got := cfg.ScopesSupported; len(got) != 2 || got[0] != "read" || got[1] != "write" {
+		t.Errorf("ScopesSupported = %v, want [read write]", got)
+	}
+	if cfg.DPoPSigningAlgValuesSupported != nil {
+		t.Errorf("DPoPSigningAlgValuesSupported = %v, want nil when DPoP unset", cfg.DPoPSigningAlgValuesSupported)
+	}
+	if cfg.DPoPBoundAccessTokensRequired != nil {
+		t.Errorf("DPoPBoundAccessTokensRequired = %v, want nil when DPoP unset", *cfg.DPoPBoundAccessTokensRequired)
+	}
+}
+
+func TestPRMConfig_DPoPRequired(t *testing.T) {
+	res, _ := makeResource(t,
+		resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{
+			AllowedProofAlgorithms: []string{"ES256"},
+			Required:               true,
+		})),
+	)
+	cfg := res.PRMConfig()
+
+	if got := cfg.DPoPSigningAlgValuesSupported; len(got) != 1 || got[0] != "ES256" {
+		t.Errorf("DPoPSigningAlgValuesSupported = %v, want [ES256]", got)
+	}
+	if cfg.DPoPBoundAccessTokensRequired == nil || !*cfg.DPoPBoundAccessTokensRequired {
+		t.Errorf("DPoPBoundAccessTokensRequired = %v, want *true", cfg.DPoPBoundAccessTokensRequired)
+	}
+}
+
+func TestPRMConfig_ReturnsIndependentCopy(t *testing.T) {
+	res, _ := makeResource(t, resource.WithScopes("read"))
+	cfg := res.PRMConfig()
+
+	// Mutating the returned slices must not affect a subsequent call.
+	cfg.AuthorizationServers[0] = "injected"
+	cfg.ScopesSupported[0] = "injected"
+	cfg.BearerMethodsSupported = append(cfg.BearerMethodsSupported, "injected")
+
+	cfg2 := res.PRMConfig()
+	if cfg2.AuthorizationServers[0] == "injected" {
+		t.Error("PRMConfig should return independent slices (AuthorizationServers leaked)")
+	}
+	if cfg2.ScopesSupported[0] == "injected" {
+		t.Error("PRMConfig should return independent slices (ScopesSupported leaked)")
+	}
+	if len(cfg2.BearerMethodsSupported) != 1 {
+		t.Errorf("PRMConfig should return independent slices (BearerMethodsSupported len = %d)", len(cfg2.BearerMethodsSupported))
 	}
 }
 
@@ -684,5 +804,39 @@ func TestNew_InvalidVerifierOption(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected error for HMAC algorithm, got nil")
+	}
+}
+
+// resource.New must reject URIs that ParseRequestURI accepts but that
+// can't anchor a DPoP htu binding or a PRM URL — scheme-less absolute
+// paths (`/mcp`) and authority-less schemes. Pushing the rejection up to
+// the boundary the operator calls means downstream consumers (the HTTP
+// adapter's resourceOrigin, the PRM emitter) can rely on Scheme + Host
+// being non-empty without defensive panics.
+func TestNew_RejectsInvalidResourceURI(t *testing.T) {
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
+			return nil, nil, fmt.Errorf("not called")
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{"scheme-less absolute path", "/mcp"},
+		{"authority-less scheme", "file:///tmp/mcp"},
+		{"empty", ""},
+		{"malformed", "://no-scheme"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := resource.New(tt.uri, testIssuer, jc)
+			if err == nil {
+				t.Fatalf("resource.New(%q): expected error, got nil", tt.uri)
+			}
+		})
 	}
 }

@@ -22,6 +22,34 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 )
 
+// dpopCtxWithProof routes every conformance test that submits a DPoP
+// proof through NewDPoPContext, the §4.3 enforcement boundary. Direct
+// `&verifier.DPoPContext{...}` literals would bypass the factory and
+// undercut the single-source architectural guarantee — the verifier
+// reads `Proof()` and never re-checks header cardinality. The helper
+// is fatal on factory errors because every caller below passes a
+// single non-blank proof; cardinality violations are the only thing
+// NewDPoPContext rejects.
+func dpopCtxWithProof(t *testing.T, method, url, proof string) *verifier.DPoPContext {
+	t.Helper()
+	ctx, err := verifier.NewDPoPContext(method, url, []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext(%q, %q, [...]): %v", method, url, err)
+	}
+	return ctx
+}
+
+// dpopCtxNoProof is the no-proof companion for tests that exercise the
+// "DPoP-bound token but no proof attached" path.
+func dpopCtxNoProof(t *testing.T, method, url string) *verifier.DPoPContext {
+	t.Helper()
+	ctx, err := verifier.NewDPoPContext(method, url, nil)
+	if err != nil {
+		t.Fatalf("NewDPoPContext(%q, %q, nil): %v", method, url, err)
+	}
+	return ctx
+}
+
 // inMemoryReplayStore is a simple DPoP replay store for testing.
 type inMemoryReplayStore struct {
 	seen map[string]time.Time
@@ -136,11 +164,7 @@ func TestRFC9449DPoPProofHeaderTypMustBeDPoPJWT(t *testing.T) {
 	proof, _ := jws.CompactSerialize()
 
 	// Submit the wrong-typ proof to the verifier — must be rejected.
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for DPoP proof with wrong typ")
 	}
@@ -340,11 +364,7 @@ func TestRFC9449InboundDPoPProofMustValidateMethodURLAndBinding(t *testing.T) {
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	result, err := tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	result, err := tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -369,10 +389,7 @@ func TestRFC9449BearerTokenWithRequestContextAndNoProofMustStillVerifyAsBearer(t
 	token, _ := testutil.SignToken(claims, key, jose.ES256, "key-0")
 
 	// Verify with a DPoP context that has no proof. Bearer tokens should still verify.
-	result, err := tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-	})
+	result, err := tv.VerifyToken(ctx, token, dpopCtxNoProof(t, "POST", "https://api.example.com/resource"))
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -432,11 +449,7 @@ func TestRFC9449DPoPReplayMustBeDetected(t *testing.T) {
 		AccessToken: token,
 	})
 
-	dpopCtx := &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	}
+	dpopCtx := dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof)
 
 	// First use should succeed.
 	_, err = tv.VerifyToken(ctx, token, dpopCtx)
@@ -479,11 +492,7 @@ func TestRFC9449DPoPMethodMismatchMustBeRejected(t *testing.T) {
 		AccessToken: token,
 	})
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "GET",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "GET", "https://api.example.com/resource", proof))
 	// Note: The Go SDK uses EqualFold for htm comparison, so POST vs GET will still fail
 	// because the strings are different.
 	if err == nil {
@@ -518,11 +527,7 @@ func TestRFC9449DPoPURLMismatchMustBeRejected(t *testing.T) {
 		AccessToken: token,
 	})
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/different-resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/different-resource", proof))
 	if err == nil {
 		t.Fatal("expected error for URL mismatch")
 	}
@@ -558,11 +563,7 @@ func TestRFC9449DPoPProofHTUMustBeNormalizedBeforeComparison(t *testing.T) {
 		})
 
 		// Request URL with lowercase.
-		_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-			Method: "POST",
-			URL:    "https://api.example.com/resource",
-			Proof:  proof,
-		})
+		_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 		if err != nil {
 			t.Fatalf("normalized HTU comparison should pass: %v", err)
 		}
@@ -575,11 +576,7 @@ func TestRFC9449DPoPProofHTUMustBeNormalizedBeforeComparison(t *testing.T) {
 		})
 
 		// Request URL WITH query params — verifier must strip them before comparing.
-		_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-			Method: "POST",
-			URL:    "https://api.example.com/resource?page=1&sort=asc",
-			Proof:  proof,
-		})
+		_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource?page=1&sort=asc", proof))
 		if err != nil {
 			t.Fatalf("htu comparison must ignore query/fragment (RFC 9449 §4.3): %v", err)
 		}
@@ -612,11 +609,7 @@ func TestRFC9449DPoPProofHTMMustBeCaseSensitive(t *testing.T) {
 	})
 
 	// Request with "POST" (uppercase) — must be rejected.
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error: htm comparison must be case-sensitive per RFC 9110 §9.1")
 	}
@@ -718,11 +711,7 @@ func TestRFC9449DPoPProofExpMustBeEnforcedWhenPresent(t *testing.T) {
 		t.Fatalf("serialize proof: %v", err)
 	}
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for expired DPoP proof exp")
 	}
@@ -868,11 +857,7 @@ func TestRFC9449DPoPProofIATMustNotBeInTheFutureBeyondLeeway(t *testing.T) {
 	jws, _ := proofSigner.Sign(payload)
 	proof, _ := jws.CompactSerialize()
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for future iat in DPoP proof")
 	}
@@ -924,11 +909,7 @@ func TestRFC9449DPoPProofMustNotBeTooOld(t *testing.T) {
 	jws, _ := proofSigner.Sign(payload)
 	proof, _ := jws.CompactSerialize()
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for old DPoP proof")
 	}
@@ -962,11 +943,7 @@ func TestRFC9449DPoPProofRequiredWhenValidatingDPoPBoundToken(t *testing.T) {
 	}
 
 	// DPoP context with empty proof.
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  "",
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxNoProof(t, "POST", "https://api.example.com/resource"))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1000,11 +977,7 @@ func TestRFC9449DPoPBindingMismatchMustBeRejected(t *testing.T) {
 		AccessToken: token,
 	})
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for binding mismatch")
 	}
@@ -1038,11 +1011,7 @@ func TestRFC9449DPoPATHMismatchMustBeRejected(t *testing.T) {
 		AccessToken: "different-token-value",
 	})
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if err == nil {
 		t.Fatal("expected error for ath mismatch")
 	}
@@ -1102,11 +1071,7 @@ func TestRFC9449DPoPProofValidationMustNotSkipBindingWhenAccessTokenIsProvided(t
 	// Proof without ath (access token hash) when token is provided.
 	proof, _ := dpopSigner.GenerateProof("POST", "https://api.example.com/resource", nil)
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	// The verifier should reject because ath is missing/mismatched.
 	if err == nil {
 		t.Fatal("expected error when proof lacks ath for a bound token")
@@ -1268,11 +1233,7 @@ func TestRFC9449DPoPNotSupportedResourceRejectsBoundToken(t *testing.T) {
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if !errors.Is(err, verifier.ErrDPoPNotSupported) {
 		t.Errorf("expected ErrDPoPNotSupported, got %v", err)
 	}
@@ -1312,11 +1273,7 @@ func TestRFC9449VerifierMustRejectDPoPProofWhenAccessTokenIsNotDPoPBound(t *test
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	_, err = tv.VerifyToken(ctx, token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	_, err = tv.VerifyToken(ctx, token, dpopCtxWithProof(t, "POST", "https://api.example.com/resource", proof))
 	if !errors.Is(err, verifier.ErrDPoPBindingMismatch) {
 		t.Errorf("expected ErrDPoPBindingMismatch, got %v", err)
 	}

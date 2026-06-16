@@ -18,6 +18,13 @@ var (
 	ErrDPoPInvalid        = errors.New("verifier: DPoP invalid")
 	ErrDPoPKeyMismatch    = errors.New("verifier: DPoP key mismatch")
 	ErrDPoPReplayDetected = errors.New("verifier: DPoP replay detected")
+	// ErrMultipleDpopProofs is returned when an inbound request carries more
+	// than one DPoP HTTP header. RFC 9449 §4.3 #1 is a MUST-level
+	// receiving-server check; the spec-correct response per §7.1 is HTTP 401
+	// with `WWW-Authenticate: DPoP error="invalid_dpop_proof"`. The other
+	// ErrDPoP* shapes in this SDK still emit invalid_token — only this §4.3
+	// error code follows the §7.1 prescription.
+	ErrMultipleDpopProofs = errors.New("verifier: multiple DPoP proofs")
 	// ErrDPoPBindingMismatch signals a structural mismatch between the DPoP
 	// proof and the access token's binding — distinct from ErrDPoPKeyMismatch
 	// (jkt thumbprint disagreement) and ErrDPoPInvalid (proof JWT itself

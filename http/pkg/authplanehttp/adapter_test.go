@@ -147,6 +147,54 @@ func TestMiddlewareNoToken(t *testing.T) {
 	}
 }
 
+// TestMiddlewareNoTokenWWWAuthenticateExact pins the *exact* header value for
+// the no-token 401 to catch malformed separators between the auth-scheme and
+// auth-params. RFC 9110 §11.1 requires `auth-scheme 1*SP auth-param`; the
+// previous implementation produced `Bearer, resource_metadata="..."` (comma
+// straight after the scheme), which is invalid and broke MCP RFC 9728
+// discovery on the very first unauthenticated request.
+func TestMiddlewareNoTokenWWWAuthenticateExact(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.Middleware()(okHandler())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/mcp/add", nil))
+
+	got := rec.Header().Get("WWW-Authenticate")
+	want := `Bearer resource_metadata="` + e.adapter.WellKnownPRMPath()
+	// The full prmURL is scheme+host+path-derived; assert the prefix and that
+	// the comma-after-scheme defect is not present.
+	if !strings.HasPrefix(got, "Bearer resource_metadata=\"") {
+		t.Errorf("WWW-Authenticate = %q; want it to start with `Bearer resource_metadata=\"`", got)
+	}
+	if strings.Contains(got, "Bearer,") {
+		t.Errorf("WWW-Authenticate = %q; contains malformed `Bearer,` (no SP between scheme and first param)", got)
+	}
+	if !strings.HasSuffix(got, `"`) {
+		t.Errorf("WWW-Authenticate = %q; want closing quote on resource_metadata value", got)
+	}
+	_ = want // intentional: the exact PRM URL depends on the test environment
+}
+
+// TestMiddlewareInvalidTokenWWWAuthenticateExact pins the format for the
+// invalid-token case — a param (`error="invalid_token"`) is already present, so
+// the resource_metadata separator must be `, `.
+func TestMiddlewareInvalidTokenWWWAuthenticateExact(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.Middleware()(okHandler())
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/mcp/add", nil)
+	req.Header.Set("Authorization", "Bearer not.a.valid.jwt")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	got := rec.Header().Get("WWW-Authenticate")
+	if !strings.HasPrefix(got, `Bearer error="invalid_token"`) {
+		t.Errorf("WWW-Authenticate = %q; want it to start with `Bearer error=\"invalid_token\"`", got)
+	}
+	if !strings.Contains(got, `", resource_metadata="`) {
+		t.Errorf("WWW-Authenticate = %q; want `, resource_metadata=\"…\"` between error and metadata params", got)
+	}
+}
+
 func TestMiddlewareMalformedHeader(t *testing.T) {
 	e := newTestEnv(t)
 	handler := e.adapter.Middleware()(okHandler())

@@ -94,10 +94,11 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Refuse if branch or any of the four tags already exist
-        # Go SDK publishes four tags per release: per-module tags
-        # (core/vX.Y.Z, mcp/vX.Y.Z, http/vX.Y.Z) plus an umbrella vX.Y.Z
-        # tag for the GitHub Release. Any one already present aborts.
+      - name: Refuse if branch or any of the five tags already exist
+        # Go SDK publishes five tags per release: per-module tags
+        # (core/vX.Y.Z, mcp/vX.Y.Z, http/vX.Y.Z, mark3labs/vX.Y.Z) plus
+        # an umbrella vX.Y.Z tag for the GitHub Release. Any one already
+        # present aborts.
         run: |
           v="${{ steps.validate.outputs.release }}"
           branch="${{ steps.validate.outputs.branch }}"
@@ -105,7 +106,7 @@ jobs:
             echo "::error::Branch $branch already exists. Aborting."
             exit 1
           fi
-          for tag in "core/v$v" "mcp/v$v" "http/v$v" "v$v"; do
+          for tag in "core/v$v" "mcp/v$v" "http/v$v" "mark3labs/v$v" "v$v"; do
             if git ls-remote --exit-code --tags origin "$tag" >/dev/null; then
               echo "::error::Tag $tag already exists. Aborting."
               exit 1

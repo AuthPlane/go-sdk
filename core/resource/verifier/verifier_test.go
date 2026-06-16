@@ -653,11 +653,11 @@ func TestVerifyToken_BearerTokenWithDPoPContext_DPoPProofIsNil(t *testing.T) {
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	claims, err := v.VerifyToken(context.Background(), token, &verifier.DPoPContext{
-		Method: "POST",
-		URL:    "https://api.example.com/resource",
-		Proof:  proof,
-	})
+	dpopCtx, err := verifier.NewDPoPContext("POST", "https://api.example.com/resource", []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext: %v", err)
+	}
+	claims, err := v.VerifyToken(context.Background(), token, dpopCtx)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -691,11 +691,11 @@ func TestVerifyToken_DPoPBound_DPoPProofIsPopulated(t *testing.T) {
 	}
 	afterIAT := time.Now().Unix()
 
-	claims, err := v.VerifyToken(context.Background(), token, &verifier.DPoPContext{
-		Method: method,
-		URL:    url,
-		Proof:  proof,
-	})
+	dpopCtx, err := verifier.NewDPoPContext(method, url, []string{proof})
+	if err != nil {
+		t.Fatalf("NewDPoPContext: %v", err)
+	}
+	claims, err := v.VerifyToken(context.Background(), token, dpopCtx)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

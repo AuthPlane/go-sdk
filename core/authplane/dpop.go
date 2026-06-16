@@ -11,9 +11,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"strings"
 	"time"
 
+	"github.com/authplane/go-sdk/core/internal/dpop"
 	"github.com/go-jose/go-jose/v4"
 )
 
@@ -186,7 +186,9 @@ func (d *DPoPSigner) Thumbprint() string {
 // Host header (RFC 9110 §7.2): an explicit default port (:80 for http, :443 for
 // https) is dropped while non-default ports are kept. Without this, an htu
 // carrying an explicit default port would not match the host the AS reconstructs
-// from a port-less Host header. IPv6 literals stay bracketed.
+// from a port-less Host header. IPv6 literals stay bracketed. The default-port
+// rule is shared with the inbound verifier (`core/resource/verifier.validateHTU`)
+// through `core/internal/dpop.NormalizeHost` so the two sides cannot drift.
 func normalizeHTU(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -196,15 +198,7 @@ func normalizeHTU(rawURL string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	u.RawFragment = ""
-	if port := u.Port(); port != "" {
-		if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
-			host := u.Hostname()
-			if strings.Contains(host, ":") {
-				host = "[" + host + "]"
-			}
-			u.Host = host
-		}
-	}
+	u.Host = dpop.NormalizeHost(u)
 	return u.String()
 }
 

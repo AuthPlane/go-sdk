@@ -3,6 +3,8 @@ package verifier
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -11,10 +13,76 @@ import (
 // Resource-level DPoP policy (replay store, proof lifetime, clock skew,
 // allowed algorithms, required flag) lives in InboundDPoPOptions and is
 // configured on the verifier via WithInboundDPoP.
+//
+// The proof slice is unexported so RFC 9449 §4.3 #1 ("not more than one
+// DPoP HTTP request header field") has a single enforcement point:
+// NewDPoPContext. Callers outside this package cannot construct an
+// invalid DPoPContext — the only way to populate the proof is through
+// the constructor, which filters blanks, splits on "," defensively, and
+// returns ErrMultipleDpopProofs on > 1 non-blank value: invalid states are
+// unconstructable rather than guarded after the fact.
 type DPoPContext struct {
 	Method string
 	URL    string
-	Proof  string
+	proofs []string
+}
+
+// NewDPoPContext builds a DPoPContext from the raw DPoP header values the
+// framework adapter pulled off the inbound request, enforcing RFC 9449
+// §4.3 #1 as the SDK's canonical boundary.
+//
+// dpopHeaderValues is the list of values the HTTP layer extracted from the
+// "DPoP" header on the inbound request. Pass:
+//   - nil or empty when no DPoP header is present.
+//   - []string{"<proof>"} when exactly one DPoP header is present.
+//   - r.Header.Values("DPoP") to surface duplicates the wire delivered.
+//
+// Net/http's Header.Values returns each duplicate-named header as its
+// own []string entry, so a request with two DPoP headers reaches this
+// factory as a 2-element slice and trips the cardinality guard
+// directly. The split-on-"," pass is defense-in-depth for upstream
+// proxies or frameworks (NGINX, Envoy, fasthttp clients, etc.) that
+// pre-join duplicates into a single comma-separated value before the
+// SDK sees them. JWS compact serialization never contains a literal
+// comma, so split-on-comma is sound. Empty / whitespace-only entries
+// are dropped; after filtering, more than one non-empty value returns
+// ErrMultipleDpopProofs.
+func NewDPoPContext(method, url string, dpopHeaderValues []string) (*DPoPContext, error) {
+	filtered := make([]string, 0, len(dpopHeaderValues))
+	for _, raw := range dpopHeaderValues {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		// SplitN with n=3 bounds the allocation on an attacker-controlled
+		// header: we only need to distinguish 0 / 1 / ≥ 2 non-blank
+		// pieces, and any third entry already trips the cardinality
+		// guard below.
+		for _, part := range strings.SplitN(trimmed, ",", 3) {
+			piece := strings.TrimSpace(part)
+			if piece != "" {
+				filtered = append(filtered, piece)
+			}
+		}
+	}
+	if len(filtered) > 1 {
+		return nil, fmt.Errorf("%w: request carries %d DPoP proofs (RFC 9449 §4.3 forbids it)", ErrMultipleDpopProofs, len(filtered))
+	}
+	return &DPoPContext{
+		Method: method,
+		URL:    url,
+		proofs: filtered,
+	}, nil
+}
+
+// Proof returns the single DPoP proof carried by the request, or "" when
+// no proof accompanied it. The accessor is nil-safe; the underlying
+// slice is unexported and only NewDPoPContext can populate it.
+func (c *DPoPContext) Proof() string {
+	if c == nil || len(c.proofs) == 0 {
+		return ""
+	}
+	return c.proofs[0]
 }
 
 // DPoPReplayStore checks and stores DPoP proof JTI values for replay prevention.

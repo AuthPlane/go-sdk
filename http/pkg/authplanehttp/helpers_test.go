@@ -223,3 +223,95 @@ func ecJWK(pub *ecdsa.PublicKey, kid string) map[string]any {
 	_ = json.Unmarshal(b, &m)
 	return m
 }
+
+// httpsTestEnv mirrors testEnv but lets the wrapped Resource use any
+// caller-supplied URI so DPoP htu reconstruction can be exercised behind
+// TLS-terminating proxies (https resource, plain-http inbound) or against
+// explicit-default-port origins. Tokens are minted with the matching aud.
+type httpsTestEnv struct {
+	adapter     *authplanehttp.Adapter
+	key         *rsa.PrivateKey
+	issuer      string
+	kid         string
+	resourceURI string
+}
+
+func newHTTPSTestEnv(t *testing.T) *httpsTestEnv {
+	return newTestEnvForResource(t, "https://api.example.com/mcp")
+}
+
+// newDefaultPortTestEnv pins the resource to an http URI carrying an
+// explicit default port (`:80`) so the htu default-port normalization
+// path is exercised. The standard `testEnv` uses `:8080`, which never
+// triggers normalization.
+func newDefaultPortTestEnv(t *testing.T) *httpsTestEnv {
+	return newTestEnvForResource(t, "http://api.example.com:80/mcp")
+}
+
+// newTestEnvForResource builds an httpsTestEnv pinned to the given
+// resource URI. Shared builder factored out of the per-scenario helpers
+// so a single mux/JWKS/issuer scaffold drives every variant.
+func newTestEnvForResource(t *testing.T, resourceURI string) *httpsTestEnv {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate RSA key: %v", err)
+	}
+	const kid = "test-key"
+	jwksBody := mustMarshal(t, map[string]any{
+		"keys": []any{rsaJWK(&key.PublicKey, kid)},
+	})
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	mux.HandleFunc("/.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(jwksBody)
+	})
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(mustMarshal(t, map[string]any{
+			"issuer":         srv.URL,
+			"jwks_uri":       srv.URL + "/.well-known/jwks.json",
+			"token_endpoint": srv.URL + "/oauth/token",
+		}))
+	})
+	client, err := authplane.NewClient(context.Background(), srv.URL, authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	res, err := client.Resource(resourceURI,
+		resource.WithScopes("tools/add", "tools/multiply"),
+		resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{
+			ReplayStore: verifier.NewInMemoryDPoPReplayStore(),
+		})),
+	)
+	if err != nil {
+		t.Fatalf("client.Resource: %v", err)
+	}
+	adapter := authplanehttp.New(res)
+	return &httpsTestEnv{adapter: adapter, key: key, issuer: srv.URL, kid: kid, resourceURI: resourceURI}
+}
+
+func (e *httpsTestEnv) makeTokenWithCnf(t *testing.T, scopes []string, exp time.Time, cnf map[string]any) string {
+	t.Helper()
+	headerJSON := mustMarshal(t, map[string]string{"alg": "RS256", "typ": "at+jwt", "kid": e.kid})
+	claims := map[string]any{
+		"iss": e.issuer, "aud": e.resourceURI, "sub": "user-test",
+		"jti": "jti-" + time.Now().Format(time.RFC3339Nano), "client_id": e.resourceURI,
+		"iat": time.Now().Unix(), "exp": exp.Unix(), "scope": strings.Join(scopes, " "),
+	}
+	if cnf != nil {
+		claims["cnf"] = cnf
+	}
+	claimsJSON := mustMarshal(t, claims)
+	sigInput := b64url(headerJSON) + "." + b64url(claimsJSON)
+	h := sha256.New()
+	h.Write([]byte(sigInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, e.key, crypto.SHA256, h.Sum(nil))
+	if err != nil {
+		t.Fatalf("sign JWT: %v", err)
+	}
+	return sigInput + "." + b64url(sig)
+}

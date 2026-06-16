@@ -4,7 +4,7 @@ Short guide. For complete context and detailed examples, read `llm-full.txt`.
 
 ## What this repo provides
 
-A Go workspace containing the framework-agnostic Authplane SDK and two
+A Go workspace containing the framework-agnostic Authplane SDK and three
 framework adapters for protecting MCP servers and OAuth 2.1 resource servers
 with tokens issued by an Authplane authorization server.
 
@@ -17,6 +17,9 @@ Modules:
   official MCP Go SDK's HTTP transport.
 - `http/` — module `github.com/authplane/go-sdk/http` — `net/http` middleware
   with DPoP sender-constrained token support.
+- `mark3labs/` — module `github.com/authplane/go-sdk/mark3labs` — adapter for
+  `github.com/mark3labs/mcp-go` servers; wraps `*authplanehttp.Adapter` and
+  exposes `HTTPContextFunc` for per-tool-call context propagation.
 
 ## First files to read
 
@@ -25,14 +28,16 @@ Modules:
 - `core/resource/`, `core/resource/verifier/`
 - `mcp/README.md`, `mcp/pkg/authplanemcp/`
 - `http/README.md`, `http/pkg/authplanehttp/`
+- `mark3labs/README.md`, `mark3labs/pkg/authplanemark3labs/`
 
 ## Architecture rules
 
 - All protocol verification and AS interaction lives in `core/`.
-- Adapters (`mcp/`, `http/`) are thin: they translate framework request
-  contexts into core-verifier calls and translate core errors into framework
-  responses.
-- Keep MCP and HTTP adapter behavior aligned where equivalent.
+- Adapters (`mcp/`, `http/`, `mark3labs/`) are thin: they translate framework
+  request contexts into core-verifier calls and translate core errors into
+  framework responses. The `mark3labs/` adapter is itself a thin wrapper
+  over `http/`, so common DPoP/PRM behavior stays single-sourced.
+- Keep adapter behavior aligned where equivalent.
 - Do not duplicate shared behavior across modules — put it in `core/`.
 - Keep protocol helpers stateless; keep cache/resilience/orchestration in
   stateful client structures.
@@ -63,8 +68,9 @@ if err != nil { panic(err) }
 claims, err := res.VerifyToken(ctx, token)
 ```
 
-For a runnable end-to-end example see `http/demo/` (net/http resource server)
-or `mcp/demo/` (MCP adapter using the official MCP Go SDK).
+For a runnable end-to-end example see `http/demo/` (net/http resource server),
+`mcp/demo/` (MCP adapter using the official MCP Go SDK), or `mark3labs/demo/`
+(MCP adapter using `mark3labs/mcp-go`).
 
 ## Key public types
 
@@ -91,6 +97,7 @@ or `mcp/demo/` (MCP adapter using the official MCP Go SDK).
 
 - `core/`, `http/`: Go 1.24+.
 - `mcp/`: Go 1.25+ (forced by `github.com/modelcontextprotocol/go-sdk`).
+- `mark3labs/`: Go 1.25+ (forced by `github.com/mark3labs/mcp-go`).
 
 ## Cross-repo references
 

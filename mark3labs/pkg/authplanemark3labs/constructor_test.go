@@ -1,4 +1,4 @@
-package authplanemcp_test
+package authplanemark3labs_test
 
 import (
 	"context"
@@ -12,13 +12,13 @@ import (
 
 	"github.com/authplane/go-sdk/core/authplane"
 	"github.com/authplane/go-sdk/core/resource/verifier"
-	"github.com/authplane/go-sdk/mcp/pkg/authplanemcp"
+	"github.com/authplane/go-sdk/mark3labs/pkg/authplanemark3labs"
 )
 
 // TestNewAdapterInvalidIssuer verifies that NewAdapter returns an error when
 // the issuer URL is unreachable.
 func TestNewAdapterInvalidIssuer(t *testing.T) {
-	_, err := authplanemcp.NewAdapter(context.Background(), authplanemcp.Options{
+	_, err := authplanemark3labs.NewAdapter(context.Background(), authplanemark3labs.Options{
 		Issuer:   "http://127.0.0.1:1", // unreachable port
 		Resource: testResource,
 		Scopes:   []string{"tools/add"},
@@ -58,7 +58,7 @@ func TestNewAdapterWithVerifierOptions(t *testing.T) {
 		}))
 	})
 
-	adapter, err := authplanemcp.NewAdapter(context.Background(), authplanemcp.Options{
+	adapter, err := authplanemark3labs.NewAdapter(context.Background(), authplanemark3labs.Options{
 		Issuer:          srv.URL,
 		Resource:        testResource,
 		Scopes:          []string{"tools/add"},
@@ -92,13 +92,11 @@ func TestClientAndResourceAccessors(t *testing.T) {
 func TestNewAdapterFromClientAndResource(t *testing.T) {
 	e := newTestEnv(t)
 
-	// Build a second adapter reusing the same client and resource.
-	adapter2, err := authplanemcp.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource())
+	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource())
 	if err != nil {
 		t.Fatalf("NewAdapterFromClientAndResource: %v", err)
 	}
 
-	// Verify the adapter works — unauthenticated request should get 401.
 	handler := adapter2.AuthMiddleware(okHandler())
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
@@ -108,12 +106,12 @@ func TestNewAdapterFromClientAndResource(t *testing.T) {
 }
 
 // TestNewAdapterFromClientAndResourceNilClient verifies that a nil client
-// yields a clear error rather than a later nil-pointer dereference inside
-// AuthMiddleware/Close.
+// yields a clear error rather than a panic — the constructor's signature
+// matches the sibling mcp adapter.
 func TestNewAdapterFromClientAndResourceNilClient(t *testing.T) {
-	_, err := authplanemcp.NewAdapterFromClientAndResource(nil, nil)
+	_, err := authplanemark3labs.NewAdapterFromClientAndResource(nil, nil)
 	if err == nil {
-		t.Fatal("expected error for nil client")
+		t.Fatal("expected error on nil client")
 	}
 	if !strings.Contains(err.Error(), "client") {
 		t.Errorf("error = %v; want it to mention 'client'", err)
@@ -121,14 +119,14 @@ func TestNewAdapterFromClientAndResourceNilClient(t *testing.T) {
 }
 
 // TestNewAdapterFromClientAndResourceNilResource verifies the second guard —
-// a non-nil client with a nil resource must return an error, not nil-deref
-// later on res.PRMURL() / Middleware().
+// a non-nil client with a nil resource must also return an error, not nil-deref
+// inside authplanehttp.New(res).
 func TestNewAdapterFromClientAndResourceNilResource(t *testing.T) {
 	e := newTestEnv(t)
 
-	_, err := authplanemcp.NewAdapterFromClientAndResource(e.adapter.Client(), nil)
+	_, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), nil)
 	if err == nil {
-		t.Fatal("expected error for nil resource")
+		t.Fatal("expected error on nil resource")
 	}
 	if !strings.Contains(err.Error(), "res") {
 		t.Errorf("error = %v; want it to mention 'res'", err)
@@ -172,7 +170,7 @@ func TestAutoWiredIntrospectionNotWipedByEmptyVerifierOptions(t *testing.T) {
 		w.Write(mustMarshal(t, map[string]any{"active": false}))
 	})
 
-	adapter, err := authplanemcp.NewAdapter(context.Background(), authplanemcp.Options{
+	adapter, err := authplanemark3labs.NewAdapter(context.Background(), authplanemark3labs.Options{
 		Issuer:   srv.URL,
 		Resource: testResource,
 		Scopes:   []string{"tools/add"},
@@ -215,8 +213,8 @@ func TestWellKnownPRMPath(t *testing.T) {
 
 // TestContextWithClaimsRoundTrip verifies the test helper ContextWithClaims.
 func TestContextWithClaimsRoundTrip(t *testing.T) {
-	ctx := authplanemcp.ContextWithClaims(context.Background(), nil)
-	if got := authplanemcp.ClaimsFromContext(ctx); got != nil {
+	ctx := authplanemark3labs.ContextWithClaims(context.Background(), nil)
+	if got := authplanemark3labs.ClaimsFromContext(ctx); got != nil {
 		t.Errorf("ClaimsFromContext after ContextWithClaims(nil) = %v, want nil", got)
 	}
 }
@@ -224,8 +222,8 @@ func TestContextWithClaimsRoundTrip(t *testing.T) {
 // TestContextWithTokenRoundTrip verifies the test helper ContextWithToken.
 func TestContextWithTokenRoundTrip(t *testing.T) {
 	const want = "test-token-value"
-	ctx := authplanemcp.ContextWithToken(context.Background(), want)
-	if got := authplanemcp.TokenFromContext(ctx); got != want {
+	ctx := authplanemark3labs.ContextWithToken(context.Background(), want)
+	if got := authplanemark3labs.TokenFromContext(ctx); got != want {
 		t.Errorf("TokenFromContext = %q, want %q", got, want)
 	}
 }

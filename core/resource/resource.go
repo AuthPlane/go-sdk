@@ -12,12 +12,39 @@ import (
 
 // Resource represents a protected resource with PRM generation and token verification.
 type Resource struct {
-	uri      string
-	scopes   []string
-	issuer   string
-	verifier *verifier.TokenVerifier
-	prmJSON  []byte
-	prmMap   map[string]any
+	uri       string
+	scopes    []string
+	issuer    string
+	verifier  *verifier.TokenVerifier
+	prmJSON   []byte
+	prmMap    map[string]any
+	prmConfig PRMConfig
+	prmURL    string
+}
+
+// PRMConfig is the typed view of the Protected Resource Metadata document
+// (RFC 9728), suitable for adapters that need to feed the values into a
+// third-party PRM-serving handler (e.g. mark3labs/mcp-go's
+// server.NewProtectedResourceMetadataHandler).
+//
+// Adapters should consume this instead of the dynamic map returned by
+// PRMResponse: the field-by-field mapping keeps adapters in sync with the
+// emitter — when buildPRM gains a new field, it appears here too, and the
+// (unlikely) silent-drop class of bug from map-key typos or interface{}
+// type-assertions is gone.
+//
+// Field naming and JSON encoding mirror RFC 9728 §2 (snake_case JSON,
+// PascalCase Go), and only fields actually populated by Resource.buildPRM are
+// present. Pointer-typed fields encode the difference between "field absent"
+// (nil) and "field present with zero value" — only DPoPBoundAccessTokensRequired
+// currently needs this. New fields added to buildPRM must be added here.
+type PRMConfig struct {
+	Resource                      string
+	AuthorizationServers          []string
+	BearerMethodsSupported        []string
+	ScopesSupported               []string
+	DPoPSigningAlgValuesSupported []string
+	DPoPBoundAccessTokensRequired *bool
 }
 
 // Option configures a Resource.
@@ -61,6 +88,16 @@ func (r *Resource) URI() string {
 	return r.uri
 }
 
+// PRMURL returns the absolute Protected Resource Metadata URL (RFC 9728 §3),
+// e.g. "https://api.example.com/.well-known/oauth-protected-resource/mcp".
+//
+// The value is precomputed at construction time from the already-validated
+// resource URI, so this accessor is infallible — adapters should consume it
+// instead of re-deriving the URL from URI() and WellKnownPRMPath().
+func (r *Resource) PRMURL() string {
+	return r.prmURL
+}
+
 // WellKnownPRMPath returns the RFC 9728 well-known path for this resource.
 // The path is formed by inserting "/.well-known/oauth-protected-resource"
 // between the host and the path component of the resource URI.
@@ -83,9 +120,20 @@ func wellKnownPRMPath(resourceURI string) string {
 }
 
 // New creates a new Resource.
+//
+// The resource URI must be an absolute URL with a scheme and host —
+// `url.ParseRequestURI` alone accepts absolute paths like `/mcp` and
+// non-authority schemes, neither of which can anchor a DPoP htu binding
+// or a PRM well-known URL. Rejecting them at this boundary keeps the
+// invariant that downstream consumers (the HTTP adapter, the PRM emitter)
+// rely on consistent.
 func New(uri, issuer string, jwksCache *verifier.JWKSCache, opts ...Option) (*Resource, error) {
-	if _, err := url.ParseRequestURI(uri); err != nil {
+	parsed, err := url.ParseRequestURI(uri)
+	if err != nil {
 		return nil, fmt.Errorf("resource: invalid resource URI: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("resource: resource URI must be absolute with scheme and host, got %q", uri)
 	}
 
 	cfg := &resourceConfig{}
@@ -132,22 +180,73 @@ func (r *Resource) PRMJSON() []byte {
 	return cp
 }
 
+// PRMConfig returns the Protected Resource Metadata document as a typed
+// struct. Slice fields are copied; the returned value is safe to mutate
+// without affecting subsequent calls.
+//
+// Prefer this over PRMResponse when feeding the values into another
+// PRM-serving library — it removes the map-key typo and interface{}
+// type-assertion failure modes.
+func (r *Resource) PRMConfig() PRMConfig {
+	cp := r.prmConfig
+	if r.prmConfig.AuthorizationServers != nil {
+		cp.AuthorizationServers = append([]string(nil), r.prmConfig.AuthorizationServers...)
+	}
+	if r.prmConfig.BearerMethodsSupported != nil {
+		cp.BearerMethodsSupported = append([]string(nil), r.prmConfig.BearerMethodsSupported...)
+	}
+	if r.prmConfig.ScopesSupported != nil {
+		cp.ScopesSupported = append([]string(nil), r.prmConfig.ScopesSupported...)
+	}
+	if r.prmConfig.DPoPSigningAlgValuesSupported != nil {
+		cp.DPoPSigningAlgValuesSupported = append([]string(nil), r.prmConfig.DPoPSigningAlgValuesSupported...)
+	}
+	if r.prmConfig.DPoPBoundAccessTokensRequired != nil {
+		v := *r.prmConfig.DPoPBoundAccessTokensRequired
+		cp.DPoPBoundAccessTokensRequired = &v
+	}
+	return cp
+}
+
 func (r *Resource) buildPRM() {
-	prm := map[string]any{
-		"resource":                 r.uri,
-		"authorization_servers":    []string{r.issuer},
-		"bearer_methods_supported": []string{"header"},
+	cfg := PRMConfig{
+		Resource:               r.uri,
+		AuthorizationServers:   []string{r.issuer},
+		BearerMethodsSupported: []string{"header"},
 	}
 	if len(r.scopes) > 0 {
-		prm["scopes_supported"] = r.scopes
+		cfg.ScopesSupported = r.scopes
 	}
 	// RFC 9728 §2: advertise DPoP signing algorithms when DPoP is supported.
 	if dpop := r.verifier.InboundDPoPView(); dpop != nil {
-		prm["dpop_signing_alg_values_supported"] = dpop.AllowedAlgorithmStrings
+		cfg.DPoPSigningAlgValuesSupported = dpop.AllowedAlgorithmStrings
 		if dpop.Required {
-			prm["dpop_bound_access_tokens_required"] = true
+			t := true
+			cfg.DPoPBoundAccessTokensRequired = &t
 		}
+	}
+	r.prmConfig = cfg
+
+	prm := map[string]any{
+		"resource":                 cfg.Resource,
+		"authorization_servers":    cfg.AuthorizationServers,
+		"bearer_methods_supported": cfg.BearerMethodsSupported,
+	}
+	if cfg.ScopesSupported != nil {
+		prm["scopes_supported"] = cfg.ScopesSupported
+	}
+	if cfg.DPoPSigningAlgValuesSupported != nil {
+		prm["dpop_signing_alg_values_supported"] = cfg.DPoPSigningAlgValuesSupported
+	}
+	if cfg.DPoPBoundAccessTokensRequired != nil {
+		prm["dpop_bound_access_tokens_required"] = *cfg.DPoPBoundAccessTokensRequired
 	}
 	r.prmMap = prm
 	r.prmJSON, _ = json.Marshal(prm)
+
+	// r.uri was validated by New (url.ParseRequestURI), so url.Parse cannot
+	// fail here — this is the single, infallible source of truth that
+	// adapters consume via PRMURL().
+	u, _ := url.Parse(r.uri)
+	r.prmURL = u.ResolveReference(&url.URL{Path: wellKnownPRMPath(r.uri)}).String()
 }
