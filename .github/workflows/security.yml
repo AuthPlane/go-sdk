@@ -56,7 +56,9 @@ jobs:
           cache-dependency-path: "${{ matrix.module }}/go.sum"
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Pinned to a tagged release rather than @latest so the toolchain is
+        # reproducible and the build can't be moved by an upstream retag.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
 
       - name: Run govulncheck
         # Exits non-zero on any known vulnerability in the module's call graph

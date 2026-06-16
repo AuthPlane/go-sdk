@@ -341,6 +341,31 @@ func TestRequireScopesMultipleOneMissing(t *testing.T) {
 	}
 }
 
+// TestRequireScopesMultipleAllMissingNamesEveryScope verifies the middleware
+// surfaces all missing scopes (not just the first) in the error_description,
+// matching the shape of a direct claims.RequireScopes call. The
+// WWW-Authenticate header carries the scopes space-separated per RFC 6750 §3;
+// the enriched quoted-list shape lives in the JSON body's error_description.
+func TestRequireScopesMultipleAllMissingNamesEveryScope(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.Middleware()(e.adapter.RequireScopes("tools/admin", "tools/superuser")(okHandler()))
+	token := e.makeToken(t, []string{"tools/add"}, time.Now().Add(time.Hour))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/mcp/admin", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); !strings.Contains(got, `scope="tools/admin tools/superuser"`) {
+		t.Errorf("WWW-Authenticate = %q, want scope=\"tools/admin tools/superuser\"", got)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `\"tools/admin\"`) || !strings.Contains(body, `\"tools/superuser\"`) {
+		t.Errorf("body = %s, want error_description to name every missing scope (not just the first)", body)
+	}
+}
+
 // Case-insensitive scheme tests
 
 func TestMiddleware_BearerCaseInsensitive(t *testing.T) {
