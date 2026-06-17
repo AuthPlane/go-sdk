@@ -103,13 +103,10 @@ func (c *VerifiedClaims) HasScope(scope string) bool {
 // Thin wrapper over [RequireScopes] so the singular helper carries the
 // same enriched `required scope "X"; token has scopes: …` shape the
 // plural one does. The wire body produced from this path is byte-identical
-// to a `claims.RequireScopes(scope)` call. Note that the adapter middleware
-// at github.com/authplane/go-sdk/http/pkg/authplanehttp.Adapter.RequireScopes
-// still loops over scopes and returns on the first miss, so a multi-scope
-// adapter failure names only one scope; a direct
-// `claims.RequireScopes("a", "b", ...)` call names every missing scope.
-// The two paths converge only on the single-missing-scope case until the
-// adapter is switched over to the plural helper.
+// to a `claims.RequireScopes(scope)` call, and the adapter middleware at
+// github.com/authplane/go-sdk/http/pkg/authplanehttp.Adapter.RequireScopes
+// delegates to RequireScopes too, so middleware-enforced and code-enforced
+// paths produce the same error shape on a multi-scope failure.
 func (c *VerifiedClaims) RequireScope(scope string) error {
 	return c.RequireScopes(scope)
 }

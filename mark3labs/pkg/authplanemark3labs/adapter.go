@@ -78,6 +78,7 @@ type Adapter struct {
 
 	client     *authplane.Client
 	prmHandler http.Handler // mark3labs PRM handler, built once at construction
+	ownsClient bool         // true when this Adapter constructed the client and must close it
 }
 
 // ClaimsFromContext returns the VerifiedClaims injected by Middleware (and
@@ -138,13 +139,15 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 		Adapter:    authplanehttp.New(res),
 		client:     client,
 		prmHandler: server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)),
+		ownsClient: true,
 	}, nil
 }
 
 // NewAdapterFromClientAndResource creates an Adapter from an already-configured
-// authplane.Client and resource.Resource. Adapter.Close() still calls client.Close();
-// when sharing a client across adapters, manage client lifecycle yourself and let
-// the adapters go out of scope.
+// authplane.Client and resource.Resource. The caller retains ownership of the
+// client — adapter.Close() is a no-op for adapters created this way, so a
+// client shared across multiple adapters keeps running even after one of them
+// is closed.
 //
 // Returns an error if client or res is nil. The signature matches the sibling
 // mcp adapter — neither constructor panics, and both surface programming
@@ -160,6 +163,7 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 		Adapter:    authplanehttp.New(res),
 		client:     client,
 		prmHandler: server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)),
+		ownsClient: false,
 	}, nil
 }
 
@@ -325,8 +329,10 @@ func prmConfigFromResource(res *resource.Resource) server.ProtectedResourceMetad
 // Client returns the underlying authplane.Client, providing access to all SDK
 // operations: TokenExchange, Revoke, Introspect, ClientCredentials, DPoPSigner, etc.
 //
-// Do not call Close() on the returned client directly — call adapter.Close() instead,
-// as the adapter owns the client lifecycle.
+// For adapters built with NewAdapter, do not call Close() on the returned client
+// directly — call adapter.Close() instead, as the adapter owns the client lifecycle.
+// For adapters built with NewAdapterFromClientAndResource, the caller owns the
+// client and is responsible for closing it.
 func (a *Adapter) Client() *authplane.Client {
 	return a.client
 }
@@ -334,9 +340,14 @@ func (a *Adapter) Client() *authplane.Client {
 // Close stops all background goroutines and releases resources held by the
 // underlying client. It is safe to call multiple times.
 //
-// When using NewAdapterFromClientAndResource and sharing a client across multiple
-// adapters, call client.Close() directly instead of adapter.Close().
+// For adapters built with NewAdapter, Close closes the underlying client.
+// For adapters built with NewAdapterFromClientAndResource, the caller owns the
+// client; Close is a no-op so a client shared across multiple adapters keeps
+// running even after one of them is closed.
 func (a *Adapter) Close() error {
+	if !a.ownsClient {
+		return nil
+	}
 	return a.client.Close()
 }
 

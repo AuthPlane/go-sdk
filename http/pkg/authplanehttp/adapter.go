@@ -199,6 +199,10 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 // for all required scopes. Returns 403 with RFC 6750 WWW-Authenticate header
 // (including scope= parameter) if any scope is missing. Returns 401 if no claims
 // are in context (i.e., Middleware was not applied upstream).
+//
+// On failure the error_description names every missing scope (not just the first),
+// matching the shape produced by a direct claims.RequireScopes call so middleware-
+// enforced and code-enforced paths surface the same diagnostic to clients.
 func (a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -207,14 +211,12 @@ func (a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handle
 				a.writeAuthError(w, verifier.ErrTokenMissing)
 				return
 			}
-			for _, scope := range scopes {
-				if err := claims.RequireScope(scope); err != nil {
-					a.writeAuthError(w, &resource.ScopeError{
-						RequiredScopes: scopes,
-						Err:            err,
-					})
-					return
-				}
+			if err := claims.RequireScopes(scopes...); err != nil {
+				a.writeAuthError(w, &resource.ScopeError{
+					RequiredScopes: scopes,
+					Err:            err,
+				})
+				return
 			}
 			next.ServeHTTP(w, r)
 		})

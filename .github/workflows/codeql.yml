@@ -1,0 +1,73 @@
+name: CodeQL
+
+# Static analysis (SAST) for the Go modules in this repo. Results are
+# uploaded to the GitHub Security tab.
+#
+# Gated to public repositories only: CodeQL scanning requires GitHub
+# Advanced Security, which is free on public repos but not enabled on the
+# private fork — running it there would fail every PR. The `if:` guard
+# keys off the repo's actual visibility, so this works for any public
+# clone and stays a no-op on private ones. Checking visibility == 'public'
+# (rather than != 'private') also fails safe: if the field is ever absent
+# the job is skipped rather than run.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Wednesdays 06:00 UTC.
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+
+# Least-privilege default; the job below grants only the writes CodeQL needs.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (Go)
+    # Public repos only — see the header comment. Skips cleanly on the fork.
+    if: github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for CodeQL to upload results to the Security tab.
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.25.x"
+          check-latest: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        with:
+          languages: go
+          # This repo is a Go workspace of four independent modules; the
+          # default autobuild can't span them, so we build each module
+          # manually below.
+          build-mode: manual
+
+      - name: Build modules
+        # Compile every module so the extractor sees all packages. go.work
+        # ties the modules together for local dev; here we build each one
+        # in its own directory to keep the extractor's view complete.
+        run: |
+          for module in core http mcp mark3labs; do
+            echo "::group::build $module"
+            (cd "$module" && go build ./...)
+            echo "::endgroup::"
+          done
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        with:
+          category: "/language:go"

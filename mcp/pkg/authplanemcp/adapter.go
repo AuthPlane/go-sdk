@@ -67,9 +67,10 @@ type Options struct {
 // Always call Close() when the adapter is no longer needed to stop background
 // refresh goroutines and release HTTP connections.
 type Adapter struct {
-	client   *authplane.Client
-	resource *resource.Resource
-	prmURL   string // full URL for WWW-Authenticate ResourceMetadataURL
+	client     *authplane.Client
+	resource   *resource.Resource
+	prmURL     string // full URL for WWW-Authenticate ResourceMetadataURL
+	ownsClient bool   // true when this Adapter constructed the client and must close it
 }
 
 // NewAdapter creates and initializes an Adapter. It calls authplane.NewClient,
@@ -110,9 +111,10 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 	}
 
 	return &Adapter{
-		client:   client,
-		resource: res,
-		prmURL:   res.PRMURL(),
+		client:     client,
+		resource:   res,
+		prmURL:     res.PRMURL(),
+		ownsClient: true,
 	}, nil
 }
 
@@ -137,9 +139,10 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 		return nil, errors.New("authplane-mcp: res must not be nil")
 	}
 	return &Adapter{
-		client:   client,
-		resource: res,
-		prmURL:   res.PRMURL(),
+		client:     client,
+		resource:   res,
+		prmURL:     res.PRMURL(),
+		ownsClient: false,
 	}, nil
 }
 
@@ -216,8 +219,10 @@ func (a *Adapter) WellKnownPRMPath() string {
 // Client returns the underlying authplane.Client, providing access to all SDK
 // operations: TokenExchange, Revoke, Introspect, ClientCredentials, DPoPSigner, etc.
 //
-// Do not call Close() on the returned client directly — call adapter.Close() instead,
-// as the adapter owns the client lifecycle.
+// For adapters built with NewAdapter, do not call Close() on the returned client
+// directly — call adapter.Close() instead, as the adapter owns the client lifecycle.
+// For adapters built with NewAdapterFromClientAndResource, the caller owns the
+// client and is responsible for closing it.
 func (a *Adapter) Client() *authplane.Client {
 	return a.client
 }
@@ -244,9 +249,14 @@ func TokenFromContext(ctx context.Context) string {
 // Close stops all background goroutines and releases resources held by the
 // underlying client. It is safe to call Close multiple times.
 //
-// When using NewAdapterFromClientAndResource and sharing a client across multiple
-// adapters, call client.Close() directly instead of adapter.Close().
+// For adapters built with NewAdapter, Close closes the underlying client.
+// For adapters built with NewAdapterFromClientAndResource, the caller owns the
+// client; Close is a no-op so a client shared across multiple adapters keeps
+// running even after one of them is closed.
 func (a *Adapter) Close() error {
+	if !a.ownsClient {
+		return nil
+	}
 	return a.client.Close()
 }
 

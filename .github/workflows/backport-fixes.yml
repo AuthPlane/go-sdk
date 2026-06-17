@@ -31,6 +31,11 @@ concurrency:
   group: backport-${{ inputs.fromBranch }}-to-${{ inputs.toBranch }}
   cancel-in-progress: false
 
+# Least-privilege default; the backport job below elevates to the writes
+# it needs (push the backport branch, open a PR).
+permissions:
+  contents: read
+
 jobs:
   backport:
     runs-on: ubuntu-latest

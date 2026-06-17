@@ -44,6 +44,11 @@ concurrency:
   group: cut-release
   cancel-in-progress: false
 
+# Least-privilege default; the cut job below elevates to contents: write
+# to push the new release branch.
+permissions:
+  contents: read
+
 jobs:
   cut:
     runs-on: ubuntu-latest

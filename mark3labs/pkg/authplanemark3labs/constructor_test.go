@@ -105,6 +105,32 @@ func TestNewAdapterFromClientAndResource(t *testing.T) {
 	}
 }
 
+// TestNewAdapterFromClientAndResource_CloseDoesNotCloseSharedClient verifies
+// that closing an adapter built from an externally-owned client leaves the
+// shared client running — the lifecycle contract documented on
+// NewAdapterFromClientAndResource and Close.
+func TestNewAdapterFromClientAndResource_CloseDoesNotCloseSharedClient(t *testing.T) {
+	e := newTestEnv(t)
+
+	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource())
+	if err != nil {
+		t.Fatalf("NewAdapterFromClientAndResource: %v", err)
+	}
+	if err := adapter2.Close(); err != nil {
+		t.Fatalf("adapter2.Close: %v", err)
+	}
+
+	// The shared client must still serve requests through the original adapter.
+	token := e.makeToken(t, []string{"tools/add"}, time.Now().Add(time.Hour))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	e.adapter.AuthMiddleware(okHandler()).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; shared client must remain usable after adapter2.Close()", rec.Code)
+	}
+}
+
 // TestNewAdapterFromClientAndResourceNilClient verifies that a nil client
 // yields a clear error rather than a panic — the constructor's signature
 // matches the sibling mcp adapter.
