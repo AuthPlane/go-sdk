@@ -192,6 +192,8 @@ func Introspect(ctx context.Context, endpoint string, auth ClientAuthentication,
 		return nil, fmt.Errorf("introspection: invalid JSON response: %w", err)
 	}
 
+	NormalizeCnf(&result.Cnf, &result.CnfJkt)
+
 	// Parse extra fields.
 	var rawMap map[string]any
 	if err := json.Unmarshal(resp.Body, &rawMap); err == nil {
@@ -201,6 +203,9 @@ func Introspect(ctx context.Context, endpoint string, auth ClientAuthentication,
 			"exp": true, "iat": true, "jti": true,
 			// AuthPlane extensions surfaced as first-class fields (RFC 9706).
 			"agent_id": true, "agent_chain": true,
+			// RFC 9449 §6.2 — confirmation. Surfaced first-class above so
+			// it must not also land in Extra.
+			"cnf": true, "cnf_jkt": true,
 		}
 		extra := make(map[string]any)
 		for k, v := range rawMap {
@@ -373,11 +378,41 @@ func doTokenRequest(ctx context.Context, endpoint string, auth ClientAuthenticat
 	}
 
 	// RFC 6749 §5.1 ABNF: expires_in = 1*DIGIT — negative values are malformed.
-	if tokenResp.ExpiresIn < 0 {
-		return nil, fmt.Errorf("%w: expires_in must be non-negative, got %d", ErrProtocolError, tokenResp.ExpiresIn)
+	if tokenResp.ExpiresIn != nil && *tokenResp.ExpiresIn < 0 {
+		return nil, fmt.Errorf("%w: expires_in must be non-negative, got %d", ErrProtocolError, *tokenResp.ExpiresIn)
 	}
 
+	NormalizeCnf(&tokenResp.Cnf, &tokenResp.CnfJkt)
+
 	return &tokenResp, nil
+}
+
+// NormalizeCnf inspects the raw `cnf` JSON value: when it's a JSON object,
+// derives the `cnf_jkt` thumbprint from `cnf.jkt`. When it's absent, null,
+// or a non-object scalar, drops both fields so a malformed AS cannot
+// pollute the typed confirmation-claim shape downstream.
+//
+// Exported so the package-external callers that build response structs
+// from cached state (e.g. `core/authplane/client.go`'s
+// `tokenResponseFromCache`) can apply the same derivation.
+func NormalizeCnf(cnf *json.RawMessage, cnfJkt *string) {
+	*cnfJkt = ""
+	if len(*cnf) == 0 {
+		return
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(*cnf, &obj); err != nil || obj == nil {
+		// Non-object scalar or explicit `null` — drop both fields so a
+		// malformed AS cannot pollute the typed shape downstream.
+		*cnf = nil
+		return
+	}
+	if jktRaw, ok := obj["jkt"]; ok {
+		var jkt string
+		if err := json.Unmarshal(jktRaw, &jkt); err == nil {
+			*cnfJkt = jkt
+		}
+	}
 }
 
 // parseErrorResponse parses an OAuth 2.0 error response body.

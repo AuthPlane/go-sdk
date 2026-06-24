@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -11,9 +12,27 @@ import (
 type CacheEntry struct { //nolint:revive // CacheEntry is the established name used across the SDK
 	AccessToken string
 	TokenType   string
-	ExpiresIn   int64
-	Scope       string
-	ExpiresAt   time.Time
+
+	// ExpiresIn mirrors the wire field's tri-state (nil = AS omitted it,
+	// `*v > 0` = AS-issued lifetime). `*v == 0` never reaches the cache —
+	// Set refuses it — so callers reading from cache see a sentinel that
+	// always round-trips to the AS-issued shape.
+	ExpiresIn *int64
+
+	Scope     string
+	ExpiresAt time.Time
+
+	// Cnf is the raw RFC 9449 §6.1 confirmation object the AS bound to
+	// the token (when DPoP-sender-constrained). Persisted so callers
+	// served from cache see the same sender-constrained shape as on the
+	// first miss — without this, every cache hit silently degraded the
+	// apparent security model of a DPoP-bound token to bearer-only.
+	Cnf json.RawMessage
+
+	// CnfJkt is the DPoP key thumbprint at `cnf.jkt`. Stored alongside
+	// `Cnf` so downstream code reading the convenience accessor cannot
+	// mistake a sender-constrained cache hit for an unbound bearer.
+	CnfJkt string
 }
 
 // TokenCache is a thread-safe in-memory cache for OAuth access tokens, keyed by
@@ -56,12 +75,31 @@ func (c *TokenCache) Get(key string) *CacheEntry {
 	return entry
 }
 
-// Set stores a token in the cache under key. If the effective TTL (expiresIn minus
-// ttlBuffer) is <= 0 the entry is not stored.
-func (c *TokenCache) Set(key, accessToken, tokenType string, expiresIn int64, scope string) {
-	ttl := time.Duration(expiresIn) * time.Second
-	if expiresIn <= 0 {
+// Set stores a token in the cache under key.
+//
+// `expiresIn` is tri-state:
+//
+//   - nil ⇒ the AS omitted `expires_in`; apply `defaultTTL`.
+//   - `*v == 0` ⇒ RFC 6749 §5.1 explicit zero (one-shot, born-expired);
+//     refuse to store so the next Get is a miss instead of a stale hit.
+//   - `*v > 0` ⇒ honor `*v` seconds.
+//
+// The effective TTL (chosen value minus `ttlBuffer`) must be > 0; otherwise
+// the entry is not stored.
+//
+// `cnf` and `cnfJkt` carry the RFC 9449 §6.1 confirmation through the cache so
+// a DPoP-bound token retrieved from cache reports its binding to downstream
+// callers instead of silently degrading to a bearer-only shape. Both may be
+// zero-valued for bearer tokens.
+func (c *TokenCache) Set(key, accessToken, tokenType string, expiresIn *int64, scope string, cnf json.RawMessage, cnfJkt string) {
+	var ttl time.Duration
+	switch {
+	case expiresIn == nil:
 		ttl = c.defaultTTL
+	case *expiresIn == 0:
+		return
+	default:
+		ttl = time.Duration(*expiresIn) * time.Second
 	}
 	ttl -= c.ttlBuffer
 	if ttl <= 0 {
@@ -74,6 +112,8 @@ func (c *TokenCache) Set(key, accessToken, tokenType string, expiresIn int64, sc
 		ExpiresIn:   expiresIn,
 		Scope:       scope,
 		ExpiresAt:   time.Now().Add(ttl),
+		Cnf:         cnf,
+		CnfJkt:      cnfJkt,
 	}
 	c.mu.Unlock()
 }

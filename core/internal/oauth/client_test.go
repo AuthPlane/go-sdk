@@ -242,6 +242,87 @@ func TestIntrospect_Success(t *testing.T) {
 	}
 }
 
+// TestIntrospect_ExposesCnfJkt pins the RFC 9449 §6.2 surface
+// end-to-end: a DPoP-bound introspection response must expose
+// the raw `cnf` object (so callers can read extension members
+// such as `x5t#S256`) and the derived `cnf_jkt` convenience
+// accessor, and `cnf` must not be duplicated into the catch-all
+// `Extra` map.
+func TestIntrospect_ExposesCnfJkt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"active":     true,
+			"token_type": "DPoP",
+			"cnf":        map[string]any{"jkt": "thumbprint-abc"},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := Introspect(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), "tok", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.CnfJkt != "thumbprint-abc" {
+		t.Fatalf("CnfJkt = %q, want %q", resp.CnfJkt, "thumbprint-abc")
+	}
+	if string(resp.Cnf) == "" {
+		t.Fatal("Cnf: expected non-empty raw object")
+	}
+	// cnf must not leak into Extra — it is surfaced first-class above.
+	if _, dup := resp.Extra["cnf"]; dup {
+		t.Errorf("cnf must not appear in Extra: %#v", resp.Extra)
+	}
+}
+
+// TestIntrospect_DropsNonObjectCnf pins the defensive `cnf` shape: a
+// malformed AS sending `cnf` as a non-object scalar must not pollute
+// the typed shape.
+func TestIntrospect_DropsNonObjectCnf(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"active": true,
+			"cnf":    "not-an-object",
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := Introspect(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), "tok", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Cnf != nil {
+		t.Errorf("Cnf: expected nil, got %q", string(resp.Cnf))
+	}
+	if resp.CnfJkt != "" {
+		t.Errorf("CnfJkt: expected empty, got %q", resp.CnfJkt)
+	}
+}
+
+// TestClientCredentials_ExposesCnfJkt pins the same RFC 9449 §6.1
+// surface for the token endpoint half (TokenResponse).
+func TestClientCredentials_ExposesCnfJkt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"access_token": "at",
+			"token_type":   "DPoP",
+			"expires_in":   3600,
+			"cnf":          map[string]any{"jkt": "thumbprint-token"},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := ClientCredentials(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.CnfJkt != "thumbprint-token" {
+		t.Fatalf("CnfJkt = %q, want %q", resp.CnfJkt, "thumbprint-token")
+	}
+	if string(resp.Cnf) == "" {
+		t.Fatal("Cnf: expected non-empty raw object")
+	}
+}
+
 func TestRevoke_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

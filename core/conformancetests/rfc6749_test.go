@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -37,8 +38,12 @@ func TestRFC6749ClientCredentialsSuccessResponse(t *testing.T) {
 	if resp.TokenType != "Bearer" {
 		t.Errorf("token_type = %q, want %q", resp.TokenType, "Bearer")
 	}
-	if resp.ExpiresIn != 3600 {
-		t.Errorf("expires_in = %d, want %d", resp.ExpiresIn, 3600)
+	if resp.ExpiresIn == nil || *resp.ExpiresIn != 3600 {
+		got := "<nil>"
+		if resp.ExpiresIn != nil {
+			got = fmt.Sprintf("%d", *resp.ExpiresIn)
+		}
+		t.Errorf("expires_in = %s, want %d", got, 3600)
 	}
 }
 

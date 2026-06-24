@@ -6,6 +6,7 @@ package authplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -187,11 +188,26 @@ func (c *Client) currentMetadata(ctx context.Context) (*metadata.ASMetadata, err
 }
 
 func (c *Client) tokenResponseFromCache(entry *cache.CacheEntry) *TokenResponse {
+	// Clone Cnf so a caller mutating resp.Cnf bytes cannot corrupt the
+	// shared backing slice held in the cache entry.
+	var cnf json.RawMessage
+	if len(entry.Cnf) > 0 {
+		cnf = append(json.RawMessage(nil), entry.Cnf...)
+	}
+	// Same reason for ExpiresIn: a caller writing through `*resp.ExpiresIn`
+	// would otherwise mutate the cached entry's lifetime in place.
+	var expiresIn *int64
+	if entry.ExpiresIn != nil {
+		v := *entry.ExpiresIn
+		expiresIn = &v
+	}
 	return &TokenResponse{
 		AccessToken: entry.AccessToken,
 		TokenType:   entry.TokenType,
-		ExpiresIn:   entry.ExpiresIn,
+		ExpiresIn:   expiresIn,
 		Scope:       entry.Scope,
+		Cnf:         cnf,
+		CnfJkt:      entry.CnfJkt,
 	}
 }
 
@@ -237,7 +253,7 @@ func (c *Client) ClientCredentials(ctx context.Context, scopes, resources []stri
 	}
 
 	// Cache the token.
-	c.tokenCache.Set(cacheKey, resp.AccessToken, resp.TokenType, resp.ExpiresIn, resp.Scope)
+	c.tokenCache.Set(cacheKey, resp.AccessToken, resp.TokenType, resp.ExpiresIn, resp.Scope, resp.Cnf, resp.CnfJkt)
 
 	return resp, nil
 }
@@ -257,7 +273,7 @@ func (c *Client) TokenExchange(ctx context.Context, opts TokenExchangeInput) (*T
 		return nil, err
 	}
 
-	c.tokenCache.Set(cacheKey, resp.AccessToken, resp.TokenType, resp.ExpiresIn, resp.Scope)
+	c.tokenCache.Set(cacheKey, resp.AccessToken, resp.TokenType, resp.ExpiresIn, resp.Scope, resp.Cnf, resp.CnfJkt)
 
 	return resp, nil
 }
