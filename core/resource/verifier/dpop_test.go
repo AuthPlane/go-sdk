@@ -239,25 +239,20 @@ func TestValidateDPoPProof_EncodedSlashIsNotPlainSlash(t *testing.T) {
 	}
 }
 
-// Percent-encoded triplets MUST compare case-sensitively. RFC 3986
-// §6.2.2.1 *allows* `%2f` and `%2F` to be considered equivalent, but the
-// verifier deliberately compares byte-for-byte — folding case unilaterally
-// would let the verifier accept a proof that a byte-exact signer rejects.
-// Pin the current contract here so a future "let's just uppercase the
-// triplets" patch can't land without the question being answered.
-func TestValidateDPoPProof_PercentEncodedCaseIsNotFolded(t *testing.T) {
+// Percent-encoded triplets compare case-insensitively after the shared
+// dpop.NormalizePath helper upper-cases their hex digits per RFC 3986
+// §6.2.2.1. A proof signed with `%2f` and a request seen as `%2F`
+// produce the same normalized htu path and the binding compares equal.
+func TestValidateDPoPProof_PercentEncodedHexFoldedToUpper(t *testing.T) {
 	key := newTestECKey(t)
 	method := "GET"
 	// Proof's htu carries lower-case `%2f`; request path carries
-	// upper-case `%2F`. Same byte semantics under RFC 3986 §6.2.2.1,
-	// but the verifier intentionally treats them as distinct to keep
-	// the htu binding byte-exact.
+	// upper-case `%2F`. Both normalize to `%2F`, so the htu binding holds.
 	proof := generateDPoPProof(t, key, method, "https://example.com/foo%2fbar", "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo%2Fbar", proof), "")
-	if !errors.Is(err, ErrDPoPInvalid) {
-		t.Fatalf("expected ErrDPoPInvalid for %%2f vs %%2F mismatch, got: %v", err)
+	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo%2Fbar", proof), ""); err != nil {
+		t.Fatalf("expected validation to succeed for %%2f vs %%2F (both fold to %%2F), got: %v", err)
 	}
 }
 

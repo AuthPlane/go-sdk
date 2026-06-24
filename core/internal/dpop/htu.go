@@ -40,23 +40,61 @@ func NormalizeHost(u *url.URL) string {
 	return u.Host
 }
 
-// NormalizePath collapses an empty path to "/" to match the ts and python
-// reference SDKs (`parsed.pathname || "/"` / `parsed.path or "/"`). The Go
-// net/http server hands every request a path of at least "/", so the
-// asymmetry only bites when an htu is built from a bare-origin URL — a
-// Go-signed proof for `https://host` would otherwise fail against a request
-// the server sees as `https://host/`.
+// NormalizePath collapses an empty path to "/" and upper-cases the hex
+// digits of percent-encoded triplets per RFC 3986 §6.2.2.1.
 //
-// Percent-encoded triplets are intentionally NOT case-folded. RFC 3986
-// §6.2.2.1 says that the hex digits within a triplet (`%2f` vs `%2F`)
-// *should* be normalized to upper-case when comparing URIs, but the verifier
-// compares the path byte-for-byte. Folding case unilaterally would let the
-// verifier accept a proof that a byte-exact signer rejects (and vice-versa)
-// on the exact path the §4.3 binding is meant to lock down. Holding the
-// byte-equality contract until an aligned RFC §6.2.2.1 pass lands.
+// Empty-path collapse: the Go net/http server hands every request a
+// path of at least "/", so the asymmetry only bites when an htu is
+// built from a bare-origin URL — a proof signed for `https://host`
+// would otherwise fail against a request the server sees as
+// `https://host/`.
+//
+// Hex upper-casing: RFC 3986 §6.2.2.1 treats `%2f` and `%2F` as
+// equivalent and recommends upper-case as the canonical form. The
+// verifier (`core/resource/verifier/dpop.go`) routes both the proof's
+// htu and the reconstructed request URL through `NormalizePath` before
+// comparing, so canonicalizing hex casing on both sides lets a proof
+// signed with `%2f` match a request whose framework emits `%2F` (or
+// vice versa) without requiring identical raw casing across frameworks.
+// Note: neither Go's `net/url.EscapedPath()` nor WHATWG `URL.pathname`
+// rewrites the case of existing `%XX` triplets — the byte-for-byte
+// equality at the comparison site is produced *here*, not by the parser.
 func NormalizePath(p string) string {
 	if p == "" {
 		return "/"
 	}
-	return p
+	return upperHexPercent(p)
+}
+
+// upperHexPercent rewrites every well-formed `%XX` triplet so the two
+// hex digits are upper-case, leaving bytes outside such triplets
+// (including a bare `%` not followed by two hex chars) untouched.
+func upperHexPercent(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	b := []byte(s)
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] != '%' {
+			continue
+		}
+		if !isHex(b[i+1]) || !isHex(b[i+2]) {
+			continue
+		}
+		b[i+1] = upperHex(b[i+1])
+		b[i+2] = upperHex(b[i+2])
+		i += 2
+	}
+	return string(b)
+}
+
+func isHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func upperHex(c byte) byte {
+	if c >= 'a' && c <= 'f' {
+		return c - ('a' - 'A')
+	}
+	return c
 }

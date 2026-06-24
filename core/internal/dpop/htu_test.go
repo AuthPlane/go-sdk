@@ -38,21 +38,34 @@ func TestNormalizeHost(t *testing.T) {
 
 func TestNormalizePath(t *testing.T) {
 	tests := []struct {
-		in, want string
+		name string
+		in   string
+		want string
 	}{
-		{"", "/"},
-		{"/", "/"},
-		{"/foo", "/foo"},
-		{"/foo/bar", "/foo/bar"},
-		{"/foo%2Fbar", "/foo%2Fbar"},
-		// Percent-encoded triplets are preserved byte-for-byte — no
-		// case-folding of the hex digits. RFC 3986 §6.2.2.1 would allow
-		// `%2f` == `%2F`, but the verifier compares byte-by-byte so the
-		// §4.3 htu binding stays exact.
-		{"/foo%2fbar", "/foo%2fbar"},
+		{"empty path collapses to slash", "", "/"},
+		{"slash root unchanged", "/", "/"},
+		{"plain path unchanged", "/foo", "/foo"},
+		{"plain nested path unchanged", "/foo/bar", "/foo/bar"},
+		{"already-upper triplet preserved", "/foo%2Fbar", "/foo%2Fbar"},
+		// Lower-case hex digits in `%XX` triplets are folded to
+		// upper-case per RFC 3986 §6.2.2.1. A proof signed with `%2f`
+		// and a request seen as `%2F` must compare equal on the htu
+		// path; without folding, the §4.3 binding rejected otherwise-
+		// equivalent URIs.
+		{"lowercase hex folded", "/foo%2fbar", "/foo%2Fbar"},
+		{"mixed-case hex folded", "/foo%aAbar", "/foo%AAbar"},
+		{"multiple triplets folded", "/path%2fwith%20space%aa", "/path%2Fwith%20space%AA"},
+		// A bare `%` not followed by two hex digits is left alone —
+		// the byte is malformed per RFC 3986 §2.1, but the verifier
+		// still compares byte-for-byte so we don't synthesize a triplet
+		// the signer didn't emit.
+		{"bare percent at end preserved", "/foo%", "/foo%"},
+		{"percent + one hex preserved", "/foo%a", "/foo%a"},
+		{"percent + non-hex preserved", "/foo%g0", "/foo%g0"},
+		{"percent + hex + non-hex preserved", "/foo%ag", "/foo%ag"},
 	}
 	for _, tt := range tests {
-		t.Run(tt.in, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			if got := NormalizePath(tt.in); got != tt.want {
 				t.Errorf("NormalizePath(%q) = %q, want %q", tt.in, got, tt.want)
 			}

@@ -1,13 +1,16 @@
 package cache
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
 
+func int64Ptr(v int64) *int64 { return &v }
+
 func TestTokenCache_SetGet_RoundTrip(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
-	tc.Set("key1", "token-abc", "Bearer", 3600, "read write")
+	tc.Set("key1", "token-abc", "Bearer", int64Ptr(3600), "read write", nil, "")
 	entry := tc.Get("key1")
 	if entry == nil {
 		t.Fatal("expected entry")
@@ -26,7 +29,7 @@ func TestTokenCache_SetGet_RoundTrip(t *testing.T) {
 func TestTokenCache_Get_Expired(t *testing.T) {
 	tc := NewTokenCache(0, 3600*time.Second)
 	// Set with very short TTL
-	tc.Set("expiring", "token", "Bearer", 1, "")
+	tc.Set("expiring", "token", "Bearer", int64Ptr(1), "", nil, "")
 	time.Sleep(1100 * time.Millisecond)
 	if tc.Get("expiring") != nil {
 		t.Error("expected nil for expired entry")
@@ -36,7 +39,7 @@ func TestTokenCache_Get_Expired(t *testing.T) {
 func TestTokenCache_TTLBuffer(t *testing.T) {
 	// Buffer of 50s, expires_in=60s → effective TTL = 10s
 	tc := NewTokenCache(50*time.Second, 3600*time.Second)
-	tc.Set("buffered", "token", "Bearer", 60, "")
+	tc.Set("buffered", "token", "Bearer", int64Ptr(60), "", nil, "")
 	entry := tc.Get("buffered")
 	if entry == nil {
 		t.Fatal("expected entry (10s effective TTL)")
@@ -51,19 +54,24 @@ func TestTokenCache_TTLBuffer(t *testing.T) {
 func TestTokenCache_SkipCaching_TTLTooSmall(t *testing.T) {
 	// Buffer of 100s, expires_in=50s → effective TTL = -50s → skip caching
 	tc := NewTokenCache(100*time.Second, 3600*time.Second)
-	tc.Set("skip", "token", "Bearer", 50, "")
+	tc.Set("skip", "token", "Bearer", int64Ptr(50), "", nil, "")
 	if tc.Get("skip") != nil {
 		t.Error("should not cache when effective TTL <= 0")
 	}
 }
 
-func TestTokenCache_DefaultTTL(t *testing.T) {
+// TestTokenCache_NilExpiresIn_HonorsDefaultTTL pins the tri-state contract:
+// when the AS omits `expires_in` (decoded as nil), the cache applies
+// `defaultTTL` minus the buffer.
+func TestTokenCache_NilExpiresIn_HonorsDefaultTTL(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 300*time.Second)
-	// expires_in=0 → use default TTL (300s) minus buffer (30s) = 270s
-	tc.Set("default", "token", "Bearer", 0, "")
+	tc.Set("default", "token", "Bearer", nil, "", nil, "")
 	entry := tc.Get("default")
 	if entry == nil {
 		t.Fatal("expected entry with default TTL")
+	}
+	if entry.ExpiresIn != nil {
+		t.Errorf("ExpiresIn: expected nil to round-trip, got %d", *entry.ExpiresIn)
 	}
 	remaining := time.Until(entry.ExpiresAt)
 	if remaining < 265*time.Second || remaining > 275*time.Second {
@@ -71,9 +79,20 @@ func TestTokenCache_DefaultTTL(t *testing.T) {
 	}
 }
 
+// TestTokenCache_ZeroExpiresIn_RefusesToStore pins the RFC 6749 §5.1
+// one-shot contract: a token the AS deliberately marks `expires_in: 0`
+// is born-expired and must not be returned on the next read.
+func TestTokenCache_ZeroExpiresIn_RefusesToStore(t *testing.T) {
+	tc := NewTokenCache(30*time.Second, 3600*time.Second)
+	tc.Set("oneshot", "token", "Bearer", int64Ptr(0), "", nil, "")
+	if tc.Get("oneshot") != nil {
+		t.Error("expected nil for expires_in=0 (one-shot) — refuse to store")
+	}
+}
+
 func TestTokenCache_Delete(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
-	tc.Set("del", "token", "Bearer", 3600, "")
+	tc.Set("del", "token", "Bearer", int64Ptr(3600), "", nil, "")
 	tc.Delete("del")
 	if tc.Get("del") != nil {
 		t.Error("expected nil after delete")
@@ -128,9 +147,9 @@ func TestCacheKey_ScopeOnly(t *testing.T) {
 
 func TestTokenCache_DeleteByAccessToken(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
-	tc.Set("key1", "token-A", "Bearer", 3600, "read")
-	tc.Set("key2", "token-B", "Bearer", 3600, "write")
-	tc.Set("key3", "token-A", "Bearer", 3600, "admin") // same token, different key
+	tc.Set("key1", "token-A", "Bearer", int64Ptr(3600), "read", nil, "")
+	tc.Set("key2", "token-B", "Bearer", int64Ptr(3600), "write", nil, "")
+	tc.Set("key3", "token-A", "Bearer", int64Ptr(3600), "admin", nil, "") // same token, different key
 
 	tc.DeleteByAccessToken("token-A")
 
@@ -147,11 +166,52 @@ func TestTokenCache_DeleteByAccessToken(t *testing.T) {
 
 func TestTokenCache_DeleteByAccessToken_NoMatch(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
-	tc.Set("key1", "token-X", "Bearer", 3600, "read")
+	tc.Set("key1", "token-X", "Bearer", int64Ptr(3600), "read", nil, "")
 
 	tc.DeleteByAccessToken("no-such-token")
 
 	if tc.Get("key1") == nil {
 		t.Error("key1 should still exist")
+	}
+}
+
+// TestTokenCache_DpopBindingSurvivesRoundTrip pins the DPoP binding
+// through the cache round-trip: a DPoP-bound token must report its
+// binding (both raw `Cnf` and the convenience `CnfJkt`) when served
+// from cache, not silently degrade to a bearer-only shape.
+func TestTokenCache_DpopBindingSurvivesRoundTrip(t *testing.T) {
+	tc := NewTokenCache(30*time.Second, 3600*time.Second)
+	cnf := json.RawMessage(`{"jkt":"thumbprint-abc"}`)
+	tc.Set("dpop", "dpop-bound-token", "DPoP", int64Ptr(3600), "tools/echo", cnf, "thumbprint-abc")
+
+	entry := tc.Get("dpop")
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if entry.CnfJkt != "thumbprint-abc" {
+		t.Errorf("CnfJkt: expected %q, got %q", "thumbprint-abc", entry.CnfJkt)
+	}
+	if string(entry.Cnf) != `{"jkt":"thumbprint-abc"}` {
+		t.Errorf("Cnf: expected raw object, got %q", string(entry.Cnf))
+	}
+}
+
+// TestTokenCache_BearerTokenDefaultsCnfToZero pins that callers
+// caching a bearer-only token (no DPoP binding) keep `Cnf` nil and
+// `CnfJkt` empty so downstream code reading them cannot mistake
+// the entry for sender-constrained.
+func TestTokenCache_BearerTokenDefaultsCnfToZero(t *testing.T) {
+	tc := NewTokenCache(30*time.Second, 3600*time.Second)
+	tc.Set("bearer", "bearer-tok", "Bearer", int64Ptr(3600), "read", nil, "")
+
+	entry := tc.Get("bearer")
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if entry.Cnf != nil {
+		t.Errorf("Cnf: expected nil, got %q", string(entry.Cnf))
+	}
+	if entry.CnfJkt != "" {
+		t.Errorf("CnfJkt: expected empty, got %q", entry.CnfJkt)
 	}
 }

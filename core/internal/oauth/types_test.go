@@ -140,3 +140,140 @@ func TestSentinelErrors_AreDistinct(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeCnf pins the parser's confirmation-claim shape: a JSON
+// object `cnf` is preserved and its `jkt` is surfaced as `cnf_jkt`;
+// absent / null / non-object `cnf` collapses both fields to zero values
+// so a malformed AS cannot pollute the typed shape downstream.
+func TestNormalizeCnf(t *testing.T) {
+	tests := []struct {
+		name       string
+		in         json.RawMessage
+		wantCnf    json.RawMessage
+		wantCnfJkt string
+	}{
+		{
+			name:       "object_with_jkt_derives_thumbprint",
+			in:         json.RawMessage(`{"jkt":"abc"}`),
+			wantCnf:    json.RawMessage(`{"jkt":"abc"}`),
+			wantCnfJkt: "abc",
+		},
+		{
+			name:       "object_with_jkt_and_extension_member_preserves_both",
+			in:         json.RawMessage(`{"jkt":"abc","x5t#S256":"hash"}`),
+			wantCnf:    json.RawMessage(`{"jkt":"abc","x5t#S256":"hash"}`),
+			wantCnfJkt: "abc",
+		},
+		{
+			name:       "object_without_jkt_keeps_cnf_empties_jkt",
+			in:         json.RawMessage(`{"x5t#S256":"hash"}`),
+			wantCnf:    json.RawMessage(`{"x5t#S256":"hash"}`),
+			wantCnfJkt: "",
+		},
+		{
+			name:       "absent_cnf_collapses_to_zero",
+			in:         nil,
+			wantCnf:    nil,
+			wantCnfJkt: "",
+		},
+		{
+			name:       "null_cnf_drops_both",
+			in:         json.RawMessage(`null`),
+			wantCnf:    nil,
+			wantCnfJkt: "",
+		},
+		{
+			name:       "non_object_scalar_cnf_is_dropped",
+			in:         json.RawMessage(`"not-an-object"`),
+			wantCnf:    nil,
+			wantCnfJkt: "",
+		},
+		{
+			name:       "non_object_array_cnf_is_dropped",
+			in:         json.RawMessage(`["a","b"]`),
+			wantCnf:    nil,
+			wantCnfJkt: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cnf := tt.in
+			var cnfJkt string
+			NormalizeCnf(&cnf, &cnfJkt)
+			if string(cnf) != string(tt.wantCnf) {
+				t.Errorf("Cnf: got %q, want %q", string(cnf), string(tt.wantCnf))
+			}
+			if cnfJkt != tt.wantCnfJkt {
+				t.Errorf("CnfJkt: got %q, want %q", cnfJkt, tt.wantCnfJkt)
+			}
+		})
+	}
+}
+
+// TestTokenResponse_ExpiresIn_WireTriState pins the round-trip semantics
+// of the `*int64` `ExpiresIn` field so a cached response re-serializes to
+// the exact shape the AS sent:
+//
+//   - missing on the wire → nil → omitted on re-marshal (omitempty).
+//   - `"expires_in": 0` → non-nil zero → re-marshals as 0, NOT omitted.
+//   - positive integer → round-trips verbatim.
+//
+// Locks the contract Set / cache callers rely on to distinguish a
+// one-shot (RFC 6749 §5.1) token from an AS-omitted lifetime.
+func TestTokenResponse_ExpiresIn_WireTriState(t *testing.T) {
+	tests := []struct {
+		name    string
+		wire    string
+		wantNil bool
+		wantVal int64
+		wantOut string
+	}{
+		{
+			name:    "absent on wire decodes to nil and re-marshals as omitted",
+			wire:    `{"access_token":"t","token_type":"Bearer"}`,
+			wantNil: true,
+			wantOut: `{"access_token":"t","token_type":"Bearer"}`,
+		},
+		{
+			name:    "explicit zero decodes to non-nil zero and re-marshals as 0",
+			wire:    `{"access_token":"t","token_type":"Bearer","expires_in":0}`,
+			wantNil: false,
+			wantVal: 0,
+			wantOut: `{"access_token":"t","token_type":"Bearer","expires_in":0}`,
+		},
+		{
+			name:    "positive value round-trips",
+			wire:    `{"access_token":"t","token_type":"Bearer","expires_in":3600}`,
+			wantNil: false,
+			wantVal: 3600,
+			wantOut: `{"access_token":"t","token_type":"Bearer","expires_in":3600}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got TokenResponse
+			if err := json.Unmarshal([]byte(tt.wire), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if tt.wantNil {
+				if got.ExpiresIn != nil {
+					t.Errorf("ExpiresIn: got %d, want nil", *got.ExpiresIn)
+				}
+			} else {
+				if got.ExpiresIn == nil {
+					t.Fatalf("ExpiresIn: got nil, want %d", tt.wantVal)
+				}
+				if *got.ExpiresIn != tt.wantVal {
+					t.Errorf("ExpiresIn: got %d, want %d", *got.ExpiresIn, tt.wantVal)
+				}
+			}
+			out, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(out) != tt.wantOut {
+				t.Errorf("marshal: got %q, want %q", string(out), tt.wantOut)
+			}
+		})
+	}
+}
