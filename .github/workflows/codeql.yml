@@ -37,6 +37,7 @@ jobs:
       # Required for CodeQL to upload results to the Security tab.
       security-events: write
       contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -48,13 +49,14 @@ jobs:
           check-latest: true
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
           languages: go
           # This repo is a Go workspace of four independent modules; the
           # default autobuild can't span them, so we build each module
           # manually below.
           build-mode: manual
+          queries: security-extended
 
       - name: Build modules
         # Compile every module so the extractor sees all packages. go.work
@@ -68,6 +70,6 @@ jobs:
           done
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
           category: "/language:go"
