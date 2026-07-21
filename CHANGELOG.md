@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-21
+
 ### Added
 - `core/resource/verifier`: `(*VerifiedClaims).RequireScopes(scopes ...string) error` plural helper. Returns `nil` on empty input, and on failure wraps `ErrInsufficientScope` naming every missing scope plus the scopes the token does carry, so an adapter can surface it verbatim in the `WWW-Authenticate` `error_description`.
 - `core/resource/verifier`: `ErrMultipleDpopProofs` sentinel for RFC 9449 §4.3 #1 violations. `core/resource.AuthErrorResponse` maps it to a `DPoP error="invalid_dpop_proof"` 401 challenge per RFC 9449 §7.1.
