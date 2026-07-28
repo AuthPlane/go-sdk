@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Resource and issuer identifiers are never rewritten (RFC 8414 §3.3 / RFC 9728 §3.3 require the advertised value to be *identical* to the configured one). The RFC 8414 metadata URL and the PRM well-known path are formed by pure insertion, preserving the identifier's path exactly — including any trailing slash and percent-encoded octets (escaped path) — and AS-metadata issuer comparison is now an exact string match. Identifiers are validated at construction via the new `verifier.ValidateIdentifier` (absolute http(s) URL with a host and no fragment); trailing slashes, host case, and explicit ports are legal and preserved. The OIDC discovery fallback deliberately keeps its terminating-slash trim — OIDC Discovery 1.0 §4 *concatenates* rather than inserts and mandates the trim. **Migration**: if your configured issuer or resource differs from your authorization server's actual identifier by a trailing slash, correct the config — the SDK no longer silently reconciles them.
+
+### Fixed
+- `core/resource/verifier`: a configured issuer whose identifier legitimately ends in `/` no longer has every token rejected. The trailing slash was silently stripped by `NewTokenVerifier` and the stripped value compared against the token's `iss`, which RFC 9068 requires to carry the slash; RFC 8414 discovery now also resolves the well-known URL for such issuers correctly.
+
 ## [0.2.0] - 2026-07-21
 
 ### Added

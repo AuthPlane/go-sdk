@@ -207,17 +207,22 @@ func buildOAuthMetadataURL(issuer string) string {
 		return issuer + "/.well-known/oauth-authorization-server"
 	}
 
-	path := strings.TrimRight(u.EscapedPath(), "/")
-	if path == "" {
-		u.Path = "/.well-known/oauth-authorization-server"
-	} else {
-		u.Path = "/.well-known/oauth-authorization-server" + path
-	}
-	u.RawPath = ""
-	return u.String()
+	// RFC 8414 §3 forms the URL by *inserting* the well-known segment between
+	// the authority and the issuer's path — a pure string insertion that
+	// preserves the path exactly, including any trailing slash. Contrast with
+	// buildOIDCDiscoveryURL below, which concatenates and trims per its own
+	// spec: the two constructions look alike but are deliberately different.
+	return u.Scheme + "://" + u.Host + "/.well-known/oauth-authorization-server" + u.EscapedPath()
 }
 
 func buildOIDCDiscoveryURL(issuer string) string {
+	// OIDC Discovery 1.0 §4 *concatenates* rather than inserts, and mandates
+	// this trim: "If the Issuer value contains a path component, any
+	// terminating / MUST be removed before appending
+	// /.well-known/openid-configuration." This is the opposite of the
+	// RFC 8414 §3 insertion rule used above — both are correct in their own
+	// context. Do NOT "fix" this TrimRight when sweeping for identifier
+	// normalisation; removing it silently breaks OIDC discovery.
 	return strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
 }
 
@@ -256,10 +261,10 @@ func (mc *MetadataCache) parse(data []byte) (*ASMetadata, error) {
 	if meta.Issuer == "" {
 		return nil, fmt.Errorf("metadata: missing required field \"issuer\"")
 	}
-	configuredIssuer := strings.TrimRight(mc.issuerURL, "/")
-	metaIssuer := strings.TrimRight(meta.Issuer, "/")
-	if metaIssuer != configuredIssuer {
-		return nil, fmt.Errorf("metadata: issuer mismatch: expected %q, got %q", configuredIssuer, metaIssuer)
+	// RFC 8414 §3.3 — the returned issuer MUST be identical to the configured
+	// one; simple string comparison, no normalisation.
+	if meta.Issuer != mc.issuerURL {
+		return nil, fmt.Errorf("metadata: issuer mismatch: expected %q, got %q", mc.issuerURL, meta.Issuer)
 	}
 	if meta.JWKSURI == "" {
 		return nil, fmt.Errorf("metadata: missing required field \"jwks_uri\"")

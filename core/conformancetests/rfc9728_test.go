@@ -120,6 +120,8 @@ func TestRFC9728WellKnownPathMustDeriveFromResourceURI(t *testing.T) {
 		{"https://api.example.com", "/.well-known/oauth-protected-resource"},
 		{"https://api.example.com/mcp", "/.well-known/oauth-protected-resource/mcp"},
 		{"https://api.example.com/v2/mcp", "/.well-known/oauth-protected-resource/v2/mcp"},
+		// RFC 9728 §3 insertion preserves the path exactly, trailing slash included.
+		{"https://api.example.com/mcp/", "/.well-known/oauth-protected-resource/mcp/"},
 	}
 
 	for _, tc := range cases {

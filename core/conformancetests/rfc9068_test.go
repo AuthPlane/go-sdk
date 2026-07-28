@@ -129,6 +129,23 @@ func TestRFC9068IssuerMustMatch(t *testing.T) {
 	if !errors.Is(err, verifier.ErrIssuerMismatch) {
 		t.Errorf("expected ErrIssuerMismatch, got %v", err)
 	}
+
+	// Variant: a token whose iss is identical to a configured trailing-slash
+	// issuer must verify — the issuer is never rewritten (RFC 8414 §3.3 /
+	// RFC 9068 §4 identity, catalog accept variant).
+	slashIssuer := "https://auth.example.com/"
+	tvSlash, _ := newTestVerifier(t, key, "key-0", slashIssuer, "https://api.example.com")
+
+	slashClaims := testutil.StandardClaims(slashIssuer, "https://api.example.com", "user123", "client456")
+	slashToken, _ := testutil.SignToken(slashClaims, key, jose.ES256, "key-0")
+
+	verified, err := tvSlash.VerifyToken(ctx, slashToken, nil)
+	if err != nil {
+		t.Fatalf("identical trailing-slash iss should verify: %v", err)
+	}
+	if verified.Sub() != "user123" {
+		t.Errorf("sub = %q, want %q", verified.Sub(), "user123")
+	}
 }
 
 func TestRFC9068AudienceMustMatchResource(t *testing.T) {

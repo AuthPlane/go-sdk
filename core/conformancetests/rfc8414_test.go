@@ -59,6 +59,30 @@ func TestRFC8414MetadataIssuerMustMatchConfiguredIssuer(t *testing.T) {
 	if !strings.Contains(err.Error(), "issuer mismatch") {
 		t.Errorf("expected issuer mismatch error, got: %v", err)
 	}
+
+	// Variant: a trailing-slash difference is equivalent per RFC 3986 §6.2.3
+	// but not identical — RFC 8414 §3.3 requires identity, so it must be
+	// rejected.
+	tsSlash := metadataServerDynamic(t, func(issuer string) map[string]any {
+		return map[string]any{
+			"issuer":   issuer + "/",
+			"jwks_uri": "https://auth.example.com/jwks",
+		}
+	})
+
+	mcSlash := metadata.New(metadata.Config{
+		IssuerURL:     tsSlash.URL,
+		FetchSettings: ssrf.DevModeFetchSettings(),
+	})
+	defer mcSlash.Close()
+
+	_, err = mcSlash.Get(ctx)
+	if err == nil {
+		t.Fatal("expected error when metadata issuer differs only by a trailing slash")
+	}
+	if !strings.Contains(err.Error(), "issuer mismatch") {
+		t.Errorf("expected issuer mismatch error, got: %v", err)
+	}
 }
 
 func TestRFC8414JWKSURIRequiredForJWTValidation(t *testing.T) {

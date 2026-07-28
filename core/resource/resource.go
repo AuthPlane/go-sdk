@@ -112,11 +112,15 @@ func (r *Resource) WellKnownPRMPath() string {
 }
 
 func wellKnownPRMPath(resourceURI string) string {
+	// RFC 9728 §3 — pure string insertion between the authority and the
+	// resource's path. The path is preserved exactly (including a bare or
+	// trailing slash), using the escaped form so percent-encoded octets are
+	// kept as sent.
 	u, err := url.Parse(resourceURI)
-	if err != nil || u.Path == "" || u.Path == "/" {
+	if err != nil || u.EscapedPath() == "" {
 		return "/.well-known/oauth-protected-resource"
 	}
-	return "/.well-known/oauth-protected-resource" + u.Path
+	return "/.well-known/oauth-protected-resource" + u.EscapedPath()
 }
 
 // New creates a new Resource.
@@ -128,12 +132,8 @@ func wellKnownPRMPath(resourceURI string) string {
 // invariant that downstream consumers (the HTTP adapter, the PRM emitter)
 // rely on consistent.
 func New(uri, issuer string, jwksCache *verifier.JWKSCache, opts ...Option) (*Resource, error) {
-	parsed, err := url.ParseRequestURI(uri)
-	if err != nil {
-		return nil, fmt.Errorf("resource: invalid resource URI: %w", err)
-	}
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("resource: resource URI must be absolute with scheme and host, got %q", uri)
+	if err := verifier.ValidateIdentifier(uri, "resource URI"); err != nil {
+		return nil, fmt.Errorf("resource: %w", err)
 	}
 
 	cfg := &resourceConfig{}
@@ -244,9 +244,10 @@ func (r *Resource) buildPRM() {
 	r.prmMap = prm
 	r.prmJSON, _ = json.Marshal(prm)
 
-	// r.uri was validated by New (url.ParseRequestURI), so url.Parse cannot
-	// fail here — this is the single, infallible source of truth that
-	// adapters consume via PRMURL().
+	// r.uri was validated by New, so url.Parse cannot fail here — this is
+	// the single, infallible source of truth that adapters consume via
+	// PRMURL(). Composed by string concatenation so the well-known path from
+	// wellKnownPRMPath is not re-escaped.
 	u, _ := url.Parse(r.uri)
-	r.prmURL = u.ResolveReference(&url.URL{Path: wellKnownPRMPath(r.uri)}).String()
+	r.prmURL = u.Scheme + "://" + u.Host + wellKnownPRMPath(r.uri)
 }

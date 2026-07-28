@@ -389,7 +389,9 @@ func TestVerifyToken_Scopes(t *testing.T) {
 }
 
 func TestVerifyToken_IssuerTrailingSlash(t *testing.T) {
-	// Verifier configured with trailing slash should still match issuer without.
+	// RFC 8414 §3.3 / RFC 9068 — the issuer is compared verbatim. A verifier
+	// configured with a trailing-slash issuer accepts a token whose iss
+	// carries the slash, and rejects one whose iss differs only by it.
 	key, err := testutil.GenerateES256Key()
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
@@ -412,17 +414,26 @@ func TestVerifyToken_IssuerTrailingSlash(t *testing.T) {
 		t.Fatalf("create verifier: %v", err)
 	}
 
-	token, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer, testAudience, testSubject, testClientID, nil)
+	matching, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer+"/", testAudience, testSubject, testClientID, nil)
 	if err != nil {
 		t.Fatalf("sign token: %v", err)
 	}
 
-	claims, err := v.VerifyToken(context.Background(), token, nil)
+	claims, err := v.VerifyToken(context.Background(), matching, nil)
 	if err != nil {
-		t.Fatalf("trailing slash should be trimmed: %v", err)
+		t.Fatalf("identical trailing-slash iss should verify: %v", err)
 	}
 	if claims.Sub() != testSubject {
 		t.Errorf("sub = %q, want %q", claims.Sub(), testSubject)
+	}
+
+	stripped, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer, testAudience, testSubject, testClientID, nil)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	if _, err := v.VerifyToken(context.Background(), stripped, nil); !errors.Is(err, verifier.ErrIssuerMismatch) {
+		t.Errorf("err = %v, want ErrIssuerMismatch — equivalent is not identical", err)
 	}
 }
 

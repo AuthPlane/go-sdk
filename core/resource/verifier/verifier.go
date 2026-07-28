@@ -3,9 +3,7 @@ package verifier
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -38,7 +36,10 @@ type resolvedInboundDPoP struct {
 // The JWKSCache is injected from outside (the facade manages its lifecycle).
 func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Option) (*TokenVerifier, error) {
 	v := &TokenVerifier{
-		issuer:    strings.TrimRight(issuer, "/"),
+		// RFC 8414 §3.3 — the issuer is an opaque identifier compared with
+		// simple string equality (against the token's iss); it is validated
+		// below but never rewritten.
+		issuer:    issuer,
 		audience:  audience,
 		jwks:      jwksCache,
 		clockSkew: DefaultClockSkew,
@@ -54,11 +55,11 @@ func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Opt
 		v.algorithms = defaultAlgorithms
 	}
 
-	if _, err := url.ParseRequestURI(v.issuer); err != nil {
-		return nil, fmt.Errorf("verifier: invalid issuer URI: %w", err)
+	if err := ValidateIdentifier(v.issuer, "issuer"); err != nil {
+		return nil, fmt.Errorf("verifier: %w", err)
 	}
-	if _, err := url.ParseRequestURI(v.audience); err != nil {
-		return nil, fmt.Errorf("verifier: invalid audience URI: %w", err)
+	if err := ValidateIdentifier(v.audience, "audience"); err != nil {
+		return nil, fmt.Errorf("verifier: %w", err)
 	}
 
 	return v, nil
