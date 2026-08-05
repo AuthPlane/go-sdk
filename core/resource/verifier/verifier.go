@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -38,7 +37,11 @@ type resolvedInboundDPoP struct {
 // The JWKSCache is injected from outside (the facade manages its lifecycle).
 func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Option) (*TokenVerifier, error) {
 	v := &TokenVerifier{
-		issuer:    strings.TrimRight(issuer, "/"),
+		// RFC 8414 §4: the issuer is an identifier, stored and compared
+		// code-point-for-code-point. Keep it verbatim (including any trailing
+		// slash) so token "iss" is matched byte-for-byte and a trailing-slash
+		// difference is a mismatch, not something the SDK silently reconciles.
+		issuer:    issuer,
 		audience:  audience,
 		jwks:      jwksCache,
 		clockSkew: DefaultClockSkew,

@@ -1,9 +1,16 @@
 package authplane
 
 import (
+	"errors"
+
 	"github.com/authplane/go-sdk/core/internal/oauth"
 	"github.com/authplane/go-sdk/core/internal/ssrf"
 )
+
+// ErrInvalidIssuer is returned by NewClient when the issuer identifier is not
+// acceptable — currently, when it carries a query or fragment component, which
+// RFC 8414 §2 forbids. Callers can match it with errors.Is.
+var ErrInvalidIssuer = errors.New("authplane: invalid issuer")
 
 // TokenResponse is an OAuth 2.0 token endpoint response.
 type TokenResponse = oauth.TokenResponse

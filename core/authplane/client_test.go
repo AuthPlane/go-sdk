@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -83,6 +84,38 @@ func TestNewClient_Success(t *testing.T) {
 		t.Fatalf("failed: %v", err)
 	}
 	defer client.Close()
+}
+
+func TestNewClient_RejectsIssuerWithQueryOrFragment(t *testing.T) {
+	// RFC 8414 §2 forbids both a query and a fragment in an issuer identifier.
+	// NewClient must reject them at construction — before discovery — so the two
+	// discovery-URL builders cannot diverge on a query/fragment-bearing issuer.
+	cases := []struct {
+		name   string
+		issuer string
+	}{
+		{"query", "https://as.example.com/tenant?x=1"},
+		{"fragment", "https://as.example.com/tenant#frag"},
+		{"both", "https://as.example.com/tenant?x=1#frag"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := authplane.NewClient(context.Background(), tc.issuer,
+				authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
+			if err == nil {
+				if client != nil {
+					client.Close()
+				}
+				t.Fatalf("expected error for issuer %q, got nil", tc.issuer)
+			}
+			if !errors.Is(err, authplane.ErrInvalidIssuer) {
+				t.Fatalf("expected error to wrap ErrInvalidIssuer, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "query or fragment") {
+				t.Fatalf("expected query/fragment rejection message, got %v", err)
+			}
+		})
+	}
 }
 
 func TestNewClient_NoCredentials(t *testing.T) {
