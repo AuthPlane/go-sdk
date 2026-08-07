@@ -59,6 +59,32 @@ func NewClient(ctx context.Context, issuer string, opts ...Option) (*Client, err
 		opt(cfg)
 	}
 
+	// RFC 8414 §2 forbids both a query and a fragment component in an issuer
+	// identifier. The resource side already rejects a fragment (resource.New),
+	// but the issuer flowed straight into metadata.Config with no such check —
+	// and the two discovery-URL builders disagree when either is present.
+	// buildOAuthMetadataURL now resolves a well-known reference against the
+	// issuer, silently dropping the issuer's query and fragment, while
+	// buildOIDCDiscoveryURL still trims only a trailing slash and concatenates
+	// the well-known suffix onto the whole string, carrying the query/fragment
+	// along. For "https://as.example.com/tenant?x=1" the RFC 8414 and OIDC
+	// discovery attempts would therefore target two different identities.
+	// Rejecting a query- or fragment-bearing issuer here makes the two helpers
+	// agree by construction.
+	//
+	// This gate is load-bearing on its own, not merely an earlier copy of the
+	// verifier's. A *Client used only for token, introspection and revocation
+	// calls never constructs a TokenVerifier, so verifier.NewTokenVerifier is
+	// never reached and this is the only thing keeping a relative or
+	// query-bearing issuer out of eager discovery.
+	//
+	// It calls the same exported rule rather than restating it, so the two
+	// boundaries cannot drift — and both reject with the same redacted message
+	// and the same ErrInvalidIssuer sentinel.
+	if err := verifier.ValidateIssuer(issuer); err != nil {
+		return nil, err
+	}
+
 	// Fetch settings precedence: explicit WithFetchSettings > AUTHPLANE_DEV_MODE env > defaults.
 	var fetchSettings ssrf.FetchSettings
 	switch {

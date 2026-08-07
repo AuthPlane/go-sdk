@@ -179,11 +179,13 @@ func TestPRMURL(t *testing.T) {
 			want:        "https://api.example.com/.well-known/oauth-protected-resource/v2/mcp",
 		},
 		{
-			// url.ResolveReference preserves trailing slashes in the resource path;
-			// pin that here so the contract doesn't drift.
-			name:        "trailing slash preserved",
+			// RFC 9728 §3.1: a terminating slash following the host component is
+			// removed before insertion, so "/mcp/" derives the same well-known URL
+			// as "/mcp". This is derivation, not identity — the resource identifier
+			// itself is preserved verbatim.
+			name:        "trailing slash stripped from derived URL",
 			resourceURI: "https://api.example.com/mcp/",
-			want:        "https://api.example.com/.well-known/oauth-protected-resource/mcp/",
+			want:        "https://api.example.com/.well-known/oauth-protected-resource/mcp",
 		},
 	}
 	for _, tc := range tests {
@@ -212,6 +214,83 @@ func TestPRMURL(t *testing.T) {
 				t.Errorf("PRMURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWellKnownPRMPath_TrailingSlashStripped is the regression for the RFC 9728
+// §3.1 derivation: a resource identifier ending in "/mcp/" derives the PRM
+// well-known path with the terminating slash removed, yielding
+// "/.well-known/oauth-protected-resource/mcp" — not the trailing-slash form a
+// conformant client would 404 on. The identifier is preserved verbatim; only the
+// derived URL loses the slash.
+func TestWellKnownPRMPath_TrailingSlashStripped(t *testing.T) {
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, testKID)
+	if err != nil {
+		t.Fatalf("build jwks: %v", err)
+	}
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
+			return jwksData, nil, nil
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+
+	res, err := resource.New("https://api.example.com/mcp/", testIssuer, jc)
+	if err != nil {
+		t.Fatalf("resource.New: %v", err)
+	}
+
+	if got, want := res.WellKnownPRMPath(), "/.well-known/oauth-protected-resource/mcp"; got != want {
+		t.Errorf("WellKnownPRMPath() = %q, want %q", got, want)
+	}
+	if got, want := res.PRMURL(), "https://api.example.com/.well-known/oauth-protected-resource/mcp"; got != want {
+		t.Errorf("PRMURL() = %q, want %q", got, want)
+	}
+	// The resource identifier itself is untouched: RFC 9728 §3.3 uses the
+	// resource identifier as-is; only the derived well-known URL drops the slash.
+	if got, want := res.URI(), "https://api.example.com/mcp/"; got != want {
+		t.Errorf("URI() = %q, want %q (identifier must be preserved verbatim)", got, want)
+	}
+}
+
+// TestWellKnownPRMPath_EncodedSlashPreserved locks in the distinction between a
+// terminating delimiter slash (stripped) and a percent-encoded "%2F", which is
+// path data per RFC 3986 §3.3 and must survive into the derived PRM URL. A
+// naive strip on the decoded path would turn "/mcp%2F" into ".../mcp", changing
+// the resource's identity; a naive URL rebuild would re-escape it into
+// "%252F". Both are guarded here.
+func TestWellKnownPRMPath_EncodedSlashPreserved(t *testing.T) {
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, testKID)
+	if err != nil {
+		t.Fatalf("build jwks: %v", err)
+	}
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
+			return jwksData, nil, nil
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+
+	res, err := resource.New("https://api.example.com/mcp%2F", testIssuer, jc)
+	if err != nil {
+		t.Fatalf("resource.New: %v", err)
+	}
+
+	if got, want := res.WellKnownPRMPath(), "/.well-known/oauth-protected-resource/mcp%2F"; got != want {
+		t.Errorf("WellKnownPRMPath() = %q, want %q", got, want)
+	}
+	if got, want := res.PRMURL(), "https://api.example.com/.well-known/oauth-protected-resource/mcp%2F"; got != want {
+		t.Errorf("PRMURL() = %q, want %q (encoded %%2F must not become %%252F or /)", got, want)
 	}
 }
 
@@ -830,6 +909,10 @@ func TestNew_RejectsInvalidResourceURI(t *testing.T) {
 		{"authority-less scheme", "file:///tmp/mcp"},
 		{"empty", ""},
 		{"malformed", "://no-scheme"},
+		// RFC 8707 §2 forbids a fragment in a resource indicator. url.ParseRequestURI
+		// folds "#frag" into the path instead of splitting it, so this must be
+		// rejected explicitly rather than silently leaking into the derived PRM URL.
+		{"fragment", "https://api.example.com/mcp#frag"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -29,8 +29,7 @@ func TestNewDPoPContext_SingleProof(t *testing.T) {
 }
 
 // TestNewDPoPContext_FiltersBlanks ensures whitespace-only entries are
-// dropped before the §4.3 cardinality check fires, matching the Java/TS
-// reference implementations.
+// dropped before the §4.3 cardinality check fires.
 func TestNewDPoPContext_FiltersBlanks(t *testing.T) {
 	ctx, err := NewDPoPContext("POST", "https://api.example.com/mcp", []string{"", "   ", "  proof  "})
 	if err != nil {

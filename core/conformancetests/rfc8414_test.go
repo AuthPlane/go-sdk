@@ -59,6 +59,32 @@ func TestRFC8414MetadataIssuerMustMatchConfiguredIssuer(t *testing.T) {
 	if !strings.Contains(err.Error(), "issuer mismatch") {
 		t.Errorf("expected issuer mismatch error, got: %v", err)
 	}
+
+	// Catalog variant: §3.3 requires the advertised issuer to be *identical*,
+	// and §4 spells the comparison out as code-point-for-code-point. A metadata
+	// issuer differing from the configured one only by a terminating slash is
+	// therefore also a mismatch — this is the case a normalizing comparison
+	// would silently accept, binding the client to a different identity.
+	slashTS := metadataServerDynamic(t, func(issuer string) map[string]any {
+		return map[string]any{
+			"issuer":   issuer + "/",
+			"jwks_uri": issuer + "/jwks",
+		}
+	})
+
+	slashMC := metadata.New(metadata.Config{
+		IssuerURL:     slashTS.URL,
+		FetchSettings: ssrf.DevModeFetchSettings(),
+	})
+	defer slashMC.Close()
+
+	_, err = slashMC.Get(ctx)
+	if err == nil {
+		t.Fatal("expected error when the metadata issuer differs only by a terminating slash")
+	}
+	if !strings.Contains(err.Error(), "issuer mismatch") {
+		t.Errorf("expected issuer mismatch error, got: %v", err)
+	}
 }
 
 func TestRFC8414JWKSURIRequiredForJWTValidation(t *testing.T) {

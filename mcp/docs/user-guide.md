@@ -155,6 +155,8 @@ Serves the RFC 9728 PRM JSON. `GET` only; other methods return 405. Sets `Conten
 
 Returns the well-known PRM path, e.g. `/.well-known/oauth-protected-resource/mcp`.
 
+Derivation follows RFC 9728 §3.1: any terminating slash after the host component is removed, so `https://api.example.com/mcp/` and `https://api.example.com/mcp` both derive `/.well-known/oauth-protected-resource/mcp`. A percent-encoded octet in the identifier's path survives verbatim — `/mcp%2Fx` derives `/.well-known/oauth-protected-resource/mcp%2Fx` — because RFC 3986 §3.3 makes it path data, not a delimiter. The resource identifier itself is never rewritten; only the derived publication URL loses the slash.
+
 ### `(a *Adapter) TokenExchange(ctx context.Context, input authplane.TokenExchangeInput) (*authplane.TokenResponse, error)`
 
 Performs RFC 8693 token exchange via the underlying client. Automatically maps `*authplane.ConsentRequiredError` with a non-empty `ConsentURL` to `mcp.URLElicitationRequiredError` (see §7). Requires credentials (`WithClientCredentials` or `WithClientAuthentication`) in `ClientOptions`.
