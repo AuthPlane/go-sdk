@@ -85,11 +85,16 @@ Set `CONFORMANCE_CATALOG_PATH` (or `AUTHPLANE_CONFORMANCE_CATALOG`) to the absol
 # Clone the catalog repo anywhere
 git clone git@github.com:AuthPlane/conformance.git /path/to/catalog
 
+# Check out the same pinned ref CI uses (single-sourced at the repo root)
+git -C /path/to/catalog checkout "$(cat /path/to/go-sdk/.conformance-catalog-ref)"
+
 # Point the harness at it
 export CONFORMANCE_CATALOG_PATH=/path/to/catalog/oauth-sdk-conformance-catalog.yaml
 ```
 
 This is useful in CI or when the catalog is not a sibling directory.
+
+CI pins the catalog to the SHA tracked in [`.conformance-catalog-ref`](../../.conformance-catalog-ref) at the repo root, so a catalog change can never break CI on its own. Check out that same ref locally (as above) to match CI exactly. A weekly `conformance-catalog-drift` workflow runs the alignment check against the latest catalog and fails when new cases need adopting; adopt them here and bump `.conformance-catalog-ref` in the same change.
 
 ## Running
 
