@@ -172,6 +172,59 @@ func TestVerifyToken_WrongIssuer(t *testing.T) {
 	}
 }
 
+// TestVerifyToken_IssuerTrailingSlashPreserved is the regression for the verify
+// path: the configured issuer is stored and compared byte-for-byte
+// (RFC 8414 §4, code-point-for-code-point, no normalization). A token whose
+// "iss" carries the same trailing slash as the configured issuer verifies, and
+// one that differs only by the slash is a mismatch — the SDK no longer silently
+// reconciles a trailing-slash difference.
+func TestVerifyToken_IssuerTrailingSlashPreserved(t *testing.T) {
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, testKID)
+	if err != nil {
+		t.Fatalf("build jwks: %v", err)
+	}
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
+			return jwksData, nil, nil
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+
+	issuerWithSlash := testIssuer + "/"
+	v, err := verifier.NewTokenVerifier(issuerWithSlash, testAudience, jc)
+	if err != nil {
+		t.Fatalf("create verifier: %v", err)
+	}
+
+	// (a) Token iss carries the configured trailing slash → verifies.
+	matching, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, issuerWithSlash, testAudience, testSubject, testClientID, nil)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	claims, err := v.VerifyToken(context.Background(), matching, nil)
+	if err != nil {
+		t.Fatalf("token with matching trailing-slash issuer should verify, got: %v", err)
+	}
+	if claims.Issuer() != issuerWithSlash {
+		t.Errorf("iss = %q, want %q", claims.Issuer(), issuerWithSlash)
+	}
+
+	// A token whose iss drops the slash is a distinct identifier → rejected.
+	// This guards against re-introducing a trailing-slash normalization.
+	slashless, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer, testAudience, testSubject, testClientID, nil)
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	if _, err := v.VerifyToken(context.Background(), slashless, nil); !errors.Is(err, verifier.ErrIssuerMismatch) {
+		t.Errorf("token whose iss lacks the configured trailing slash: err = %v, want ErrIssuerMismatch", err)
+	}
+}
+
 func TestVerifyToken_WrongAudience(t *testing.T) {
 	v, key := setupES256Verifier(t)
 
@@ -385,44 +438,6 @@ func TestVerifyToken_Scopes(t *testing.T) {
 	}
 	if err := claims.RequireScope("delete"); !errors.Is(err, verifier.ErrInsufficientScope) {
 		t.Errorf("RequireScope(delete) = %v, want ErrInsufficientScope", err)
-	}
-}
-
-func TestVerifyToken_IssuerTrailingSlash(t *testing.T) {
-	// Verifier configured with trailing slash should still match issuer without.
-	key, err := testutil.GenerateES256Key()
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, testKID)
-	if err != nil {
-		t.Fatalf("build jwks: %v", err)
-	}
-
-	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
-		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
-			return jwksData, nil, nil
-		},
-		DefaultTTL: time.Hour,
-	})
-	t.Cleanup(jc.Close)
-
-	v, err := verifier.NewTokenVerifier(testIssuer+"/", testAudience, jc)
-	if err != nil {
-		t.Fatalf("create verifier: %v", err)
-	}
-
-	token, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer, testAudience, testSubject, testClientID, nil)
-	if err != nil {
-		t.Fatalf("sign token: %v", err)
-	}
-
-	claims, err := v.VerifyToken(context.Background(), token, nil)
-	if err != nil {
-		t.Fatalf("trailing slash should be trimmed: %v", err)
-	}
-	if claims.Sub() != testSubject {
-		t.Errorf("sub = %q, want %q", claims.Sub(), testSubject)
 	}
 }
 

@@ -120,6 +120,17 @@ func TestRFC9728WellKnownPathMustDeriveFromResourceURI(t *testing.T) {
 		{"https://api.example.com", "/.well-known/oauth-protected-resource"},
 		{"https://api.example.com/mcp", "/.well-known/oauth-protected-resource/mcp"},
 		{"https://api.example.com/v2/mcp", "/.well-known/oauth-protected-resource/v2/mcp"},
+		// Catalog row: a resource published with a terminating slash serves its
+		// metadata at the slash-less well-known path, so identifiers differing
+		// only by that slash resolve to the same document (RFC 9728 §3.1).
+		{"https://api.example.com/mcp/", "/.well-known/oauth-protected-resource/mcp"},
+		// Every terminating slash is stripped, not one — pinned so the choice
+		// cannot silently drift back to a single-character trim.
+		{"https://api.example.com/mcp//", "/.well-known/oauth-protected-resource/mcp"},
+		// A percent-encoded octet is path data (RFC 3986 §3.3), not the "/"
+		// delimiter, so it survives the derivation verbatim rather than
+		// decoding into a separator and naming a different resource.
+		{"https://api.example.com/mcp%2Fx", "/.well-known/oauth-protected-resource/mcp%2Fx"},
 	}
 
 	for _, tc := range cases {

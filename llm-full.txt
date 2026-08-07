@@ -207,7 +207,8 @@ Top-level public types under `github.com/authplane/go-sdk/core/...`:
 | `DPoPContext`, `DPoPReplayStore`, `InMemoryDPoPReplayStore`, `NewInMemoryDPoPReplayStore` | `verifier` | Per-request DPoP context + replay-store interface |
 | `InboundDPoPOptions`, `InboundDPoPView`, `WithInboundDPoP` | `verifier` | Resource-level inbound DPoP policy bundle (replay store, MaxProofAge, ClockSkew, AllowedProofAlgorithms, Required); configures the verifier and drives PRM advertisement |
 | `RevocationChecker`, `NullRevocationChecker`, `WithRevocationChecker`, `WithFailClosed`, `WithAlgorithms`, `WithClockSkew` | `verifier` | Revocation + verifier configuration |
-| Verifier error sentinels (`ErrTokenMissing`, `ErrTokenExpired`, `ErrInvalidSignature`, `ErrInvalidClaims`, `ErrTokenRevoked`, `ErrInsufficientScope`, `ErrDPoPRequired`, `ErrDPoPNotSupported`, `ErrDPoPInvalid`, `ErrDPoPKeyMismatch`, `ErrDPoPReplayDetected`, `ErrJWKSUnavailable`, ...) | `verifier` | Test with `errors.Is`; map to HTTP via `resource.HTTPStatus` |
+| `ValidateIssuer` | `verifier` | RFC 8414 §2 issuer-shape rule (no query, no fragment, absolute with scheme and host). The single gate every construction boundary calls |
+| Verifier error sentinels (`ErrInvalidIssuer`, `ErrTokenMissing`, `ErrTokenExpired`, `ErrInvalidSignature`, `ErrInvalidClaims`, `ErrTokenRevoked`, `ErrInsufficientScope`, `ErrDPoPRequired`, `ErrDPoPNotSupported`, `ErrDPoPInvalid`, `ErrDPoPKeyMismatch`, `ErrDPoPReplayDetected`, `ErrJWKSUnavailable`, ...) | `verifier` | Test with `errors.Is`; map to HTTP via `resource.HTTPStatus`. `authplane.ErrInvalidIssuer` is an alias of `verifier.ErrInvalidIssuer` |
 
 ## References
 

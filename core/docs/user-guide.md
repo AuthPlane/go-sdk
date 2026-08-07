@@ -67,6 +67,10 @@ func main() {
 
 `authplane.NewClient` is the top-level entry point. It owns AS metadata discovery, JWKS caching, token caching, DPoP configuration, and the circuit breaker.
 
+The issuer must be the authorization server's identifier exactly as published: an absolute `https` URL with a host, carrying **no query and no fragment** (RFC 8414 §2 forbids both). Anything else is rejected at construction with an error wrapping `verifier.ErrInvalidIssuer` — match it with `errors.Is`. The same rule is applied by `verifier.NewTokenVerifier` and `resource.New`, all three through the exported `verifier.ValidateIssuer`.
+
+The identifier is stored verbatim: a trailing slash is significant. If your AS publishes `https://auth.example.com/`, configure that, including the slash — the SDK compares the token's `iss` byte-for-byte (RFC 8414 §4) and no longer reconciles the two forms. Deriving the `.well-known` discovery URL still drops the terminating slash, but that is derivation, not identity.
+
 ```go
 import "github.com/authplane/go-sdk/core/authplane"
 

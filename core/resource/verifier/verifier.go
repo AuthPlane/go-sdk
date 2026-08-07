@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -38,7 +39,11 @@ type resolvedInboundDPoP struct {
 // The JWKSCache is injected from outside (the facade manages its lifecycle).
 func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Option) (*TokenVerifier, error) {
 	v := &TokenVerifier{
-		issuer:    strings.TrimRight(issuer, "/"),
+		// RFC 8414 §4: the issuer is an identifier, stored and compared
+		// code-point-for-code-point. Keep it verbatim (including any trailing
+		// slash) so token "iss" is matched byte-for-byte and a trailing-slash
+		// difference is a mismatch, not something the SDK silently reconciles.
+		issuer:    issuer,
 		audience:  audience,
 		jwks:      jwksCache,
 		clockSkew: DefaultClockSkew,
@@ -54,8 +59,8 @@ func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Opt
 		v.algorithms = defaultAlgorithms
 	}
 
-	if _, err := url.ParseRequestURI(v.issuer); err != nil {
-		return nil, fmt.Errorf("verifier: invalid issuer URI: %w", err)
+	if err := ValidateIssuer(v.issuer); err != nil {
+		return nil, err
 	}
 	if _, err := url.ParseRequestURI(v.audience); err != nil {
 		return nil, fmt.Errorf("verifier: invalid audience URI: %w", err)
@@ -241,4 +246,60 @@ func (v *TokenVerifier) VerifyToken(ctx context.Context, rawToken string, dpop *
 	}
 
 	return claims, nil
+}
+
+// ValidateIssuer enforces the shape RFC 8414 requires of an issuer identifier.
+//
+// §2 forbids both a query and a fragment component, and the identifier must be
+// an absolute URL with a scheme and host: it anchors the byte-for-byte `iss`
+// comparison above and the well-known derivation in internal/metadata, neither
+// of which is meaningful for a relative reference. url.ParseRequestURI alone is
+// not enough on either count — it accepts "/tenant" (no scheme, no host), and
+// it does not split a fragment, so "https://as.example.com/t#frag" parses
+// cleanly with the fragment folded into Path.
+//
+// It is exported so every construction boundary applies one rule rather than a
+// copy of it: NewTokenVerifier below, resource.New (which calls it), and
+// authplane.NewClient, whose discovery path needs its own gate because a client
+// used only for token, introspection and revocation calls never constructs a
+// TokenVerifier.
+//
+// Every error it returns wraps ErrInvalidIssuer and carries a redacted form of
+// the identifier — see redactIssuer.
+func ValidateIssuer(issuer string) error {
+	if strings.ContainsAny(issuer, "?#") {
+		return fmt.Errorf("%w: must not contain a query or fragment (RFC 8414 §2), got %s", ErrInvalidIssuer, redactIssuer(issuer))
+	}
+	parsed, err := url.ParseRequestURI(issuer)
+	if err != nil {
+		// Wrap with %w so errors.As(err, new(*url.Error)) keeps working, but
+		// substitute the URL: url.Error.Error() prints its URL field verbatim
+		// and does not redact.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = &url.Error{Op: uerr.Op, URL: redactIssuer(issuer), Err: uerr.Err}
+		}
+		return fmt.Errorf("%w: %w", ErrInvalidIssuer, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("%w: must be absolute with a scheme and host, got %s", ErrInvalidIssuer, redactIssuer(issuer))
+	}
+	return nil
+}
+
+// redactIssuer renders an issuer identifier for an error message without
+// echoing anything credential-shaped.
+//
+// The branches above fire precisely for malformed identifiers, and the
+// query/fragment branch fires for exactly the shape that carries a secret —
+// "https://as.example.com?token=…". Echoing the raw value there would put it in
+// whatever log the construction error lands in. Only the scheme and host
+// survive: url.URL keeps userinfo in User, the query in RawQuery and the
+// fragment in Fragment, so Host alone is safe to print.
+func redactIssuer(issuer string) string {
+	parsed, err := url.Parse(issuer)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "(unparseable issuer)"
+	}
+	return parsed.Scheme + "://" + parsed.Host + " (path, query and fragment redacted)"
 }

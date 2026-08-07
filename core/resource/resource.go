@@ -6,13 +6,21 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
+	"strings"
 
 	"github.com/authplane/go-sdk/core/resource/verifier"
 )
 
 // Resource represents a protected resource with PRM generation and token verification.
 type Resource struct {
-	uri       string
+	uri string
+	// parsedURI is uri after New's validation. Keeping it removes three
+	// re-parses of the same already-validated string (WellKnownPRMPath and two
+	// in buildPRM) and, more importantly, lets wellKnownPRMPath take a
+	// *url.URL: as a string-taking function it had to decide what to return on
+	// a parse failure, and returning the origin-level well-known path handed
+	// back a plausible-looking wrong answer instead of failing.
+	parsedURI *url.URL
 	scopes    []string
 	issuer    string
 	verifier  *verifier.TokenVerifier
@@ -102,21 +110,63 @@ func (r *Resource) PRMURL() string {
 // The path is formed by inserting "/.well-known/oauth-protected-resource"
 // between the host and the path component of the resource URI.
 //
+// Per RFC 9728 §3.1 the terminating slash following the host component is
+// removed before insertion, so a resource identifier and its trailing-slash
+// variant resolve to the same well-known path. The section says "any
+// terminating '/'", which is read here as every one of them: "/mcp//" derives
+// the same path as "/mcp/". A single-character strip would leave "/mcp/" for
+// the former and "/mcp" for the latter, publishing two documents for what §3.1
+// treats as one identifier. This is derivation, not identity: the resource
+// identifier itself is preserved verbatim everywhere it is stored, advertised
+// or compared.
+//
+// The path is derived from the escaped path, so a percent-encoded octet such
+// as "%2F" (path data per RFC 3986 §3.3, not a delimiter) is carried through
+// unchanged rather than being decoded into a "/" and stripped.
+//
 // Examples:
 //
-//	resource URI "https://api.example.com"        → "/.well-known/oauth-protected-resource"
-//	resource URI "https://api.example.com/mcp"    → "/.well-known/oauth-protected-resource/mcp"
-//	resource URI "https://api.example.com/v2/mcp" → "/.well-known/oauth-protected-resource/v2/mcp"
+//	resource URI "https://api.example.com"         → "/.well-known/oauth-protected-resource"
+//	resource URI "https://api.example.com/mcp"     → "/.well-known/oauth-protected-resource/mcp"
+//	resource URI "https://api.example.com/mcp/"    → "/.well-known/oauth-protected-resource/mcp"
+//	resource URI "https://api.example.com/mcp//"   → "/.well-known/oauth-protected-resource/mcp"
+//	resource URI "https://api.example.com/mcp%2F"  → "/.well-known/oauth-protected-resource/mcp%2F"
+//	resource URI "https://api.example.com/v2/mcp"  → "/.well-known/oauth-protected-resource/v2/mcp"
 func (r *Resource) WellKnownPRMPath() string {
-	return wellKnownPRMPath(r.uri)
+	return wellKnownPRMPath(r.parsedURI)
 }
 
-func wellKnownPRMPath(resourceURI string) string {
-	u, err := url.Parse(resourceURI)
-	if err != nil || u.Path == "" || u.Path == "/" {
+// wellKnownPRMPath takes an already-parsed URI rather than a string: every
+// caller holds one (New parsed it, and the Resource keeps it), and a
+// string-taking version had to invent an answer for a parse failure it could
+// not actually encounter — returning the origin-level well-known path, which is
+// a wrong answer that looks right.
+func wellKnownPRMPath(u *url.URL) string {
+	// Operate on the escaped path, not the decoded u.Path: per RFC 3986 §3.3 a
+	// percent-encoded octet such as "%2F" is data within a path segment, not the
+	// "/" delimiter, so it must survive into the derived well-known URL verbatim.
+	// Using u.Path would decode "%2F" to "/" and then TrimRight would strip it,
+	// changing the resource's identity. This mirrors buildOAuthMetadataURL, which
+	// derives the RFC 8414 metadata URL from EscapedPath() for the same reason.
+	escPath := u.EscapedPath()
+	if escPath == "" || escPath == "/" {
 		return "/.well-known/oauth-protected-resource"
 	}
-	return "/.well-known/oauth-protected-resource" + u.Path
+	// RFC 9728 §3.1: any terminating slash following the host component MUST be
+	// removed before inserting the well-known path suffix between the host and
+	// the path component, so "/mcp/" is served at
+	// ".../oauth-protected-resource/mcp" — the same URL a conformant client
+	// derives. This strips only a genuine delimiter slash (a "%2F" is left
+	// intact) and only from the derived URL; the resource identifier is
+	// unchanged.
+	//
+	// TODO(AuthPlane/go-sdk#24): RFC 9728 §3.1 defines the derivation over the
+	// resource identifier's "path and/or query components"; only the path half
+	// is handled here, so two identifiers differing only by query collapse onto
+	// one document. Whether to preserve the query or reject a query-bearing
+	// identifier at New is an open cross-implementation decision — see the
+	// issue.
+	return "/.well-known/oauth-protected-resource" + strings.TrimRight(escPath, "/")
 }
 
 // New creates a new Resource.
@@ -135,6 +185,13 @@ func New(uri, issuer string, jwksCache *verifier.JWKSCache, opts ...Option) (*Re
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("resource: resource URI must be absolute with scheme and host, got %q", uri)
 	}
+	// RFC 8707 §2 forbids a fragment in a resource indicator. url.ParseRequestURI
+	// does not split a fragment, so "https://api.example.com/mcp#frag" parses with
+	// the "#frag" folded into Path and would otherwise pass the scheme/host check
+	// and leak into the derived PRM URL. Reject it explicitly.
+	if strings.Contains(uri, "#") {
+		return nil, fmt.Errorf("resource: resource URI must not contain a fragment (RFC 8707 §2), got %q", uri)
+	}
 
 	cfg := &resourceConfig{}
 	for _, opt := range opts {
@@ -147,10 +204,11 @@ func New(uri, issuer string, jwksCache *verifier.JWKSCache, opts ...Option) (*Re
 	}
 
 	r := &Resource{
-		uri:      uri,
-		scopes:   cfg.scopes,
-		issuer:   issuer,
-		verifier: tv,
+		uri:       uri,
+		parsedURI: parsed,
+		scopes:    cfg.scopes,
+		issuer:    issuer,
+		verifier:  tv,
 	}
 
 	r.buildPRM()
@@ -244,9 +302,20 @@ func (r *Resource) buildPRM() {
 	r.prmMap = prm
 	r.prmJSON, _ = json.Marshal(prm)
 
-	// r.uri was validated by New (url.ParseRequestURI), so url.Parse cannot
-	// fail here — this is the single, infallible source of truth that
-	// adapters consume via PRMURL().
-	u, _ := url.Parse(r.uri)
-	r.prmURL = u.ResolveReference(&url.URL{Path: wellKnownPRMPath(r.uri)}).String()
+	// r.parsedURI is New's own parse of the validated URI — the single,
+	// infallible source of truth adapters consume via PRMURL(). Reusing it here
+	// replaces two re-parses of a string that was already parsed once.
+	//
+	// Parse the well-known path (rather than assigning it to url.URL.Path
+	// directly) so its RawPath is populated: wellKnownPRMPath already returns an
+	// escaped path, and String() would otherwise re-escape a literal "%2F" into
+	// "%252F". Parsing round-trips the escaping so an encoded "%2F" is preserved.
+	//
+	// ResolveReference dereferences ref immediately, so a nil ref would panic.
+	// That is unreachable: wellKnownPRMPath derives from the already-parsed
+	// URI's escaped path, so url.Parse of the resulting well-known path cannot
+	// fail and ref is never nil. The discarded error is therefore safe to ignore.
+	u := r.parsedURI
+	ref, _ := url.Parse(wellKnownPRMPath(r.parsedURI))
+	r.prmURL = u.ResolveReference(ref).String()
 }

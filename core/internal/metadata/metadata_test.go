@@ -373,6 +373,47 @@ func TestMetadataCache_JWKSURIChange(t *testing.T) {
 	}
 }
 
+// TestMetadataCache_IssuerTrailingSlashMismatch is the regression for the
+// RFC 8414 §3.3 comparison: the configured issuer and the document "issuer"
+// are compared byte-for-byte (§4, code-point-for-code-point, no normalization).
+// A metadata document whose issuer differs from the configured issuer only by a
+// trailing slash is a different identifier and is rejected — a clean discovery
+// failure rather than a silent bind to a different issuer's metadata.
+func TestMetadataCache_IssuerTrailingSlashMismatch(t *testing.T) {
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/oauth-authorization-server" {
+			w.Header().Set("Content-Type", "application/json")
+			// Document issuer carries a trailing slash the configured issuer lacks.
+			meta := ASMetadata{
+				Issuer:  serverURL + "/",
+				JWKSURI: serverURL + "/jwks",
+			}
+			data, _ := json.Marshal(meta)
+			w.Write(data)
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	mc := New(Config{
+		IssuerURL:       server.URL, // configured without a trailing slash
+		FetchSettings:   testSettings(),
+		RefreshInterval: time.Hour,
+	})
+	defer mc.Close()
+
+	_, err := mc.Get(context.Background())
+	if err == nil {
+		t.Fatal("expected issuer-mismatch error for a trailing-slash difference, got nil")
+	}
+	if !strings.Contains(err.Error(), "issuer mismatch") {
+		t.Errorf("expected issuer mismatch error, got: %v", err)
+	}
+}
+
 // TestMetadataCache_Close_Idempotent verifies that calling Close multiple times
 // does not panic.
 func TestMetadataCache_Close_Idempotent(t *testing.T) {
@@ -431,5 +472,49 @@ func TestMetadataCache_BothDiscoveryFail(t *testing.T) {
 	_, err := mc.Get(context.Background())
 	if err == nil {
 		t.Fatal("expected error when both discovery paths fail, got nil")
+	}
+}
+
+// TestBuildOAuthMetadataURL_TrailingSlash asserts the RFC 8414 §3.1 derivation
+// removes a terminating slash on the issuer path before inserting the
+// well-known component, so an issuer ending in "/tenant/" derives
+// ".../oauth-authorization-server/tenant" (not ".../tenant/"). This keeps the
+// derived metadata URL aligned with the byte-for-byte issuer identity.
+func TestBuildOAuthMetadataURL_TrailingSlash(t *testing.T) {
+	tests := []struct {
+		name   string
+		issuer string
+		want   string
+	}{
+		{
+			name:   "path with trailing slash",
+			issuer: "https://as.example.com/tenant/",
+			want:   "https://as.example.com/.well-known/oauth-authorization-server/tenant",
+		},
+		{
+			name:   "path without trailing slash",
+			issuer: "https://as.example.com/tenant",
+			want:   "https://as.example.com/.well-known/oauth-authorization-server/tenant",
+		},
+		{
+			name:   "bare origin",
+			issuer: "https://as.example.com",
+			want:   "https://as.example.com/.well-known/oauth-authorization-server",
+		},
+		{
+			// A percent-encoded octet is path data (RFC 3986 §3.3), not a
+			// delimiter: it must survive verbatim into the derived URL, never
+			// re-escaped into "%252F" (a 404).
+			name:   "path with encoded octet",
+			issuer: "https://as.example.com/tenant%2Fx",
+			want:   "https://as.example.com/.well-known/oauth-authorization-server/tenant%2Fx",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildOAuthMetadataURL(tt.issuer); got != tt.want {
+				t.Errorf("buildOAuthMetadataURL(%q) = %q, want %q", tt.issuer, got, tt.want)
+			}
+		})
 	}
 }
