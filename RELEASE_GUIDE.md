@@ -5,7 +5,7 @@ How to ship a new version of the Go SDK (`core`, `http`, `mcp`). All three modul
 ## Prerequisites
 
 - You are a maintainer on `AuthPlane/go-sdk`.
-- **`RELEASE_BOT_APP_ID`** and **`RELEASE_BOT_PRIVATE_KEY`** are set as organization secrets scoped to this repo. The Release Bot GitHub App mints a short-lived token used to push the four annotated tags. (`ci.yml` does not need these — the conformance repo is public.) `release.yml` fails fast with a clear error if either secret is missing — the workflow will not silently proceed.
+- **`RELEASE_BOT_APP_ID`** and **`RELEASE_BOT_PRIVATE_KEY`** are set as organization secrets scoped to this repo. The Release Bot GitHub App mints a short-lived token used to push the five annotated tags. (`ci.yml` does not need these — the conformance repo is public.) `release.yml` fails fast with a clear error if either secret is missing — the workflow will not silently proceed.
 - `CHANGELOG.md` on `main` has a populated `## [Unreleased]` section.
 
 There is no registry to configure. `proxy.golang.org` polls public tags and begins serving the new module versions within seconds of the atomic push — **the tag push is the publish**.
