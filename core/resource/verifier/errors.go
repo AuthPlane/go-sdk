@@ -4,6 +4,16 @@ import "errors"
 
 // Sentinel errors returned by TokenVerifier.
 var (
+	// ErrInvalidIssuer is returned when an issuer identifier is not the shape
+	// RFC 8414 requires. Every construction boundary that accepts an issuer
+	// routes through ValidateIssuer, so this is the single sentinel for all of
+	// them: NewTokenVerifier, resource.New (which calls it) and
+	// authplane.NewClient, which needs its own call because a client used only
+	// for token, introspection and revocation never builds a TokenVerifier.
+	//
+	// authplane.ErrInvalidIssuer is an alias of this value, so errors.Is
+	// matches regardless of which boundary rejected the identifier.
+	ErrInvalidIssuer      = errors.New("verifier: invalid issuer")
 	ErrTokenMissing       = errors.New("verifier: token missing")
 	ErrTokenExpired       = errors.New("verifier: token expired")
 	ErrInvalidSignature   = errors.New("verifier: invalid signature")

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -83,6 +84,87 @@ func TestNewClient_Success(t *testing.T) {
 		t.Fatalf("failed: %v", err)
 	}
 	defer client.Close()
+}
+
+func TestNewClient_RejectsIssuerWithQueryOrFragment(t *testing.T) {
+	// RFC 8414 §2 forbids both a query and a fragment in an issuer identifier.
+	// NewClient must reject them at construction — before discovery — so the two
+	// discovery-URL builders cannot diverge on a query/fragment-bearing issuer.
+	cases := []struct {
+		name   string
+		issuer string
+		// wantMsg is the substring the rejection message must carry. The two
+		// rules produce different wording, so asserting the shared sentinel
+		// alone would not tell them apart.
+		wantMsg string
+	}{
+		{"query", "https://as.example.com/tenant?x=1", "query or fragment"},
+		{"fragment", "https://as.example.com/tenant#frag", "query or fragment"},
+		{"both", "https://as.example.com/tenant?x=1#frag", "query or fragment"},
+		// The scheme/host rule is not redundant with the verifier's gate: a
+		// *Client used only for token, introspection and revocation calls never
+		// constructs a TokenVerifier, so NewClient is the only boundary that
+		// keeps a relative reference out of eager discovery. Without these rows
+		// the branch could be deleted and no test would go red.
+		{"no scheme or host", "/tenant", "scheme and host"},
+		{"scheme only", "https://", "scheme and host"},
+		// A bare authority fails earlier, in url.ParseRequestURI, so it takes
+		// the wrapped-parse-error branch rather than the scheme/host one. It is
+		// still rejected, and its message is still redacted.
+		{"host only", "as.example.com/tenant", "unparseable issuer"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := authplane.NewClient(context.Background(), tc.issuer,
+				authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
+			if err == nil {
+				if client != nil {
+					client.Close()
+				}
+				t.Fatalf("expected error for issuer %q, got nil", tc.issuer)
+			}
+			if !errors.Is(err, authplane.ErrInvalidIssuer) {
+				t.Fatalf("expected error to wrap ErrInvalidIssuer, got %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("expected %q in rejection message, got %v", tc.wantMsg, err)
+			}
+		})
+	}
+}
+
+func TestNewClient_RejectionDoesNotEchoIssuerSecrets(t *testing.T) {
+	// The query/fragment branch fires for exactly the shape that carries a
+	// secret. Construction errors land in startup logs, so the message must not
+	// reproduce the query, the fragment or any userinfo.
+	// The needles must not be substrings of the rejection wording itself —
+	// "frag" would match the word "fragment" in the message and report a leak
+	// that is not one.
+	const (
+		secret   = "s3cr3t-token-value"
+		password = "hunter2-not-a-word"
+		fragNeed = "zz-fragment-needle"
+	)
+	issuer := "https://admin:" + password + "@as.example.com/tenant?access_token=" + secret + "#" + fragNeed
+
+	client, err := authplane.NewClient(context.Background(), issuer,
+		authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
+	if err == nil {
+		if client != nil {
+			client.Close()
+		}
+		t.Fatal("expected error for issuer carrying a query and fragment, got nil")
+	}
+	msg := err.Error()
+	for _, leaked := range []string{secret, password, "access_token", fragNeed} {
+		if strings.Contains(msg, leaked) {
+			t.Fatalf("rejection message leaked %q: %s", leaked, msg)
+		}
+	}
+	// The host is deliberately kept — without it the error is unactionable.
+	if !strings.Contains(msg, "as.example.com") {
+		t.Fatalf("expected the host to survive redaction, got %s", msg)
+	}
 }
 
 func TestNewClient_NoCredentials(t *testing.T) {

@@ -132,6 +132,51 @@ func TestMiddlewareSkipsPRMPathWithQueryString(t *testing.T) {
 	}
 }
 
+// TestMiddlewareSkipsPRMPathWithEncodedOctet locks in the fix for a resource
+// identifier carrying a percent-encoded octet (e.g. "%2F"). WellKnownPRMPath
+// keeps the octet escaped, so the middleware must compare the raw request path
+// (EscapedPath), not the decoded r.URL.Path. Comparing the decoded path would
+// let "%2F" collapse to "/", the two sides would disagree, and the PRM
+// discovery endpoint would return 401 instead of being bypassed — violating
+// RFC 9728 §3.2, which requires it publicly reachable without a token.
+func TestMiddlewareSkipsPRMPathWithEncodedOctet(t *testing.T) {
+	e := newTestEnvForResource(t, "https://api.example.com/mcp%2Fdata")
+	prmPath := e.adapter.WellKnownPRMPath()
+	if !strings.Contains(prmPath, "%2F") {
+		t.Fatalf("WellKnownPRMPath() = %q, want it to preserve the encoded %%2F", prmPath)
+	}
+	// The bypass hands off to the PRM handler, which must serve the metadata
+	// unauthenticated even though the path contains an encoded octet. Wrapping
+	// the PRM handler directly (rather than a ServeMux) isolates the bypass
+	// decision from any router-specific handling of "%2F".
+	handler := e.adapter.Middleware()(e.adapter.PRMHandler())
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, prmPath, nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("PRM with encoded octet: status = %d, want 200 (endpoint must be bypassed)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("PRM Content-Type = %q, want application/json", ct)
+	}
+
+	// Second case: exercise the documented wiring operators actually deploy —
+	// register the PRM handler on a ServeMux at WellKnownPRMPath() and wrap the
+	// mux with Middleware(). The bypass must still keep the encoded-octet PRM
+	// path publicly reachable after the router resolves it, since that is the
+	// registration/bypass agreement operators depend on.
+	mux := http.NewServeMux()
+	mux.Handle(prmPath, e.adapter.PRMHandler())
+	muxHandler := e.adapter.Middleware()(mux)
+	muxRec := httptest.NewRecorder()
+	muxHandler.ServeHTTP(muxRec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, prmPath, nil))
+	if muxRec.Code != http.StatusOK {
+		t.Errorf("PRM with encoded octet via mux: status = %d, want 200 (endpoint must stay publicly reachable)", muxRec.Code)
+	}
+	if ct := muxRec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("PRM Content-Type via mux = %q, want application/json", ct)
+	}
+}
+
 // Middleware tests
 
 func TestMiddlewareNoToken(t *testing.T) {

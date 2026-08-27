@@ -111,8 +111,8 @@ func (a *Adapter) writeAuthError(w http.ResponseWriter, err error) {
 // request, in raw form (`EscapedPath`) so reserved percent-encoding
 // (e.g. `%2F` vs `/`) is preserved per RFC 3986 §6.2.2.2. Query and fragment
 // are dropped — RFC 9449 §4.3 #5 defines `htu` as the target URI without
-// query or fragment; outbound `normalizeHTU` (`core/authplane/dpop.go`) and
-// every sibling SDK (rust/cs/java/python) drop them too.
+// query or fragment; outbound `normalizeHTU` (`core/authplane/dpop.go`)
+// drops them too, so the inbound and outbound sides of the binding agree.
 //
 // Operators must mount this middleware **before** any prefix-stripping
 // router (`http.StripPrefix`) so `r.URL.EscapedPath()` still reflects the
@@ -154,7 +154,25 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 	prmPath := a.resource.WellKnownPRMPath()
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == prmPath {
+			// Compare the raw request path (EscapedPath), not the decoded
+			// r.URL.Path: WellKnownPRMPath returns an escaped path, so a
+			// resource identifier carrying a percent-encoded octet (e.g.
+			// "%2F") yields a prmPath with that octet intact. Comparing the
+			// decoded path here would let "%2F" collapse to "/", the two
+			// sides would disagree, and the PRM discovery endpoint would stop
+			// being bypassed and return 401 — RFC 9728 §3.2 requires it
+			// publicly reachable. This mirrors validateHTU, which likewise
+			// compares EscapedPath for the DPoP htu binding.
+			//
+			// This is deliberately stricter than RFC 3986 §6.2.2.1: a
+			// percent-encoded *unreserved* octet (e.g. "m%63p" for "mcp")
+			// compares unequal here even though §6.2.2.1 would treat it as
+			// equivalent to the decoded form. We accept that asymmetry — a
+			// conformant client derives the well-known path from the resource
+			// identifier it was given, so it signs the same octets the
+			// operator configured; the exact-match check keeps the bypass
+			// surface minimal rather than admitting encoding variants.
+			if r.URL.EscapedPath() == prmPath {
 				next.ServeHTTP(w, r)
 				return
 			}

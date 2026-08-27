@@ -129,7 +129,7 @@ Standard `net/http` middleware.
 - Calls `resource.VerifyToken(ctx, token, opts...)`.
 - On success, injects `*verifier.VerifiedClaims` and the raw token into the request context.
 - On failure, writes an RFC 6750 response via `resource.AuthErrorResponse`.
-- Requests whose path equals `WellKnownPRMPath()` are passed through unauthenticated.
+- Requests whose **escaped** path (`r.URL.EscapedPath()`) equals `WellKnownPRMPath()` are passed through unauthenticated. The comparison is on the escaped form on both sides: a resource identifier carrying a percent-encoded octet (e.g. `%2F`) derives a well-known path that keeps it, and comparing the decoded `r.URL.Path` would let `%2F` collapse to `/`, disagree, and return 401 for the discovery endpoint RFC 9728 §3.2 requires to be publicly reachable.
 
 ### `(a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler`
 

@@ -201,6 +201,21 @@ func (mc *MetadataCache) fetchMetadata(ctx context.Context) (data []byte, header
 	return nil, nil, fmt.Errorf("metadata: discovery failed (tried RFC 8414 and OIDC): %w", lastErr)
 }
 
+// buildOAuthMetadataURL derives the RFC 8414 authorization-server metadata URL
+// from the issuer. Per RFC 8414 §3.1 the well-known path component is inserted
+// between the host and the issuer's path component (not appended to the end),
+// and any terminating slash on the issuer's path is removed first, so an issuer
+// of "https://as.example.com/tenant/" derives
+// ".../oauth-authorization-server/tenant". The escaped path is used so a
+// percent-encoded octet (RFC 3986 §3.3 path data) survives into the derived URL
+// rather than being decoded and mistaken for a delimiter.
+//
+// The well-known suffix is parsed into a reference and resolved against the
+// issuer (rather than assigned to u.Path with u.RawPath cleared): the escaped
+// path already carries the encoding, and assigning it to u.Path would make
+// String() re-escape a literal "%2F" into "%252F" (a 404). Parsing the suffix
+// populates its RawPath so the escaping round-trips unchanged. This mirrors the
+// PRM URL derivation in core/resource.buildPRM.
 func buildOAuthMetadataURL(issuer string) string {
 	u, err := url.Parse(issuer)
 	if err != nil {
@@ -208,15 +223,22 @@ func buildOAuthMetadataURL(issuer string) string {
 	}
 
 	path := strings.TrimRight(u.EscapedPath(), "/")
-	if path == "" {
-		u.Path = "/.well-known/oauth-authorization-server"
-	} else {
-		u.Path = "/.well-known/oauth-authorization-server" + path
-	}
-	u.RawPath = ""
-	return u.String()
+	// ResolveReference dereferences ref immediately, so a nil ref would panic.
+	// That is unreachable here: path is u.EscapedPath() (an already-valid
+	// escaped path from a successfully parsed URL) prefixed with a literal
+	// well-known segment, so url.Parse cannot fail and ref is never nil. The
+	// discarded error is therefore safe to ignore.
+	ref, _ := url.Parse("/.well-known/oauth-authorization-server" + path)
+	return u.ResolveReference(ref).String()
 }
 
+// buildOIDCDiscoveryURL derives the OIDC discovery URL from the issuer. OIDC
+// Discovery §4 appends "/.well-known/openid-configuration" to the end of the
+// issuer, whereas RFC 8414 (see buildOAuthMetadataURL) inserts the well-known
+// path between host and path; both nonetheless require removing the issuer's
+// terminating slash first, for different reasons — appending to a trailing
+// slash would double it, and inserting past one would leave it stranded before
+// the path component.
 func buildOIDCDiscoveryURL(issuer string) string {
 	return strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
 }
@@ -256,10 +278,17 @@ func (mc *MetadataCache) parse(data []byte) (*ASMetadata, error) {
 	if meta.Issuer == "" {
 		return nil, fmt.Errorf("metadata: missing required field \"issuer\"")
 	}
-	configuredIssuer := strings.TrimRight(mc.issuerURL, "/")
-	metaIssuer := strings.TrimRight(meta.Issuer, "/")
-	if metaIssuer != configuredIssuer {
-		return nil, fmt.Errorf("metadata: issuer mismatch: expected %q, got %q", configuredIssuer, metaIssuer)
+	// RFC 8414 §3.3 requires the metadata "issuer" to be identical to the
+	// configured issuer, and §4 specifies a code-point-for-code-point comparison
+	// with no normalization applied. Compare both sides verbatim: a document
+	// whose issuer differs only by a trailing slash is a different identifier and
+	// is rejected. Derivation is many-to-one (an issuer and its trailing-slash
+	// variant share one well-known URL), so the strict comparison turns that
+	// unavoidable collision into a clean discovery failure rather than a silent
+	// bind to a different issuer's metadata (the attack RFC 8414 §3.3 and
+	// RFC 9728 §7.3 exist to defeat).
+	if meta.Issuer != mc.issuerURL {
+		return nil, fmt.Errorf("metadata: issuer mismatch: expected %q, got %q", mc.issuerURL, meta.Issuer)
 	}
 	if meta.JWKSURI == "" {
 		return nil, fmt.Errorf("metadata: missing required field \"jwks_uri\"")

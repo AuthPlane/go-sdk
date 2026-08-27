@@ -76,6 +76,19 @@ go install golang.org/x/vuln/cmd/govulncheck@latest
 (cd mcp  && govulncheck ./...)
 ```
 
+**Conformance catalog:**
+
+The `core` conformance suite maps to the shared [conformance catalog](https://github.com/AuthPlane/conformance). CI pins the catalog to the SHA tracked in [`.conformance-catalog-ref`](.conformance-catalog-ref) at the repo root, so a catalog change can never break CI on its own. To reproduce CI locally, check out that same ref:
+
+```bash
+git clone https://github.com/AuthPlane/conformance.git /path/to/catalog
+git -C /path/to/catalog checkout "$(cat .conformance-catalog-ref)"
+export CONFORMANCE_CATALOG_PATH=/path/to/catalog/oauth-sdk-conformance-catalog.yaml
+(cd core && go test ./conformancetests/ -v)
+```
+
+A weekly `conformance-catalog-drift` workflow runs the alignment check against the latest catalog and fails when new cases need adopting. When adopting them, update `core/conformancetests/` and bump `.conformance-catalog-ref` in the same change. See [`core/conformancetests/README.md`](core/conformancetests/README.md) for details.
+
 ## Pull Request Guidelines
 
 - Branch off `main`. Release branches (`release/v*`, `hotfix/v*`) are managed by the release flow — see [RELEASE_POLICY.md](RELEASE_POLICY.md).

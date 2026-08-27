@@ -181,7 +181,7 @@ Because `*Adapter` embeds `*authplanehttp.Adapter`, the following methods from t
 
 - `Middleware() func(http.Handler) http.Handler` — the underlying middleware (`AuthMiddleware` is a one-line wrapper).
 - `PRMHandler() http.Handler` — the plain-HTTP PRM handler (`max-age=3600`, no CORS). Prefer `ProtectedResourceMetadataHandler()` below for MCP clients.
-- `WellKnownPRMPath() string` — the RFC 9728 well-known path.
+- `WellKnownPRMPath() string` — the RFC 9728 well-known path. Derivation strips any terminating slash after the host component (§3.1) and preserves percent-encoded octets in the path; the resource identifier itself is unchanged.
 - `RequireScopes(scopes ...string) func(http.Handler) http.Handler` — RFC 6750 `insufficient_scope` middleware (useful for non-MCP HTTP routes mounted alongside `/mcp`).
 
 ### `(a *Adapter) HTTPContextFunc(opts ...HTTPContextOption) server.HTTPContextFunc`
