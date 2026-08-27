@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.25.5
 
 require (
-	github.com/authplane/go-sdk/core v0.0.0
+	github.com/authplane/go-sdk/core v0.3.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/modelcontextprotocol/go-sdk v1.4.1
 )

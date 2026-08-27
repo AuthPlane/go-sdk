@@ -3,8 +3,8 @@ module github.com/authplane/go-sdk/mark3labs
 go 1.25.5
 
 require (
-	github.com/authplane/go-sdk/core v0.0.0
-	github.com/authplane/go-sdk/http v0.0.0
+	github.com/authplane/go-sdk/core v0.3.0
+	github.com/authplane/go-sdk/http v0.3.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/mark3labs/mcp-go v0.54.0
 )
