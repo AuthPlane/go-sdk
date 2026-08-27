@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-27
+
 ### Added
 - `core/resource/verifier`: `ValidateIssuer(issuer string) error` — the RFC 8414 §2 issuer-shape rule, exported so every construction boundary applies one implementation rather than a copy. Rejects a query or fragment component, and requires an absolute URL with a scheme and host. `NewTokenVerifier`, `resource.New` and `authplane.NewClient` all route through it.
 - `core/resource/verifier`: `ErrInvalidIssuer` sentinel, returned by everything that validates an issuer identifier. Match it with `errors.Is`.
