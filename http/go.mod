@@ -6,6 +6,6 @@ toolchain go1.25.5
 
 require github.com/authplane/go-sdk/core v0.0.0
 
-require github.com/go-jose/go-jose/v4 v4.1.4
+require github.com/go-jose/go-jose/v4 v4.1.5
 
 replace github.com/authplane/go-sdk/core => ../core
