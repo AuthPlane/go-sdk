@@ -43,6 +43,14 @@ type Options struct {
 	Resource string
 	Scopes   []string
 
+	// ResourceMetadataURL overrides the URL advertised in the RFC 9728 §5.1
+	// resource_metadata parameter of the WWW-Authenticate challenge. Leave it
+	// empty to advertise the document this adapter serves itself; set it to the
+	// authorization server's copy ("<issuer>/.well-known/oauth-protected-resource/{ref}")
+	// when the resource server cannot host well-known paths. Rejected at
+	// construction if it is not an absolute http(s) URL.
+	ResourceMetadataURL string
+
 	// DevMode relaxes SSRF protection to allow HTTP and localhost — required when
 	// the issuer runs on a local development server. Remove before deploying to production.
 	// The SDK also checks the AUTHPLANE_DEV_MODE=1 env var as a fallback.
@@ -122,6 +130,9 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 	}
 
 	resourceOpts := []resource.Option{resource.WithScopes(options.Scopes...)}
+	if options.ResourceMetadataURL != "" {
+		resourceOpts = append(resourceOpts, resource.WithResourceMetadataURL(options.ResourceMetadataURL))
+	}
 	if len(options.VerifierOptions) > 0 {
 		// Only pass WithVerifierOptions when non-empty: WithVerifierOptions replaces
 		// (not appends) the verifier option list, so passing an empty slice would

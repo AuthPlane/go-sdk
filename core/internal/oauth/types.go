@@ -158,6 +158,14 @@ var (
 	ErrUseDPoPNonce         = errors.New("auth: use_dpop_nonce")
 	ErrConsentRequired      = errors.New("auth: consent_required")
 	ErrInteractionRequired  = errors.New("auth: interaction_required")
+	// ErrAccessDenied is returned when the AS refuses a cross-client token
+	// exchange (HTTP 403): the exchanging client is not allowlisted on the
+	// target resource. Operator-fixable, not user-fixable — re-prompting the
+	// user does not help, unlike consent_required.
+	ErrAccessDenied = errors.New("auth: access_denied")
+	// ErrInvalidTarget is returned when the requested resource does not match
+	// a granted resource byte for byte (RFC 8707 §2.2; a trailing slash counts).
+	ErrInvalidTarget = errors.New("auth: invalid_target")
 )
 
 // mapOAuthError maps an OAuth 2.0 error code string to a sentinel error.
@@ -183,6 +191,10 @@ func mapOAuthError(errorCode string) error {
 		return ErrConsentRequired
 	case "interaction_required":
 		return ErrInteractionRequired
+	case "access_denied":
+		return ErrAccessDenied
+	case "invalid_target":
+		return ErrInvalidTarget
 	default:
 		return errors.New("auth: " + errorCode)
 	}

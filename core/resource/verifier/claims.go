@@ -83,7 +83,9 @@ func (c *VerifiedClaims) Act() map[string]any {
 	return cloneMap(c.act)
 }
 
-// MayAct returns a copy of the may_act claim.
+// MayAct returns a copy of the may_act claim (RFC 8693 §4.4).
+//
+// Deprecated: authserver 0.2.0 no longer issues may_act; removed in the next minor.
 func (c *VerifiedClaims) MayAct() map[string]any {
 	return cloneMap(c.mayAct)
 }
@@ -118,9 +120,11 @@ func (c *VerifiedClaims) RequireScope(scope string) error {
 // semantic.
 //
 // On failure the returned error names every missing scope and the scopes
-// the token does carry, so the adapter can surface it verbatim in the
-// `error_description` of the `WWW-Authenticate` challenge without an
-// out-of-band log lookup. The error wraps ErrInsufficientScope, so
+// the token does carry, so the resource server has the whole diagnostic in
+// one log line. It is not put on the wire: the 403 names the missing scopes
+// through the RFC 6750 §3 `scope="..."` parameter of the WWW-Authenticate
+// header, and the body carries only the fixed sentence for the error code.
+// The error wraps ErrInsufficientScope, so
 // adapters that already branch on `errors.Is(err, ErrInsufficientScope)`
 // (e.g. `resource.HTTPStatus`) keep producing a 403 with the right
 // `scope="..."` parameter when the surrounding ScopeError carries the
@@ -156,7 +160,7 @@ func (c *VerifiedClaims) RequireScopes(scopes ...string) error {
 }
 
 // quoteAll wraps each entry in %q-style double-quotes so the rendered
-// error_description visually delimits each scope and stays unambiguous
+// message visually delimits each scope and stays unambiguous
 // even if a malformed token carries scope tokens containing control
 // characters. RFC 6749 §3.3 (`scope-token = 1*( %x21 / %x23-5B /
 // %x5D-7E )`) explicitly forbids whitespace inside a scope, so this is

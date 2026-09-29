@@ -7,22 +7,33 @@ name: Release tooling
 # release, which is the worst moment to discover it — so they are linted
 # and tested here too.
 #
-# Scoped to `.github/workflows/**` and `scripts/*.sh` to keep CI overhead
-# off unrelated PRs. `.github/scripts/*.sh` is deliberately not in scope:
-# it is driven by conformance-catalog-drift.yml, not by the release flow
-# this job guards, and pulling it in would widen the trigger to every PR
-# touching `.github/**`.
+# Scoped to `.github/workflows/**`, `scripts/*.sh` and `.github/scripts/*.sh`
+# to keep CI overhead off unrelated PRs.
+#
+# `.github/scripts/*.sh` was previously out of scope on the grounds that it
+# serves the drift workflow rather than the release flow this job guards. It is
+# in scope now: those scripts stopped being thin fetch wrappers once the
+# conformance case-body drift check landed there, and they run only on a weekly
+# schedule, so a break in them surfaces late and quietly — the same "surfaces
+# only when someone reaches for it" argument that put `scripts/*.sh` here. The
+# trigger stays narrow: the added path matches PRs touching those scripts, not
+# every PR touching `.github/**`.
+#
+# Linting alone would not have been enough for them, so they carry their own
+# tests here as well, next to backport-fixes.test.sh.
 
 on:
   pull_request:
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/*.sh"
       - "scripts/*.sh"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/*.sh"
       - "scripts/*.sh"
 
 permissions:
@@ -76,9 +87,32 @@ jobs:
       - name: Shellcheck the release scripts
         run: shellcheck scripts/*.sh
 
+      - name: Shellcheck the workflow support scripts
+        run: shellcheck .github/scripts/*.sh
+
       # backport-fixes.sh accepts a branch or a tag as --from, and only the
       # branch form has a remote-tracking ref. The tag form is what the release
       # flow tells you to use once release.yml has deleted the branch, so it is
       # the form least likely to be exercised before it is needed.
       - name: Test backport-fixes.sh
         run: scripts/backport-fixes.test.sh
+
+      # Shellcheck above is the only other gate on the conformance drift
+      # scripts, and it cannot see the way they break: a loosened id regex that
+      # drops cases, or a `diff` whose exit code stops being read, is valid
+      # shell. The result is a check that reports green while guarding nothing,
+      # on a weekly schedule where nobody is watching — and it would stay
+      # unnoticed until a real re-tightening slipped through, which is the
+      # failure that check exists to prevent. These controls pin the detection
+      # itself. They need neither Go nor the catalog clone, so they run here.
+      - name: Test conformance-case-body-drift.sh
+        run: .github/scripts/conformance-case-body-drift.test.sh
+
+      # Same argument, for the script every catalog-consuming workflow reads the
+      # pin through. Its refusals are what keep an unpinned ref or a fetch that
+      # lands no catalog from being diagnosed somewhere else, much later — and
+      # dropping one of them is valid shell. It is also a copy carried between
+      # repositories, so this is what a copy has to still satisfy. Nothing here
+      # touches the network: the fetch is redirected at a local fixture repo.
+      - name: Test fetch-conformance-catalog.sh
+        run: .github/scripts/fetch-conformance-catalog.test.sh

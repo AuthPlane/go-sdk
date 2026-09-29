@@ -1,12 +1,15 @@
 package verifier_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -353,6 +356,34 @@ func TestVerifyToken_RevocationCheckerError_FailOpen(t *testing.T) {
 	}
 	if claims.Sub() != testSubject {
 		t.Errorf("sub = %q, want %q", claims.Sub(), testSubject)
+	}
+}
+
+// TestVerifyToken_RevocationCheckerError_FailOpen_LogsWarning pins that
+// the fail-open branch is not silent: a checker error that lets a token
+// through is reported on the default slog logger.
+func TestVerifyToken_RevocationCheckerError_FailOpen_LogsWarning(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	checker := func(ctx context.Context, claims *verifier.VerifiedClaims, rawToken string) (bool, error) {
+		return false, fmt.Errorf("revocation service unavailable")
+	}
+
+	v, key := setupES256Verifier(t, verifier.WithRevocationChecker(checker))
+	token := signStandardToken(t, key)
+
+	if _, err := v.VerifyToken(context.Background(), token, nil); err != nil {
+		t.Fatalf("fail-open should accept token, got error: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "fail-open") {
+		t.Errorf("expected a fail-open WARN log, got %q", logged)
+	}
+	if !strings.Contains(logged, "revocation service unavailable") {
+		t.Errorf("expected the checker error in the log, got %q", logged)
 	}
 }
 

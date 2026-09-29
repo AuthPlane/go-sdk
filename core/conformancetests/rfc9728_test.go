@@ -3,6 +3,7 @@ package conformancetests
 import (
 	"context"
 	"crypto/ecdsa"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,14 +17,22 @@ func newPRMTestResource(t *testing.T, uri, issuer string, scopes ...string) *res
 	return newPRMTestResourceWithOpts(t, uri, issuer, scopes)
 }
 
-// newPRMTestResourceWithOpts is like newPRMTestResource but accepts extra resource options.
-func newPRMTestResourceWithOpts(t *testing.T, uri, issuer string, scopes []string, extra ...resource.Option) *resource.Resource {
+// newPRMTestJWKSCache builds a primed JWKS cache for tests that call
+// resource.New directly — the rejection cases below need the constructor's
+// error, which newPRMTestResource turns into t.Fatalf.
+func newPRMTestJWKSCache(t *testing.T) *verifier.JWKSCache {
 	t.Helper()
 	key, err := testutil.GenerateES256Key()
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	jc := newJWKSCacheForKey(t, key)
+	return newJWKSCacheForKey(t, key)
+}
+
+// newPRMTestResourceWithOpts is like newPRMTestResource but accepts extra resource options.
+func newPRMTestResourceWithOpts(t *testing.T, uri, issuer string, scopes []string, extra ...resource.Option) *resource.Resource {
+	t.Helper()
+	jc := newPRMTestJWKSCache(t)
 
 	opts := []resource.Option{}
 	if len(scopes) > 0 {
@@ -138,6 +147,92 @@ func TestRFC9728WellKnownPathMustDeriveFromResourceURI(t *testing.T) {
 		if got := r.WellKnownPRMPath(); got != tc.wantPath {
 			t.Errorf("WellKnownPRMPath(%q) = %q, want %q", tc.resourceURI, got, tc.wantPath)
 		}
+	}
+}
+
+func TestRFC9728WellKnownURLMustPreserveTheResourceQueryComponent(t *testing.T) {
+	Case(t, "rfc9728-well-known-url-must-preserve-the-resource-query-component")
+
+	// The stimulus is the full derived URL rather than the path alone, since a
+	// path-only accessor cannot express a query. RFC 9728 §3 inserts the
+	// well-known string "between the host component and the path and/or query
+	// components", so the query survives the derivation.
+	cases := []struct {
+		resourceURI string
+		wantURL     string
+	}{
+		{"https://api.example.com/mcp?tenant=a", "https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=a"},
+		{"https://api.example.com/mcp?tenant=b", "https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=b"},
+		// No path and no terminating slash: §3.1 has no slash to remove, so the
+		// suffix goes directly after the host and the query follows it.
+		{"https://api.example.com?x=1", "https://api.example.com/.well-known/oauth-protected-resource?x=1"},
+	}
+
+	var derived []string
+	for _, tc := range cases {
+		r := newPRMTestResource(t, tc.resourceURI, "https://auth.example.com")
+		got := r.PRMURL()
+		if got != tc.wantURL {
+			t.Errorf("PRMURL(%q) = %q, want %q", tc.resourceURI, got, tc.wantURL)
+		}
+		derived = append(derived, got)
+	}
+
+	// Identifiers differing only by their query must not collapse onto one
+	// metadata document URL — that is the multi-tenant harm the case names, in
+	// which a client asking for tenant a's metadata is served tenant b's.
+	// Checked as uniqueness over every derived URL rather than by index, so
+	// reordering or extending the case table cannot silently drop the check.
+	seen := make(map[string]struct{}, len(derived))
+	for i, url := range derived {
+		if _, dup := seen[url]; dup {
+			t.Errorf("distinct identifiers collapsed onto one PRM URL %q (case %d)", url, i)
+		}
+		seen[url] = struct{}{}
+	}
+}
+
+func TestRFC9728ResourceIdentifierMustBeAnAbsoluteURLWithSchemeAndHost(t *testing.T) {
+	Case(t, "rfc9728-resource-identifier-must-be-an-absolute-url-with-scheme-and-host")
+
+	jc := newPRMTestJWKSCache(t)
+
+	// Each value is exercised independently and each must reject on its own.
+	// The two are not redundant: a scheme-relative reference supplies an
+	// authority, so a guard that only asks whether the identifier is opaque or
+	// authority-less would accept it while still rejecting the plain relative
+	// form. The scheme is the component missing from both.
+	rejected := []struct {
+		name string
+		uri  string
+	}{
+		{"relative reference", "/mcp"},
+		{"scheme-relative reference", "//api.example.com/mcp"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := resource.New(tc.uri, "https://auth.example.com", jc)
+			if err == nil {
+				t.Fatalf("resource.New(%q) = %q, want rejection", tc.uri, r.URI())
+			}
+			// The catalog's error_hint names the absoluteness requirement, so
+			// pin the rejection to it: an error from an unrelated gate (query
+			// grammar, parse failure) must not keep this case green.
+			if !strings.Contains(err.Error(), "absolute with scheme and host") {
+				t.Errorf(
+					"resource.New(%q) error = %v, want it to name the absoluteness requirement",
+					tc.uri, err,
+				)
+			}
+		})
+	}
+
+	// The requirement is scheme-and-host, not https-only: an identifier that
+	// supplies both components is acceptable on these grounds, so a loopback
+	// http identifier must still be accepted. Any https policy is a separate
+	// requirement this case neither tests nor licenses folding in here.
+	if _, err := resource.New("http://localhost:8080/mcp", "https://auth.example.com", jc); err != nil {
+		t.Errorf("resource.New(%q): unexpected rejection: %v", "http://localhost:8080/mcp", err)
 	}
 }
 

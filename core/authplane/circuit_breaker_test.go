@@ -41,6 +41,8 @@ func TestShouldTripCircuitBreaker(t *testing.T) {
 		{"invalid_grant", oauth.ErrInvalidGrant, false},
 		{"invalid_scope", oauth.ErrInvalidScope, false},
 		{"use_dpop_nonce", oauth.ErrUseDPoPNonce, false},
+		{"access_denied", oauth.ErrAccessDenied, false},
+		{"invalid_target", oauth.ErrInvalidTarget, false},
 
 		// SSRF — should NOT trip.
 		{"ssrf_blocked", ssrf.ErrSSRFBlocked, false},
@@ -54,6 +56,8 @@ func TestShouldTripCircuitBreaker(t *testing.T) {
 			Cause:      oauth.ErrConsentRequired,
 		}), false},
 		{"wrapped ssrf", fmt.Errorf("metadata: %w", ssrf.ErrSSRFBlocked), false},
+		{"wrapped access_denied", fmt.Errorf("exchange: %w: client not allowlisted", oauth.ErrAccessDenied), false},
+		{"wrapped invalid_target", fmt.Errorf("exchange: %w: resource mismatch", oauth.ErrInvalidTarget), false},
 	}
 
 	for _, tt := range tests {

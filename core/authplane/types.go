@@ -69,4 +69,6 @@ var (
 	ErrUseDPoPNonce         = oauth.ErrUseDPoPNonce
 	ErrConsentRequired      = oauth.ErrConsentRequired
 	ErrInteractionRequired  = oauth.ErrInteractionRequired
+	ErrAccessDenied         = oauth.ErrAccessDenied
+	ErrInvalidTarget        = oauth.ErrInvalidTarget
 )

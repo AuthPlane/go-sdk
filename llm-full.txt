@@ -200,7 +200,7 @@ Top-level public types under `github.com/authplane/go-sdk/core/...`:
 | `TokenResponse`, `IntrospectionResponse`, `TokenExchangeInput`, `ConsentRequiredError`, OAuth error sentinels (`ErrInvalidGrant`, `ErrConsentRequired`, etc.) | `authplane` | Token-operation results and OAuth error types |
 | `Resource`, `Option`, `WithScopes`, `WithVerifierOptions` | `resource` | Protected-resource facade (verify + RFC 9728 PRM) |
 | `VerifyOption`, `WithDPoP` | `resource` | Per-call options for `Resource.VerifyToken` (e.g. attach a `DPoPContext`) |
-| `HTTPStatus`, `AuthErrorResponse`, `ScopeError` | `resource` | Error → HTTP status / WWW-Authenticate helpers (RFC 6750) |
+| `HTTPStatus`, `AuthErrorResponse`, `AuthErrorResponseVerbose`, `ScopeError` | `resource` | Error → HTTP status / WWW-Authenticate helpers (RFC 6750). The JSON body's `error_description` is a fixed sentence per error code; the `Verbose` variant restores the error's own message and is a development aid only |
 | `TokenVerifier`, `NewTokenVerifier`, `JWKSCache`, `NewJWKSCache` | `verifier` | Lower-level JWT verification + JWKS cache (used by `Resource`) |
 | `VerifiedClaims` (with `DPoPProof()` accessor) | `verifier` | Validated JWT claims; DPoP-bound tokens expose validated proof via `DPoPProof() *VerifiedDPoPProof` |
 | `VerifiedDPoPProof` | `verifier` | JTI, HTM, HTU, IAT, KeyThumbprint, Nonce of a validated DPoP proof |

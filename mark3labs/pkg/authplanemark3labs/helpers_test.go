@@ -40,6 +40,26 @@ type testEnv struct {
 // when the test completes.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWithScopes(t, "tools/add", "tools/multiply")
+}
+
+// newTestEnvWithMetadataURL is newTestEnv with Options.ResourceMetadataURL set;
+// an empty value leaves the adapter on the derived PRM URL.
+func newTestEnvWithMetadataURL(t *testing.T, resourceMetadataURL string) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, resourceMetadataURL, "tools/add", "tools/multiply")
+}
+
+// newTestEnvWithScopes is newTestEnv with the resource's supported scopes
+// chosen by the caller; pass none for a resource that advertises no scopes.
+func newTestEnvWithScopes(t *testing.T, scopes ...string) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, "", scopes...)
+}
+
+// newTestEnvWith is the base the three constructors above delegate to.
+func newTestEnvWith(t *testing.T, resourceMetadataURL string, scopes ...string) *testEnv {
+	t.Helper()
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -77,8 +97,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	adapter, err := authplanemark3labs.NewAdapter(context.Background(), authplanemark3labs.Options{
 		Issuer:   srv.URL,
 		Resource: testResource,
-		Scopes:   []string{"tools/add", "tools/multiply"},
+		Scopes:   scopes,
 		DevMode:  true, // allow HTTP + localhost in tests
+
+		ResourceMetadataURL: resourceMetadataURL,
 	})
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)

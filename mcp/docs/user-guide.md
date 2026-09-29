@@ -57,7 +57,7 @@ func main() {
 
 1. `authplane.NewClient` performs RFC 8414 AS metadata discovery.
 2. `client.Resource(uri, resource.WithScopes(...))` builds the resource (the JWKS cache is warmed and background refresh starts).
-3. If `ClientOptions` includes `WithClientCredentials` or `WithClientAuthentication`, RFC 7662 introspection is auto-wired as the revocation checker, and `TokenExchange` becomes operational.
+3. If `ClientOptions` includes `WithClientCredentials` or `WithClientAuthentication`, RFC 7662 introspection is auto-wired as the revocation checker, and `TokenExchange` becomes operational. The credentials must belong to a confidential client that is the issuing client or a runtime-client of the Resource — see §8.
 
 `AuthMiddleware` delegates token extraction to the MCP Go SDK's `auth.RequireBearerToken`, which places `auth.TokenInfo` into the request context (MCP's streamable transport reads it for session binding). The adapter then runs the core verifier, stores the resulting claims in a per-request box, and injects `*verifier.VerifiedClaims` into the context for tool handlers.
 
@@ -122,8 +122,30 @@ mcp.AddTool(server, &mcp.Tool{Name: "add", Description: "Add two numbers"},
 | `DevMode` | `bool` | no | Relaxes SSRF to allow HTTP, localhost, private networks. Also enabled if `AUTHPLANE_DEV_MODE=1`. Remove before production. |
 | `ClientOptions` | `[]authplane.Option` | no | SDK-level options: `WithClientCredentials`, `WithClientAuthentication`, `WithJWKSCacheTTL`, `WithCircuitBreaker`, `WithDPoP`, etc. |
 | `VerifierOptions` | `[]verifier.Option` | no | Verifier-level options: `WithAlgorithms`, `WithClockSkew`, `WithRevocationChecker`, `WithFailClosed`. |
+| `ResourceMetadataURL` | `string` | no | Overrides the URL advertised in `resource_metadata`. Empty advertises the document this adapter serves. See §5.1. |
 
 `VerifierOptions` **replaces** the verifier option list set by `client.Resource`. When `ClientOptions` supplies credentials, the SDK auto-wires an introspection-backed revocation checker — if you also pass `VerifierOptions`, include `verifier.WithRevocationChecker(...)` (or `NullRevocationChecker`) explicitly if you want to keep, replace, or disable it.
+
+### 5.1 Where the PRM document lives
+
+RFC 9728 admits two topologies, and the adapter serves both.
+
+**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from `Options.Resource`, `ProtectedResourceMetadataHandler()` serves the document, and the 401 challenge advertises that URL. Nothing to configure.
+
+**(b) AS-hosted.** authserver 0.2.0 and later publishes a document for every registered Resource at `<issuer>/.well-known/oauth-protected-resource/{ref}`, where `{ref}` is the RFC 9728 §3.1 path suffix of the Resource URI (or its slug). Point the challenge there when the resource server cannot host well-known paths — a platform that owns `/.well-known`, a proxy that will not forward it:
+
+```go
+adapter, err := authplanemcp.NewAdapter(ctx, authplanemcp.Options{
+    Issuer:              "https://auth.example.com",
+    Resource:            "https://mcp.example.com/mcp",
+    Scopes:              []string{"tools/query"},
+    ResourceMetadataURL: "https://auth.example.com/.well-known/oauth-protected-resource/mcp",
+})
+```
+
+Only the advertisement moves. `WellKnownPRMPath()` and `ProtectedResourceMetadataHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
+
+Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resource` member inside the document must equal the URL clients call, byte for byte — a client must discard a document whose `resource` differs from the identifier it derived the request from. So the Resource URI registered at the authorization server, the identifier you configure here, and the public URL your server is reached on must be one and the same string, trailing slash and port included.
 
 ## 6. Main API reference
 
@@ -141,7 +163,7 @@ Constructs an adapter from an already-built client and resource. Use this when s
 
 Wraps an HTTP handler with bearer-token authentication.
 
-- Rejects unauthenticated requests with 401 and a `WWW-Authenticate` header pointing to the PRM URL.
+- Rejects unauthenticated requests with 401 and a `WWW-Authenticate` header pointing to the PRM URL and naming the resource's configured scopes (`Options.Scopes`) in `scope="…"`, per RFC 6750 §3 and the MCP authorization spec's SHOULD — e.g. `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="tools/query tools/write"`. The `scope` param is omitted when `Options.Scopes` is empty.
 - On success, injects `*verifier.VerifiedClaims` and the raw token into the request context.
 - Internally uses `auth.RequireBearerToken` from the MCP Go SDK so that `auth.TokenInfo` is placed in the context for the streamable transport's session-binding protection.
 
@@ -191,6 +213,22 @@ RFC 8693 token exchange frequently runs into an authorization-server response of
 
 The adapter bridges these two: `adapter.TokenExchange` catches the consent-required error and rewrites it as `mcp.URLElicitationRequiredError` so the MCP client does the right thing automatically.
 
+**Operator step for cross-client exchanges.** For each MCP server that exchanges for a downstream resource it does not act as, allowlist the exchanging client on the target Resource:
+
+```http
+PATCH /admin/resources/{id}
+{"policy": {"exchange": {"allowed_client_ids": ["<exchanging-client-id>"]}}}
+```
+
+A client exchanging a token issued to itself, fronted exchanges and Broker resources need nothing.
+
+Two exchange errors look like consent problems but are not:
+
+- `access_denied` (HTTP 403, `authplane.ErrAccessDenied`) on a cross-client exchange means the operator has not allowlisted the exchanging client on the target Resource (`policy.exchange.allowed_client_ids` / `policy.runtime.client_ids`). Re-prompting the user will not fix it — unlike `consent_required`, which the user resolves.
+- `invalid_target` (HTTP 400, `authplane.ErrInvalidTarget`, RFC 8707 §2.2) means the `resource` string does not match a granted resource exactly — byte for byte, a trailing slash counts.
+
+Neither counts toward the circuit breaker: the AS answered, it just said no.
+
 ### 7.1 Automatic mapping
 
 ```go
@@ -224,7 +262,7 @@ The generated `URLElicitationRequiredError` carries:
 - The AS `error_description` as the prompt message (falling back to `"Consent is required to proceed"` when empty).
 - A newly minted elicitation ID so the MCP client can correlate the completion event.
 
-If the AS does not provide a `ConsentURL`, the original `*authplane.ConsentRequiredError` is returned unchanged — the tool handler decides how to proceed (abort, fall back to a static message, etc.).
+If the AS does not provide a `ConsentURL`, the original `*authplane.ConsentRequiredError` is returned unchanged — the tool handler decides how to proceed (abort, fall back to a static message, etc.). `access_denied` and `invalid_target` are never mapped to an elicitation: there is nothing for the user to do.
 
 ### 7.2 Custom consent handling
 
@@ -247,6 +285,14 @@ URL elicitation is an MCP-protocol concept. The `http` adapter has **no equivale
 ## 8. Revocation checking
 
 When credentials are supplied in `ClientOptions`, the SDK auto-wires RFC 7662 introspection as the revocation checker. Every successful JWT verification triggers an introspection round-trip; the token is rejected if the AS reports `active: false`.
+
+The introspecting client must be **confidential** (client ID and secret) **and** either the client the token was issued to or a runtime-client of the Resource named in the token's `aud`. authserver ≥ 0.1.2 answers `{"active": false}` to anyone else — a public (secret-less) client cannot introspect at all, and a resource server introspecting with the wrong client rejects every token as revoked. Register the resource server as a runtime-client of its Resource:
+
+```bash
+authserver admin resource runtime-client add --client-id <rs-client-id> --slug <resource-slug>
+```
+
+When introspection answers `active: false` for a token that already passed local JWT verification, the SDK logs one warning per resource pointing at this requirement. The warning is written to `slog.Default()`; install a handler with `slog.SetDefault` to route it into your own logging setup, or to silence it.
 
 ```go
 adapter, err := authplanemcp.NewAdapter(ctx, authplanemcp.Options{
@@ -352,6 +398,8 @@ When calling `adapter.Client()` operations directly (e.g. `Revoke`, `Introspect`
 | `ErrProtocolError` | Malformed response from AS. |
 | `ErrConsentRequired` | User consent required — prefer `*ConsentRequiredError` for the URL. |
 | `ErrInteractionRequired` | User interaction required. |
+| `ErrAccessDenied` | Cross-client exchange refused (403): the exchanging client is not allowlisted on the target Resource. Operator fix, not a consent prompt. |
+| `ErrInvalidTarget` | `resource` does not match a granted resource byte for byte (RFC 8707 §2.2). |
 | `ErrUseDPoPNonce` | AS returned a DPoP nonce; the client auto-retries with the nonce. |
 
 The full verifier error list (signature, claims, DPoP, etc.) lives in the [core user guide](../../core/docs/user-guide.md).

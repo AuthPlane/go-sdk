@@ -136,9 +136,9 @@ func TestVerifiedClaims_RequireScope(t *testing.T) {
 func TestVerifiedClaims_RequireScope_EnrichedErrorString(t *testing.T) {
 	// RequireScope now delegates to RequireScopes, which means the singular
 	// path also carries the `required scope "X"; token has scopes: …`
-	// rich shape. Pin the wire body so a future refactor that reverts the
-	// delegation (or changes the message format) fails this test instead
-	// of silently regressing the adapter's WWW-Authenticate error_description.
+	// rich shape. Pin the message so a future refactor that reverts the
+	// delegation (or changes the format) fails this test instead of
+	// silently regressing what the resource server logs.
 	c := ParseClaims(testClaims(), "kid")
 	err := c.RequireScope("delete")
 	if err == nil {
@@ -306,9 +306,11 @@ func TestVerifiedClaims_Act(t *testing.T) {
 	}
 }
 
+// TestVerifiedClaims_MayAct keeps the deprecated accessor honest until it
+// is removed: a token that still carries may_act is parsed unchanged.
 func TestVerifiedClaims_MayAct(t *testing.T) {
 	c := ParseClaims(testClaims(), "kid")
-	mayAct := c.MayAct()
+	mayAct := c.MayAct() //nolint:staticcheck // deprecated accessor kept until the next minor
 	if mayAct["sub"] != "potential-actor" {
 		t.Errorf("expected may_act.sub = 'potential-actor', got %v", mayAct["sub"])
 	}

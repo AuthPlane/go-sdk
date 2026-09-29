@@ -128,7 +128,8 @@ Standard `net/http` middleware.
 - For `DPoP`, also consumes the `DPoP` request header and constructs a `*verifier.DPoPContext` with the request method, reconstructed URL (scheme + host + request URI), proof, and the adapter's replay store.
 - Calls `resource.VerifyToken(ctx, token, opts...)`.
 - On success, injects `*verifier.VerifiedClaims` and the raw token into the request context.
-- On failure, writes an RFC 6750 response via `resource.AuthErrorResponse`.
+- On failure, writes an RFC 6750 response via `resource.AuthErrorResponseWithMetadata`, whose challenge carries `resource_metadata="…"` (RFC 9728 §5.1) pointing at `res.ResourceMetadataURL()` — see §6.1.
+- A 401 also carries `scope="…"` listing the resource's configured scopes (`resource.WithScopes`), per RFC 6750 §3 and the MCP authorization spec's SHOULD, so a client learns what to request before it holds any token — e.g. `Bearer resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp", scope="tools/add tools/multiply"`. The param is omitted when no scopes are configured. A 403 from `RequireScopes` keeps its own route-specific `scope=` (below) and is not touched.
 - Requests whose **escaped** path (`r.URL.EscapedPath()`) equals `WellKnownPRMPath()` are passed through unauthenticated. The comparison is on the escaped form on both sides: a resource identifier carrying a percent-encoded octet (e.g. `%2F`) derives a well-known path that keeps it, and comparing the decoded `r.URL.Path` would let `%2F` collapse to `/`, disagree, and return 401 for the discovery endpoint RFC 9728 §3.2 requires to be publicly reachable.
 
 ### `(a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler`
@@ -167,6 +168,26 @@ res, err := client.Resource("https://api.example.com",
 )
 adapter := authplanehttp.New(res)
 ```
+
+### 6.1 Where the PRM document lives
+
+RFC 9728 admits two topologies, and the adapter serves both.
+
+**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from the resource identifier, `PRMHandler()` serves the document, and the `WWW-Authenticate` challenge advertises that URL. Nothing to configure.
+
+**(b) AS-hosted.** authserver 0.2.0 and later publishes a document for every registered Resource at `<issuer>/.well-known/oauth-protected-resource/{ref}`, where `{ref}` is the RFC 9728 §3.1 path suffix of the Resource URI (or its slug). Point the challenge there when the resource server cannot host well-known paths — a platform that owns `/.well-known`, a proxy that will not forward it:
+
+```go
+res, err := client.Resource("https://api.example.com/mcp",
+    resource.WithScopes("read", "write"),
+    resource.WithResourceMetadataURL("https://auth.example.com/.well-known/oauth-protected-resource/mcp"),
+)
+adapter := authplanehttp.New(res)
+```
+
+Only the advertisement moves. `WellKnownPRMPath()` and `PRMHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
+
+Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resource` member inside the document must equal the URL clients call, byte for byte — a client must discard a document whose `resource` differs from the identifier it derived the request from. So the Resource URI registered at the authorization server, the identifier you configure here, and the public URL your server is reached on must be one and the same string, trailing slash and port included.
 
 ## 7. DPoP (sender-constrained tokens)
 
@@ -241,14 +262,16 @@ client.Resource(uri,
 
 ## 9. Error handling
 
-The middleware maps every verifier error to an RFC 6750 response via `resource.AuthErrorResponse`. If you need to handle errors yourself inside a custom middleware chain, call the same helpers:
+The middleware maps every verifier error to an RFC 6750 response via `resource.AuthErrorResponseWithMetadata`. If you need to handle errors yourself inside a custom middleware chain, call the same helper — it returns the status too, so there is no need to call `HTTPStatus` as well:
 
 ```go
 import "github.com/authplane/go-sdk/core/resource"
 
-status := resource.HTTPStatus(err)
-status, headers, body := resource.AuthErrorResponse(err)
+// status, WWW-Authenticate + Content-Type headers, and the JSON body:
+status, headers, body := resource.AuthErrorResponseWithMetadata(err, res.ResourceMetadataURL())
 ```
+
+`AuthErrorResponseWithMetadata` appends the RFC 9728 §5.1 `resource_metadata` parameter to the challenge — pass `res.ResourceMetadataURL()` and your custom middleware advertises the same document the adapter does. `resource.AuthErrorResponse(err)` is the same call without that parameter.
 
 Status mapping (from `resource.HTTPStatus`):
 
@@ -259,7 +282,7 @@ Status mapping (from `resource.HTTPStatus`):
 | `ErrJWKSUnavailable`, `ErrMetadataUnavailable` | 503 |
 | `ErrSSRFBlocked`, `ErrProtocolError`, other | 500 |
 
-`WWW-Authenticate` scheme is `DPoP` for any DPoP error and `Bearer` otherwise. The full error reference lives in the [core user guide](../../core/docs/user-guide.md).
+`WWW-Authenticate` scheme is `DPoP` for any DPoP error and `Bearer` otherwise. The JSON body's `error_description` is a fixed sentence chosen by the error code, never the verifier's own message. The adapter owns the error at that point and no longer returns it, so it writes the diagnostic to `slog.Default()` at DEBUG (`authplane: rejecting request`, with `err` and `status`); enable debug logging on your default handler to see it, or call `resource.VerifyToken` directly if you want the error in hand. The full error reference lives in the [core user guide](../../core/docs/user-guide.md).
 
 ## 10. Lifecycle
 

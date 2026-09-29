@@ -12,6 +12,20 @@ name: Conformance Catalog Drift
 #
 # When this job fails on drift, adopt the new cases in core/conformancetests/
 # and bump .conformance-catalog-ref to the new catalog SHA in the same change.
+#
+# The job runs TWO checks, because they see different things:
+#
+#   1. Case-ID alignment against the tip. Reports cases ADDED to the catalog
+#      that this SDK does not yet cover. This is a set comparison over ids.
+#
+#   2. Case-BODY drift for the cases this SDK registers. Reports a case that was
+#      re-tightened IN PLACE — same id, changed requirement. Check 1 is blind to
+#      this by construction: the id set is unchanged, so the case still looks
+#      adopted while the requirement underneath it has moved, and the SDK keeps
+#      declaring conformance to wording nothing verified it against. That has
+#      already happened once, to the metadata jwks_uri rotation case. Check 2
+#      needs the catalog at BOTH refs in the same job, which is why the pinned
+#      catalog is fetched here alongside the tip.
 
 on:
   schedule:
@@ -66,9 +80,101 @@ jobs:
         shell: bash
         run: go test ./conformancetests/ -v 2>&1 | tee "$RUNNER_TEMP/align.log"
 
+      # The catalog at the ref this repo PINS, alongside the tip cloned above.
+      # The body check needs both to compare anything; with only the tip it
+      # would have nothing to compare against and could report nothing but
+      # green. Reuses the same fetch the pinned workflows use — including its
+      # 40-hex-SHA guard and its unreachable-ref failure — rather than a second
+      # copy of that logic that could be tightened in one place and not the
+      # other. CONFORMANCE_CATALOG_DEST keeps it off the default path, which
+      # the tip clone above already occupies.
+      #
+      # Placed AFTER the alignment check, with if: always(), so the two checks
+      # fail independently. Only check 2 reads the pinned catalog. Run before
+      # `align`, a failed fetch — a transient error on this second clone, or a
+      # pinned SHA that has become unreachable — would skip `Setup Go` and
+      # `align` (neither carries an `if:`, so both default to `success()`) and
+      # silently drop the id-level check that ran on its own before check 2
+      # existed. `Report drift` would then find no align.log and report the
+      # skip as a build or harness problem, which is the wrong diagnosis for a
+      # check that never started.
+      - name: Fetch pinned conformance catalog (out of tree)
+        if: always()
+        env:
+          CONFORMANCE_CATALOG_DEST: ${{ runner.temp }}/conformance-pinned
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # The ids for check 2. They come from the harness's own report rather than
+      # from a grep over the test sources, so they cannot disagree with what
+      # actually registered.
+      #
+      # Run against the PINNED catalog, not the tip. The question the body check
+      # asks is "which cases does this SDK declare conformance to under its
+      # current pin", and anchoring the list to the pin keeps it stable while
+      # the tip moves. It also keeps this step independent of the step above,
+      # which is EXPECTED to go red whenever the tip has drifted.
+      #
+      # if: always() because of that: the id-level check failing is the normal
+      # way this job reports, and the body check must still run after it.
+      - name: Collect the case ids this SDK registers
+        if: always()
+        working-directory: core
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance-pinned/oauth-sdk-conformance-catalog.yaml
+        shell: bash
+        run: |
+          # Delete the report the step above wrote against the TIP catalog. If
+          # the run below fails to produce a new one, the id script must find
+          # nothing rather than silently read the previous step's report and
+          # describe the wrong catalog.
+          rm -f "$GITHUB_WORKSPACE/conformance-report.json"
+
+          # -count=1 defeats the test cache. A cached run does not execute
+          # TestMain, so it writes no report at all — and the check downstream
+          # would then be reading a stale artifact or nothing.
+          status=0
+          go test -count=1 ./conformancetests/ > "$RUNNER_TEMP/pinned-suite.log" 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            # Not this job's signal to raise: a suite that fails against its own
+            # pinned catalog is red on every PR in ci.yml already. Surfaced, and
+            # the id list still comes from THIS run's report, never an older one.
+            echo "::warning::The conformance suite did not pass against the pinned catalog (exit $status). This job reports catalog drift, not suite health — see ci.yml. Log tail follows."
+            tail -n 40 "$RUNNER_TEMP/pinned-suite.log"
+          fi
+
+          "$GITHUB_WORKSPACE/.github/scripts/conformance-registered-case-ids.sh" \
+            > "$RUNNER_TEMP/registered-case-ids.txt"
+          echo "This SDK registers $(wc -l < "$RUNNER_TEMP/registered-case-ids.txt") conformance case(s)."
+
+      # Check 2. Fails the job when a case this SDK registers changed body
+      # between the pinned ref and the tip, and fails just as loudly when it
+      # cannot do that comparison at all.
+      - name: Check pinned case bodies against the catalog tip
+        id: bodies
+        if: always()
+        shell: bash
+        env:
+          PINNED_CATALOG: ${{ runner.temp }}/conformance-pinned/oauth-sdk-conformance-catalog.yaml
+          TIP_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+          REGISTERED_IDS: ${{ runner.temp }}/registered-case-ids.txt
+        run: |
+          DRIFT_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            .github/scripts/conformance-case-body-drift.sh
+
       - name: Report drift
         if: always()
         run: |
+          # The body check writes its own detail into the step summary when it
+          # finds something. Recorded here either way, so a green run states
+          # that both checks ran rather than only the one that prints on
+          # success — a check whose silence is indistinguishable from its
+          # absence is how this class went unnoticed in the first place.
+          if [ "${{ steps.bodies.outcome }}" = "success" ]; then
+            echo "Conformance case bodies: no registered case changed shape under an unchanged id." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::The pinned case-body check did not pass (outcome: ${{ steps.bodies.outcome }}). Either a case this SDK registers was re-tightened under the same id, or the check could not run. Read its step log — it names the case."
+          fi
+
           if [ "${{ steps.align.outcome }}" = "success" ]; then
             echo "Conformance catalog alignment: no drift against the latest catalog." >> "$GITHUB_STEP_SUMMARY"
           elif ! grep -qE "has no conformance test|registers unknown case" "$RUNNER_TEMP/align.log" 2>/dev/null; then

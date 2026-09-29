@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/authplane/go-sdk/core/internal/cache"
@@ -186,13 +188,38 @@ func NewClient(ctx context.Context, issuer string, opts ...Option) (*Client, err
 // WithClientAuthentication), RFC 7662 introspection is automatically wired as
 // the default revocation checker. Any WithRevocationChecker supplied in opts
 // takes precedence — pass verifier.NullRevocationChecker to explicitly disable it.
+//
+// The introspecting client must be confidential and either the client the
+// token was issued to or a runtime-client of the Resource named in the token's
+// aud: authserver ≥ 0.1.2 answers {"active": false} to anyone else, so a
+// resource server introspecting with the wrong credentials rejects every
+// token as revoked. The checker logs a warning the first time that happens.
 func (c *Client) Resource(resourceURI string, opts ...resource.Option) (*resource.Resource, error) {
 	if c.auth != nil {
+		// inactiveWarn gates the ownership warning below. It is declared here,
+		// not on Client, because runtime-client registration is per resource: a
+		// Client backing two Resources must be able to warn about each.
+		var inactiveWarn sync.Once
 		introspectOpt := resource.WithVerifierOptions(
-			verifier.WithRevocationChecker(func(ctx context.Context, _ *verifier.VerifiedClaims, rawToken string) (bool, error) {
+			verifier.WithRevocationChecker(func(ctx context.Context, claims *verifier.VerifiedClaims, rawToken string) (bool, error) {
 				resp, err := c.Introspect(ctx, rawToken)
 				if err != nil {
 					return false, err
+				}
+				if !resp.Active {
+					// The token passed signature, issuer, audience and
+					// expiry locally, so active:false is either a real
+					// revocation or the AS not treating this client as
+					// the token's owner. Once per resource is enough to
+					// point at the second cause without flooding logs
+					// on genuinely revoked tokens.
+					inactiveWarn.Do(func() {
+						slog.WarnContext(ctx, "authplane: introspection returned active=false for a token that passed local JWT verification; "+
+							"if the token is not revoked, the authorization server does not recognize this client as the token's owner — "+
+							"authserver >= 0.1.2 only answers the issuing client or a runtime-client of the resource in aud "+
+							"(authserver admin resource runtime-client add --client-id <rs-client-id> --slug <resource-slug>)",
+							"client_id", c.auth.ClientID, "aud", claims.Audience(), "jti", claims.JTI())
+					})
 				}
 				return !resp.Active, nil
 			}),
@@ -413,12 +440,17 @@ func shouldTripCircuitBreaker(err error) bool {
 	}
 
 	// Per-request or per-token errors — the AS responded correctly.
+	// access_denied (cross-client exchange not allowlisted on the target
+	// resource) and invalid_target (resource does not match a granted one)
+	// are policy answers about this request, not an AS outage.
 	switch {
 	case errors.Is(err, oauth.ErrInvalidGrant),
 		errors.Is(err, oauth.ErrInvalidScope),
 		errors.Is(err, oauth.ErrConsentRequired),
 		errors.Is(err, oauth.ErrInteractionRequired),
-		errors.Is(err, oauth.ErrUseDPoPNonce):
+		errors.Is(err, oauth.ErrUseDPoPNonce),
+		errors.Is(err, oauth.ErrAccessDenied),
+		errors.Is(err, oauth.ErrInvalidTarget):
 		return false
 	}
 

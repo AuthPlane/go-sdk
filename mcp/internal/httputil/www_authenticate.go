@@ -38,6 +38,12 @@ func (w *WWWAuthenticateQuoter) Flush() {
 	}
 }
 
+// Unwrap returns the wrapped ResponseWriter so that http.ResponseController
+// can reach the real writer for SetWriteDeadline, Hijack and friends.
+func (w *WWWAuthenticateQuoter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // QuoteWWWAuthenticateParams ensures every key=value param in a WWW-Authenticate
 // header value is quoted if the value is not a valid HTTP token.
 // For example:  Bearer resource_metadata=http://x  →  Bearer resource_metadata="http://x"

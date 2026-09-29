@@ -276,9 +276,10 @@ claims.Claim("email")                       // any or nil
 
 ```go
 claims.Act()          // map[string]any for "act" claim (delegation chain)
-claims.MayAct()       // map[string]any for "may_act" claim (authorized actors)
 claims.AgentChain()   // []string for "agent_chain" claim (Authplane extension)
 ```
+
+`MayAct()` is deprecated: authserver 0.2.0 no longer issues the `may_act` claim (RFC 8693 §4.4), and the accessor is removed in the next minor.
 
 ### DPoP confirmation
 
@@ -309,6 +310,14 @@ verifier never re-parses or mutates the proof after publication.
 By default, verification only uses the JWT and JWKS. Revocation checking adds a post-validation step.
 
 ### Built-in introspection-based revocation
+
+The introspecting client must be **confidential** (client ID and secret) **and** either the client the token was issued to or a runtime-client of the Resource named in the token's `aud`. authserver ≥ 0.1.2 answers `{"active": false}` to anyone else — a public (secret-less) client cannot introspect at all, and a resource server introspecting with the wrong client rejects every token as revoked. Register the resource server as a runtime-client of its Resource:
+
+```bash
+authserver admin resource runtime-client add --client-id <rs-client-id> --slug <resource-slug>
+```
+
+When introspection answers `active: false` for a token that already passed local JWT verification, the SDK logs one warning per resource pointing at this requirement. The warning is written to `slog.Default()`; install a handler with `slog.SetDefault` to route it into your own logging setup, or to silence it.
 
 Use the facade's `Introspect` method as a revocation checker:
 
@@ -418,6 +427,22 @@ resp, err := client.TokenExchange(ctx, authplane.TokenExchangeInput{
 | `Resources` | no | Target audience URIs (RFC 8707), multiple values supported |
 | `Audiences` | no | Target audience strings, multiple values supported |
 
+**Operator step for cross-client exchanges.** For each MCP server that exchanges for a downstream resource it does not act as, allowlist the exchanging client on the target Resource:
+
+```http
+PATCH /admin/resources/{id}
+{"policy": {"exchange": {"allowed_client_ids": ["<exchanging-client-id>"]}}}
+```
+
+A client exchanging a token issued to itself, fronted exchanges and Broker resources need nothing.
+
+Two exchange errors look like consent problems but are not:
+
+- `access_denied` (HTTP 403, `ErrAccessDenied`) on a cross-client exchange means the operator has not allowlisted the exchanging client on the target Resource (`policy.exchange.allowed_client_ids` / `policy.runtime.client_ids`). Re-prompting the user will not fix it — unlike `consent_required`, which the user resolves.
+- `invalid_target` (HTTP 400, `ErrInvalidTarget`, RFC 8707 §2.2) means the `resource` string does not match a granted resource exactly — byte for byte, a trailing slash counts.
+
+Neither counts toward the circuit breaker: the AS answered, it just said no.
+
 ## 7. Handling Consent-Required Errors
 
 When a token exchange fails because the user has not yet consented to a third-party service, the AS returns `consent_required` or `interaction_required`. The SDK wraps these into a `*ConsentRequiredError` with the consent URL and description from the AS response.
@@ -449,6 +474,8 @@ if errors.Is(err, authplane.ErrConsentRequired) {
 The `ConsentURL` field may be empty if the AS does not yet include it in its error response. The `Description` field comes from the AS `error_description`.
 
 MCP adapters can use this error to return a `URLElicitationRequiredError` (MCP spec SEP-1036, JSON-RPC code `-32042`) to prompt the user to complete an out-of-band consent flow.
+
+Do not map `ErrAccessDenied` or `ErrInvalidTarget` to a consent prompt — see the notes under [TokenExchange](#tokenexchange). `access_denied` is an operator allowlist gap on the target Resource; `invalid_target` is a `resource` string that does not match a granted resource exactly.
 
 ## 8. DPoP for Outbound Calls
 
@@ -621,11 +648,24 @@ status := resource.HTTPStatus(err)
 // 500 for ErrSSRFBlocked, ErrProtocolError, and unknown errors
 ```
 
-For generating `WWW-Authenticate` headers:
+For generating `WWW-Authenticate` headers (note this returns the status too — do not call `HTTPStatus` as well):
 
 ```go
+// Without the RFC 9728 pointer:
 status, headers, body := resource.AuthErrorResponse(err)
+
+// With `resource_metadata="…"` appended to the challenge, which is what the
+// adapters emit — pass res.ResourceMetadataURL():
+status, headers, body = resource.AuthErrorResponseWithMetadata(err, res.ResourceMetadataURL())
 ```
+
+The parameter goes last in the challenge, after `realm`, `error` and `scope`, separated by a space when it is the only auth-param (the no-token case, `Bearer resource_metadata="…"`) and by `, ` otherwise. An empty URL emits the challenge unchanged.
+
+The JSON body's `error_description` is a fixed sentence chosen by the error code — `err`'s own message never reaches it. That body goes to a caller who has not authenticated, and the verifier's messages name the failing detail (the unknown `kid`, the audience the resource expects, the rejected `typ`). Log `err` for the diagnostic; it is unchanged.
+
+A request that presented no credentials at all is the one case with no `error` on either side: RFC 6750 §3 has the challenge omit it — the codes describe a request that did authenticate and failed — and the body omits the member for the same reason, carrying only `{"error_description":"The request did not carry an access token"}`. Read that absence the way the challenge reads: begin discovery and authenticate.
+
+`resource.AuthErrorResponseVerbose(err, realm...)` puts the message back in `error_description`. It is a development aid — it discloses that detail to unauthenticated callers, so do not use it in production.
 
 ### OAuth errors (`authplane`)
 
@@ -634,6 +674,10 @@ resp, err := client.ClientCredentials(ctx, scope, resource)
 if err != nil {
     if errors.Is(err, authplane.ErrInvalidGrant) {
         // subject token invalid
+    } else if errors.Is(err, authplane.ErrAccessDenied) {
+        // cross-client exchange: this client is not allowlisted on the target Resource
+    } else if errors.Is(err, authplane.ErrInvalidTarget) {
+        // "resource" does not match a granted resource byte for byte (RFC 8707 §2.2)
     } else if errors.Is(err, authplane.ErrCircuitOpen) {
         // AS unavailable, circuit breaker tripped
     }
@@ -667,6 +711,22 @@ Example output:
 
 Serve it at `/.well-known/oauth-protected-resource` in your framework of choice. The SDK does not include HTTP middleware -- integration with `net/http`, gRPC, or other frameworks is left to adapter packages or application code.
 
+### Where the document lives
+
+`res.PRMURL()` is the URL the SDK derives for the document and `res.WellKnownPRMPath()` the path to serve it on. `res.ResourceMetadataURL()` is what adapters advertise in the `WWW-Authenticate` `resource_metadata` parameter — the same derived URL, unless you point it elsewhere:
+
+```go
+res, err := client.Resource("https://api.example.com/mcp",
+    resource.WithScopes("read", "write"),
+    // The document authserver >= 0.2.0 publishes for every registered Resource.
+    resource.WithResourceMetadataURL("https://auth.example.com/.well-known/oauth-protected-resource/mcp"),
+)
+```
+
+Use it when the resource server cannot host well-known paths. Only the advertisement moves: `PRMURL()` and `WellKnownPRMPath()` keep returning the derived values, so the local endpoint stays serveable. The URL is validated at construction — absolute, `https` or `http`, no fragment, no userinfo — and a bad value fails `client.Resource(...)` rather than the first 401.
+
+Either way RFC 9728 §3.3 applies: the `resource` member of whatever document you point at must equal the URL clients call, byte for byte, or a conformant client discards it.
+
 ## 13. Advanced Notes
 
 ### Circuit breaker behavior
@@ -684,6 +744,8 @@ The circuit breaker protects AS-bound operations from cascading failure. It clas
 - `invalid_grant` — per-token condition (expired, revoked)
 - `invalid_scope` — per-request (wrong scopes requested)
 - `use_dpop_nonce` — per-request (nonce retry)
+- `access_denied` — cross-client exchange not allowlisted on the target Resource (operator fix)
+- `invalid_target` — `resource` does not match a granted resource (RFC 8707 §2.2)
 - SSRF validation failures — local configuration, not AS issue
 
 After cooldown expiry, the next call is allowed as a half-open probe. Successful probes reset the circuit to closed.

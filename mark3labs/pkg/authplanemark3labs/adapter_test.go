@@ -86,6 +86,73 @@ func TestAuthMiddlewareInvalidTokenReturns401(t *testing.T) {
 	}
 }
 
+// Scope hint on 401 (RFC 6750 §3; MCP authorization spec: the server SHOULD
+// name the scopes to request on the first challenge). The param is emitted
+// by the embedded authplanehttp.Adapter; these tests pin that it reaches the
+// mark3labs call shape unchanged. The resource in newTestEnv is configured
+// with "tools/add" and "tools/multiply".
+
+// TestAuthMiddlewareNoTokenCarriesScopeHint pins the exact no-token challenge:
+// resource_metadata first, then scope, both quoted and comma-separated.
+func TestAuthMiddlewareNoTokenCarriesScopeHint(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("Www-Authenticate")
+	want := `Bearer resource_metadata="` + e.adapter.Resource().PRMURL() + `", scope="tools/add tools/multiply"`
+	if got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+// TestAuthMiddlewareInvalidTokenCarriesScopeHint covers the 401 that already
+// has error="invalid_token": the scope param must still be present, after
+// resource_metadata.
+func TestAuthMiddlewareInvalidTokenCarriesScopeHint(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer not.a.valid.jwt")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("Www-Authenticate")
+	want := `Bearer error="invalid_token", resource_metadata="` + e.adapter.Resource().PRMURL() + `", scope="tools/add tools/multiply"`
+	if got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+// TestAuthMiddlewareNoConfiguredScopesOmitsScopeHint: a resource with no
+// scopes has nothing to hint, and RFC 6750 §3 forbids an empty scope value,
+// so the challenge is byte-identical to the pre-hint shape.
+func TestAuthMiddlewareNoConfiguredScopesOmitsScopeHint(t *testing.T) {
+	e := newTestEnvWithScopes(t)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("Www-Authenticate")
+	want := `Bearer resource_metadata="` + e.adapter.Resource().PRMURL() + `"`
+	if got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
 // TestAuthMiddlewareNoScopeEnforcement verifies that AuthMiddleware does NOT
 // reject tokens based on scope. A valid token with no scopes must be passed
 // through to the inner handler — scope enforcement is the tool handler's job.
@@ -719,5 +786,45 @@ func TestURLElicitationErrorMarshalData(t *testing.T) {
 	}
 	if payload["elicitationId"] == "" {
 		t.Error("elicitationId is empty in payload")
+	}
+}
+
+// resource_metadata override.
+
+const asHostedPRMURL = "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+
+// TestAuthMiddlewareResourceMetadataOverride pins that
+// Options.ResourceMetadataURL reaches the challenge through the embedded http
+// adapter, which is what emits it for this adapter.
+func TestAuthMiddlewareResourceMetadataOverride(t *testing.T) {
+	e := newTestEnvWithMetadataURL(t, asHostedPRMURL)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	got := rec.Header().Get("Www-Authenticate")
+	want := `Bearer resource_metadata="` + asHostedPRMURL + `", scope="tools/add tools/multiply"`
+	if got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+// TestAuthMiddlewareResourceMetadataDefault: with no override the challenge
+// carries the derived PRM URL, unchanged from before the option existed.
+func TestAuthMiddlewareResourceMetadataDefault(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
+
+	got := rec.Header().Get("Www-Authenticate")
+	want := `Bearer resource_metadata="` + e.adapter.Resource().PRMURL() + `", scope="tools/add tools/multiply"`
+	if got != want {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 	}
 }
