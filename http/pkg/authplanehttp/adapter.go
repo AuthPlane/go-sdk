@@ -3,8 +3,10 @@ package authplanehttp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/authplane/go-sdk/core/resource"
@@ -19,17 +21,23 @@ import (
 // flag) is configured on the wrapped Resource via verifier.WithInboundDPoP;
 // the adapter does not own DPoP policy.
 type Adapter struct {
-	resource       *resource.Resource
-	prmURL         string // full URL advertised in the WWW-Authenticate resource_metadata param (RFC 9728 §5.1)
-	resourceOrigin string // scheme + "://" + authority from the configured resource URI; precomputed for DPoP htu binding
+	resource *resource.Resource
+	// resourceMetadataURL is the full URL advertised in the WWW-Authenticate
+	// resource_metadata param (RFC 9728 §5.1) — the derived PRM URL, or the
+	// override from resource.WithResourceMetadataURL when the document is
+	// hosted elsewhere (typically by the authorization server).
+	resourceMetadataURL string
+	scopeHint           string // space-joined resource scopes advertised in the 401 scope param (RFC 6750 §3); empty when none configured
+	resourceOrigin      string // scheme + "://" + authority from the configured resource URI; precomputed for DPoP htu binding
 }
 
 // New creates an Adapter wrapping the given resource.Resource.
 func New(res *resource.Resource) *Adapter {
 	return &Adapter{
-		resource:       res,
-		prmURL:         res.PRMURL(),
-		resourceOrigin: resourceOrigin(res.URI()),
+		resource:            res,
+		resourceMetadataURL: res.ResourceMetadataURL(),
+		scopeHint:           strings.Join(res.PRMConfig().ScopesSupported, " "),
+		resourceOrigin:      resourceOrigin(res.URI()),
 	}
 }
 
@@ -71,36 +79,68 @@ func (a *Adapter) WellKnownPRMPath() string {
 }
 
 // writeAuthError writes the HTTP error response for an auth failure using
-// resource.AuthErrorResponse, which generates RFC 6750 compliant status,
-// WWW-Authenticate header, and JSON error body.
+// resource.AuthErrorResponseWithMetadata, which generates RFC 6750 compliant
+// status, WWW-Authenticate header, and JSON error body, with
+// `resource_metadata="..."` (RFC 9728 §5.1) appended so clients can
+// auto-discover the authorization server from a 401.
 //
-// When the adapter has a non-empty prmURL, `resource_metadata="..."` is
-// appended to the WWW-Authenticate header per RFC 9728 §5.1, so clients can
-// auto-discover the authorization server from a 401. The separator is space
-// when no auth-param is yet present (e.g. the no-token case where
-// resource.AuthErrorResponse returns just `Bearer`) and `, ` otherwise — RFC
-// 9110 §11.1 requires `auth-scheme 1*SP auth-param`, with commas only
-// *between* params.
+// The parameter used to be appended here, which meant core could emit a
+// challenge this adapter would then have to repair; the emitter now lives in
+// one place and this adapter only supplies the URL.
+//
+// A 401 additionally carries `scope="..."` listing the resource's configured
+// scopes (RFC 6750 §3) when any are set: the MCP authorization spec says the
+// server SHOULD name the scopes to request on the first challenge, before the
+// client holds any token at all. A 403 is left alone — its scope param
+// already names the route's required scopes via resource.ScopeError, which is
+// the more specific answer.
 func (a *Adapter) writeAuthError(w http.ResponseWriter, err error) {
-	status, headers, body := resource.AuthErrorResponse(err)
-	if a.prmURL != "" {
-		wwwAuth := headers["WWW-Authenticate"]
-		if wwwAuth == "" {
-			wwwAuth = "Bearer"
-		}
-		sep := " "
-		if strings.Contains(wwwAuth, "=") {
-			sep = ", "
-		}
-		wwwAuth += fmt.Sprintf(`%sresource_metadata="%s"`, sep, a.prmURL) //nolint:gocritic // RFC 6750 §3 requires literal double-quotes
-		headers["WWW-Authenticate"] = wwwAuth
+	status, headers, body := resource.AuthErrorResponseWithMetadata(err, a.resourceMetadataURL)
+	if status == http.StatusUnauthorized && a.scopeHint != "" {
+		headers["WWW-Authenticate"] = appendChallengeParam(headers["WWW-Authenticate"], "scope", a.scopeHint)
 	}
+
+	// The response body no longer carries the diagnostic, and this function owns
+	// the last reference to err: every middleware failure site funnels through
+	// here and the adapter exposes no error hook. Without this line a
+	// misconfigured aud, iss or kid rotation is undebuggable on the adapter path
+	// — the operator sees the generic sentence and nothing anywhere else. DEBUG
+	// because it is per-request and only useful while diagnosing; slog.Default()
+	// is the sink, so slog.SetDefault routes or silences it.
+	slog.Default().Debug("authplane: rejecting request", "err", err, "status", status)
 	for k, v := range headers {
 		w.Header().Set(k, v)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write([]byte(body))
 }
+
+// appendChallengeParam appends one quoted auth-param to a WWW-Authenticate
+// challenge. The separator is a space when no auth-param is yet present
+// (e.g. the no-token case where resource.AuthErrorResponse returns just
+// `Bearer`) and `, ` otherwise — RFC 9110 §11.1 requires
+// `auth-scheme 1*SP auth-param`, with commas only *between* params.
+func appendChallengeParam(challenge, name, value string) string {
+	sep := " "
+	if strings.Contains(challenge, "=") {
+		sep = ", "
+	}
+	return challenge + sep + fmt.Sprintf(`%s="%s"`, name, sanitizeParamValue(value)) //nolint:gocritic // RFC 6750 §3 requires literal double-quotes
+}
+
+// sanitizeParamValue makes a value safe to splice into a WWW-Authenticate
+// quoted-string (RFC 9110 §5.6.4): CR, LF, `"` and `\` are each replaced by a
+// space, and the result is trimmed. Substitution rather than deletion is what
+// keeps `a"b` two scope tokens instead of silently fusing it into one — none
+// of these octets is legal in a scope-token (RFC 6749 §3.3) or in the URI
+// derived for resource_metadata, so no valid value is altered.
+func sanitizeParamValue(v string) string {
+	return strings.TrimSpace(paramValueSanitizer.ReplaceAllString(v, " "))
+}
+
+// A run collapses to one space: `\"` is one offense, not two, and should not
+// widen the value by an extra space.
+var paramValueSanitizer = regexp.MustCompile(`[\r\n"\\]+`)
 
 // buildRequestURL reconstructs the absolute URL used as the request side of
 // the RFC 9449 §4.3 `htu` comparison. The scheme and authority come from the
@@ -218,9 +258,12 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 // (including scope= parameter) if any scope is missing. Returns 401 if no claims
 // are in context (i.e., Middleware was not applied upstream).
 //
-// On failure the error_description names every missing scope (not just the first),
-// matching the shape produced by a direct claims.RequireScopes call so middleware-
-// enforced and code-enforced paths surface the same diagnostic to clients.
+// On failure the `scope="..."` challenge parameter names every missing scope
+// (not just the first), so a client can step up in one round trip. The fuller
+// diagnostic produced by a direct claims.RequireScopes call does not reach the
+// caller — the JSON body carries a fixed error_description, not the message.
+// The adapter logs it to slog.Default() at DEBUG instead, since it owns the
+// error here and hands it back to nobody.
 func (a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

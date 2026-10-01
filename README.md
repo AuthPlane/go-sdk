@@ -52,7 +52,11 @@ func main() {
 }
 ```
 
-That's a complete, secure, standards-compliant MCP resource server. For a plain HTTP resource server, see the [`http` adapter](http/README.md); for `mark3labs/mcp-go` servers, see the [`mark3labs` adapter](mark3labs/README.md).
+That's a complete, standards-compliant MCP resource server: every request needs a valid token for this resource, and an unauthenticated one gets a 401 pointing at the metadata document.
+
+One thing it does *not* do is gate individual tools. `Options.Scopes` is only advertised in the metadata document; the middleware accepts any valid token for the resource, so a token without `tools/query` still reaches every handler. Gate them with `ClaimsFromContext(ctx).RequireScope(...)` — see [Scope-gated tools](mcp/docs/user-guide.md#43-enforce-scope-inside-tool-handlers).
+
+For a plain HTTP resource server, see the [`http` adapter](http/README.md); for `mark3labs/mcp-go` servers, see the [`mark3labs` adapter](mark3labs/README.md).
 
 ## Packages
 
@@ -68,6 +72,11 @@ Each package has its own quickstart and user guide; start at the package README 
 ## Requirements
 
 - Go 1.24+ (`core`, `http`) / Go 1.25+ (`mcp`, forced by `github.com/modelcontextprotocol/go-sdk`; `mark3labs`, forced by `github.com/mark3labs/mcp-go`)
+
+## Compatibility
+
+- Tested against [authserver](https://github.com/AuthPlane/authserver) 0.2.0.
+- Introspection-based revocation requires authserver ≥ 0.1.2, and the introspecting client must be confidential and either the issuing client or a runtime-client of the Resource — a public client, or the wrong client, gets `active: false` for every token.
 
 ## Capabilities
 

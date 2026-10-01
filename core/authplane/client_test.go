@@ -1,9 +1,11 @@
 package authplane_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/authplane/go-sdk/core/authplane"
+	"github.com/authplane/go-sdk/core/resource/verifier"
 	"github.com/authplane/go-sdk/core/testutil"
 	"github.com/go-jose/go-jose/v4"
 )
@@ -481,6 +484,166 @@ func TestClient_Resource(t *testing.T) {
 	}
 }
 
+// TestClient_Resource_IntrospectionInactive_WarnsOnce pins the auto-wired
+// introspection checker's behavior when the AS answers active:false for a
+// token that already passed local JWT verification: the token is rejected as
+// revoked, and a single WARN names the ownership cause (authserver >= 0.1.2
+// answers active:false to any client that is not the issuing client or a
+// runtime-client of the resource in aud) so the operator can tell a
+// misconfigured resource server from a genuinely revoked token.
+func TestClient_Resource_IntrospectionInactive_WarnsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, "kid")
+	if err != nil {
+		t.Fatalf("build JWKS: %v", err)
+	}
+
+	var serverURL string
+	var introspectCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                 serverURL,
+			"token_endpoint":         serverURL + "/token",
+			"jwks_uri":               serverURL + "/jwks",
+			"introspection_endpoint": serverURL + "/introspect",
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksData)
+	})
+	mux.HandleFunc("/introspect", func(w http.ResponseWriter, r *http.Request) {
+		introspectCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"active":false}`))
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	serverURL = server.URL
+
+	client, err := authplane.NewClient(context.Background(), serverURL,
+		authplane.WithClientCredentials("rs-client", "rs-secret"),
+		authplane.WithFetchSettings(authplane.DevModeFetchSettings()),
+	)
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	defer client.Close()
+
+	const resourceURI = "https://api.example.com/mcp"
+	res, err := client.Resource(resourceURI)
+	if err != nil {
+		t.Fatalf("create resource: %v", err)
+	}
+
+	for i := range 2 {
+		token, err := testutil.SignTokenWithClaims(key, jose.ES256, "kid", serverURL, resourceURI, "user", "issuing-client", nil)
+		if err != nil {
+			t.Fatalf("sign token: %v", err)
+		}
+		if _, err := res.VerifyToken(context.Background(), token); !errors.Is(err, verifier.ErrTokenRevoked) {
+			t.Fatalf("call %d: expected ErrTokenRevoked, got %v", i, err)
+		}
+	}
+	if got := introspectCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 introspection calls, got %d", got)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "runtime-client add") {
+		t.Fatalf("expected one ownership WARN pointing at the runtime-client requirement, got %q", logged)
+	}
+	if n := strings.Count(logged, "active=false"); n != 1 {
+		t.Errorf("expected the warning exactly once per resource, got %d in %q", n, logged)
+	}
+	if !strings.Contains(logged, "client_id=rs-client") {
+		t.Errorf("expected the introspecting client_id in the log, got %q", logged)
+	}
+}
+
+// TestClient_Resource_IntrospectionInactive_WarnsPerResource pins the scope of
+// the once-only gate: runtime-client registration is per resource, so a Client
+// backing two Resources must warn about each. Gating on the Client would leave
+// the second resource rejecting every token with nothing in the log.
+func TestClient_Resource_IntrospectionInactive_WarnsPerResource(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	jwksData, err := testutil.BuildJWKSWithKID(&key.PublicKey, "kid")
+	if err != nil {
+		t.Fatalf("build JWKS: %v", err)
+	}
+
+	var serverURL string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                 serverURL,
+			"token_endpoint":         serverURL + "/token",
+			"jwks_uri":               serverURL + "/jwks",
+			"introspection_endpoint": serverURL + "/introspect",
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksData)
+	})
+	mux.HandleFunc("/introspect", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"active":false}`))
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	serverURL = server.URL
+
+	client, err := authplane.NewClient(context.Background(), serverURL,
+		authplane.WithClientCredentials("rs-client", "rs-secret"),
+		authplane.WithFetchSettings(authplane.DevModeFetchSettings()),
+	)
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	defer client.Close()
+
+	for _, resourceURI := range []string{"https://api.example.com/mcp", "https://api.example.com/admin"} {
+		res, err := client.Resource(resourceURI)
+		if err != nil {
+			t.Fatalf("create resource %s: %v", resourceURI, err)
+		}
+		token, err := testutil.SignTokenWithClaims(key, jose.ES256, "kid", serverURL, resourceURI, "user", "issuing-client", nil)
+		if err != nil {
+			t.Fatalf("sign token for %s: %v", resourceURI, err)
+		}
+		if _, err := res.VerifyToken(context.Background(), token); !errors.Is(err, verifier.ErrTokenRevoked) {
+			t.Fatalf("%s: expected ErrTokenRevoked, got %v", resourceURI, err)
+		}
+	}
+
+	logged := buf.String()
+	if n := strings.Count(logged, "active=false"); n != 2 {
+		t.Errorf("expected one warning per resource (2), got %d in %q", n, logged)
+	}
+}
+
 func TestClient_CircuitBreaker(t *testing.T) {
 	key, err := testutil.GenerateES256Key()
 	if err != nil {
@@ -532,6 +695,72 @@ func TestClient_CircuitBreaker(t *testing.T) {
 	_, err = client.ClientCredentials(context.Background(), nil, nil)
 	if !errors.Is(err, authplane.ErrCircuitOpen) {
 		t.Fatalf("expected ErrCircuitOpen, got %v", err)
+	}
+}
+
+// TestClient_CircuitBreaker_AccessDeniedDoesNotTrip pins that a 403
+// access_denied (cross-client exchange not allowlisted on the target
+// resource) and a 400 invalid_target are policy answers, not outages: the
+// breaker stays closed however many of them the AS returns.
+func TestClient_CircuitBreaker_AccessDeniedDoesNotTrip(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   string
+		want   error
+	}{
+		{"access_denied", http.StatusForbidden, "access_denied", authplane.ErrAccessDenied},
+		{"invalid_target", http.StatusBadRequest, "invalid_target", authplane.ErrInvalidTarget},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var serverURL string
+			mux := http.NewServeMux()
+			mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"issuer":         serverURL,
+					"token_endpoint": serverURL + "/token",
+					"jwks_uri":       serverURL + "/jwks",
+				})
+			})
+			mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"keys":[]}`))
+			})
+			mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(`{"error":"` + tt.code + `"}`))
+			})
+
+			server := httptest.NewServer(mux)
+			defer server.Close()
+			serverURL = server.URL
+
+			client, err := authplane.NewClient(context.Background(), serverURL,
+				authplane.WithClientCredentials("id", "secret"),
+				authplane.WithFetchSettings(authplane.DevModeFetchSettings()),
+				authplane.WithCircuitBreaker(2, 10*time.Second),
+			)
+			if err != nil {
+				t.Fatalf("create client: %v", err)
+			}
+			defer client.Close()
+
+			for i := range 5 {
+				_, err := client.TokenExchange(context.Background(), authplane.TokenExchangeInput{
+					SubjectToken: "subject-token",
+					Resources:    []string{"https://downstream.example.com/"},
+				})
+				if errors.Is(err, authplane.ErrCircuitOpen) {
+					t.Fatalf("call %d: circuit opened on %s", i, tt.code)
+				}
+				if !errors.Is(err, tt.want) {
+					t.Fatalf("call %d: expected %v, got %v", i, tt.want, err)
+				}
+			}
+		})
 	}
 }
 

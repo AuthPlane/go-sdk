@@ -35,6 +35,27 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWithOptions(t)
+}
+
+// newTestEnvWithScopes is newTestEnv with the resource's supported scopes
+// chosen by the caller; pass none for a resource that advertises no scopes.
+func newTestEnvWithScopes(t *testing.T, scopes ...string) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, scopes)
+}
+
+// newTestEnvWithOptions is newTestEnv with extra resource options — used by the
+// resource_metadata override tests, which need a Resource built with
+// resource.WithResourceMetadataURL.
+func newTestEnvWithOptions(t *testing.T, extra ...resource.Option) *testEnv {
+	t.Helper()
+	return newTestEnvWith(t, []string{"tools/add", "tools/multiply"}, extra...)
+}
+
+// newTestEnvWith is the base the three constructors above delegate to.
+func newTestEnvWith(t *testing.T, scopes []string, extra ...resource.Option) *testEnv {
+	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatalf("generate RSA key: %v", err)
@@ -63,12 +84,13 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { client.Close() })
-	res, err := client.Resource(testResource,
-		resource.WithScopes("tools/add", "tools/multiply"),
+	opts := append([]resource.Option{
+		resource.WithScopes(scopes...),
 		resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{
 			ReplayStore: verifier.NewInMemoryDPoPReplayStore(),
 		})),
-	)
+	}, extra...)
+	res, err := client.Resource(testResource, opts...)
 	if err != nil {
 		t.Fatalf("client.Resource: %v", err)
 	}

@@ -21,6 +21,8 @@ func TestMapOAuthError_KnownCodes(t *testing.T) {
 		{"server_error", ErrServerError},
 		{"consent_required", ErrConsentRequired},
 		{"interaction_required", ErrInteractionRequired},
+		{"access_denied", ErrAccessDenied},
+		{"invalid_target", ErrInvalidTarget},
 	}
 	for _, tt := range tests {
 		t.Run(tt.code, func(t *testing.T) {
@@ -131,6 +133,7 @@ func TestSentinelErrors_AreDistinct(t *testing.T) {
 		ErrUnauthorizedClient, ErrUnsupportedGrantType,
 		ErrInvalidRequest, ErrServerError, ErrCircuitOpen,
 		ErrConsentRequired, ErrInteractionRequired,
+		ErrAccessDenied, ErrInvalidTarget,
 	}
 	for i, a := range sentinels {
 		for j, b := range sentinels {

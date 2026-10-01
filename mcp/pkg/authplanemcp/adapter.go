@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/authplane/go-sdk/core/authplane"
@@ -42,6 +43,14 @@ type Options struct {
 	Resource string
 	Scopes   []string
 
+	// ResourceMetadataURL overrides the URL advertised in the RFC 9728 §5.1
+	// resource_metadata parameter of the WWW-Authenticate challenge. Leave it
+	// empty to advertise the document this adapter serves itself; set it to the
+	// authorization server's copy ("<issuer>/.well-known/oauth-protected-resource/{ref}")
+	// when the resource server cannot host well-known paths. Rejected at
+	// construction if it is not an absolute http(s) URL.
+	ResourceMetadataURL string
+
 	// DevMode relaxes SSRF protection to allow HTTP and localhost — required when
 	// the issuer runs on a local development server. Remove before deploying to production.
 	// The SDK also checks the AUTHPLANE_DEV_MODE=1 env var as a fallback.
@@ -67,10 +76,15 @@ type Options struct {
 // Always call Close() when the adapter is no longer needed to stop background
 // refresh goroutines and release HTTP connections.
 type Adapter struct {
-	client     *authplane.Client
-	resource   *resource.Resource
-	prmURL     string // full URL for WWW-Authenticate ResourceMetadataURL
-	ownsClient bool   // true when this Adapter constructed the client and must close it
+	client   *authplane.Client
+	resource *resource.Resource
+	// resourceMetadataURL is the full URL handed to the MCP go-sdk's
+	// RequireBearerTokenOptions.ResourceMetadataURL — the derived PRM URL, or
+	// the override from resource.WithResourceMetadataURL when the document is
+	// hosted elsewhere (typically by the authorization server).
+	resourceMetadataURL string
+	scopeHint           string // space-joined resource scopes advertised in the 401 scope param (RFC 6750 §3); empty when none configured
+	ownsClient          bool   // true when this Adapter constructed the client and must close it
 }
 
 // NewAdapter creates and initializes an Adapter. It calls authplane.NewClient,
@@ -97,6 +111,9 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 	}
 
 	resourceOpts := []resource.Option{resource.WithScopes(options.Scopes...)}
+	if options.ResourceMetadataURL != "" {
+		resourceOpts = append(resourceOpts, resource.WithResourceMetadataURL(options.ResourceMetadataURL))
+	}
 	if len(options.VerifierOptions) > 0 {
 		// Only pass WithVerifierOptions when non-empty: WithVerifierOptions replaces
 		// (not appends) the verifier option list, so passing an empty slice would
@@ -111,10 +128,11 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 	}
 
 	return &Adapter{
-		client:     client,
-		resource:   res,
-		prmURL:     res.PRMURL(),
-		ownsClient: true,
+		client:              client,
+		resource:            res,
+		resourceMetadataURL: res.ResourceMetadataURL(),
+		scopeHint:           strings.Join(res.PRMConfig().ScopesSupported, " "),
+		ownsClient:          true,
 	}, nil
 }
 
@@ -139,10 +157,11 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 		return nil, errors.New("authplane-mcp: res must not be nil")
 	}
 	return &Adapter{
-		client:     client,
-		resource:   res,
-		prmURL:     res.PRMURL(),
-		ownsClient: false,
+		client:              client,
+		resource:            res,
+		resourceMetadataURL: res.ResourceMetadataURL(),
+		scopeHint:           strings.Join(res.PRMConfig().ScopesSupported, " "),
+		ownsClient:          false,
 	}, nil
 }
 
@@ -156,6 +175,12 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 // header (e.g. Bearer resource_metadata=http://...) which violates RFC 6750 §3
 // and causes MCP clients to fail discovery. httputil.WWWAuthenticateQuoter
 // intercepts the header and adds the required quotes before it reaches the client.
+//
+// The MCP go-sdk also writes no `scope` param, and RequireBearerTokenOptions
+// has no field for one — its Scopes field only enforces (403), it never
+// advertises. httputil.WWWAuthenticateScopeHint appends `scope="..."` with the
+// resource's configured scopes to every 401 (RFC 6750 §3; the MCP
+// authorization spec says the server SHOULD name them on the first challenge).
 //
 // On success the verified claims are also injected into the request context and are
 // accessible via ClaimsFromContext — allowing individual tool handlers to perform
@@ -179,15 +204,19 @@ func (a *Adapter) AuthMiddleware(handler http.Handler) http.Handler {
 	// scope via ClaimsFromContext + RequireScope. The initialize handshake and
 	// other protocol messages must succeed with any valid token.
 	mux := auth.RequireBearerToken(a.verifyToken, &auth.RequireBearerTokenOptions{
-		ResourceMetadataURL: a.prmURL,
+		ResourceMetadataURL: a.resourceMetadataURL,
 	})(inner)
 
 	// Wrap with httputil.WWWAuthenticateQuoter to ensure the WWW-Authenticate header
-	// emitted by the MCP go-sdk is RFC 6750 §3.1 compliant.
+	// emitted by the MCP go-sdk is RFC 6750 §3.1 compliant, then with
+	// WWWAuthenticateScopeHint to add the scope param. The quoter runs first
+	// (outermost), so it only ever sees the bare upstream value; the hint it
+	// hands down is already a quoted-string.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Inject an empty claimsBox into context for verifyToken to populate.
 		ctx := context.WithValue(r.Context(), claimsBoxKey{}, &claimsBox{})
-		mux.ServeHTTP(&httputil.WWWAuthenticateQuoter{ResponseWriter: w}, r.WithContext(ctx))
+		hinted := &httputil.WWWAuthenticateScopeHint{ResponseWriter: w, Scope: a.scopeHint}
+		mux.ServeHTTP(&httputil.WWWAuthenticateQuoter{ResponseWriter: hinted}, r.WithContext(ctx))
 	})
 }
 

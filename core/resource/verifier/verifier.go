@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"slices"
 	"strings"
@@ -198,7 +199,10 @@ func (v *TokenVerifier) VerifyToken(ctx context.Context, rawToken string, dpop *
 			if v.failClosed {
 				return nil, fmt.Errorf("%w: revocation check failed: %v", ErrTokenRevoked, err)
 			}
-			// fail-open: accept the token
+			// fail-open: accept the token. Say so — a silently failing
+			// checker is indistinguishable from a passing one otherwise.
+			slog.WarnContext(ctx, "verifier: revocation check failed; accepting token (fail-open)",
+				"jti", claims.JTI(), "error", err)
 		} else if revoked {
 			return nil, ErrTokenRevoked
 		}

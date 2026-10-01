@@ -644,6 +644,51 @@ func TestTokenExchange_ConsentRequiredWithoutConsentURL(t *testing.T) {
 	}
 }
 
+// TestTokenExchange_AccessDenied pins the typed mapping of the HTTP 403
+// access_denied answer an AS gives a cross-client exchange whose client is
+// not allowlisted on the target resource.
+func TestTokenExchange_AccessDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":             "access_denied",
+			"error_description": "client is not allowed to exchange for this resource",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := TokenExchange(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), TokenExchangeInput{
+		SubjectToken: "subject-token",
+		Resources:    []string{"https://downstream.example.com/"},
+	}, nil)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("expected ErrAccessDenied, got %T: %v", err, err)
+	}
+	var consentErr *ConsentRequiredError
+	if errors.As(err, &consentErr) {
+		t.Error("access_denied must not be surfaced as *ConsentRequiredError")
+	}
+}
+
+// TestTokenExchange_InvalidTarget pins the typed mapping of invalid_target
+// (RFC 8707 §2.2): the requested resource does not match a granted one.
+func TestTokenExchange_InvalidTarget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":             "invalid_target",
+			"error_description": "resource does not match a granted resource",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := TokenExchange(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), TokenExchangeInput{
+		SubjectToken: "subject-token",
+		Resources:    []string{"https://downstream.example.com"},
+	}, nil)
+	if !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("expected ErrInvalidTarget, got %T: %v", err, err)
+	}
+}
+
 func TestTokenExchange_MissingIssuedTokenType(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{

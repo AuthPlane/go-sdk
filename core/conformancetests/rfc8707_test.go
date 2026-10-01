@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/authplane/go-sdk/core/resource"
 	"github.com/authplane/go-sdk/core/testutil"
 	"github.com/go-jose/go-jose/v4"
 )
@@ -67,6 +69,26 @@ func TestRFC8707ClientCredentialsMultipleResourceParametersMustBeEmitted(t *test
 	}
 	if !slices.Contains(receivedResources, "https://api-two.example.com") {
 		t.Errorf("missing resource https://api-two.example.com in %v", receivedResources)
+	}
+}
+
+func TestRFC8707ResourceIndicatorMustNotContainAFragment(t *testing.T) {
+	Case(t, "rfc8707-resource-indicator-must-not-contain-a-fragment")
+
+	// RFC 8707 §2 states of the resource parameter that "The URI MUST NOT
+	// include a fragment component", and RFC 9728 §1.2 defines the resource
+	// identifier as a URL with no fragment. The rejection has to be observable
+	// from the constructor call itself: accepting the value and stripping the
+	// fragment later, while deriving the well-known URL, would publish a
+	// metadata document whose resource field differs from the identifier the
+	// client derived that URL from, which §3.3 requires the client to discard.
+	const uri = "https://api.example.com/mcp#section"
+	r, err := resource.New(uri, "https://auth.example.com", newPRMTestJWKSCache(t))
+	if err == nil {
+		t.Fatalf("resource.New(%q) = %q, want rejection", uri, r.URI())
+	}
+	if !strings.Contains(err.Error(), "fragment") {
+		t.Errorf("resource.New(%q) error = %v, want it to name the fragment", uri, err)
 	}
 }
 

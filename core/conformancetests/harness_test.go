@@ -78,12 +78,27 @@ var registry = &conformanceRegistry{
 
 // caseRegistration holds metadata supplied via CaseOption functions.
 type caseRegistration struct {
-	gaps []string
-	note string
+	level string
+	gaps  []string
+	note  string
 }
 
 // CaseOption configures optional metadata on a conformance case.
 type CaseOption func(*caseRegistration)
+
+// Full marks a case as fully covered and records what the test demonstrated.
+//
+// A green row says only that a test passed; it cannot say how much of the case
+// that test drove, so a reader has no way to tell full coverage from a check
+// that happened to be green. The note carries what the row cannot: the
+// mechanism the case was satisfied through and the bound it was demonstrated
+// within.
+func Full(note string) CaseOption {
+	return func(r *caseRegistration) {
+		r.level = "full"
+		r.note = note
+	}
+}
 
 // Partial marks a case as having partial coverage with a single gap.
 func Partial(gap, note string) CaseOption {
@@ -115,9 +130,12 @@ func Case(t *testing.T, caseID string, opts ...CaseOption) {
 	}
 
 	coverage := map[string]any{}
-	if len(reg.gaps) > 0 {
+	switch {
+	case len(reg.gaps) > 0:
 		coverage["level"] = "partial"
 		coverage["gaps"] = reg.gaps
+	case reg.level != "":
+		coverage["level"] = reg.level
 	}
 	if reg.note != "" {
 		coverage["note"] = reg.note
@@ -168,13 +186,17 @@ func projectRoot() string {
 	return filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
 }
 
-var (
-	reCatalogVersion = regexp.MustCompile(`(?m)^catalog_version:\s*"([^"]+)"\s*$`)
-	reCaseID         = regexp.MustCompile(`(?m)^\s+- id: "([^"]+)"\s*$`)
-)
+var reCatalogVersion = regexp.MustCompile(`(?m)^catalog_version:\s*"([^"]+)"\s*$`)
 
-// loadCatalogMetadata reads the conformance catalog YAML and extracts the
-// catalog version and the list of case IDs using regex.
+// loadCatalogMetadata reads the conformance catalog YAML and returns the
+// catalog version and the list of case IDs.
+//
+// The case IDs come from parseCatalogCases, not from a regex over the file. A
+// regex reports what it matched and says nothing about what it did not, so a
+// case in a shape it did not anticipate was dropped silently — and a dropped
+// case is one the alignment guard never asks about, leaving the guard green
+// while it under-checks the catalog it claims to enforce. The parser fails the
+// run on any shape it cannot read instead.
 func loadCatalogMetadata() (version string, caseIDs []string, err error) {
 	root := projectRoot()
 	catalogPath := os.Getenv("CONFORMANCE_CATALOG_PATH")
@@ -197,16 +219,34 @@ func loadCatalogMetadata() (version string, caseIDs []string, err error) {
 	}
 	version = vMatch[1]
 
-	// Split at "cases:" and extract IDs from the cases section only.
-	parts := strings.SplitN(text, "cases:", 2)
-	if len(parts) < 2 {
+	if !strings.Contains(text, "cases:") {
 		return "", nil, fmt.Errorf("cases section not found in %s", catalogPath)
 	}
-	casesSection := parts[1]
-	matches := reCaseID.FindAllStringSubmatch(casesSection, -1)
-	caseIDs = make([]string, 0, len(matches))
-	for _, m := range matches {
-		caseIDs = append(caseIDs, m[1])
+
+	cases, err := parseCatalogCases(text)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse catalog %s: %w", catalogPath, err)
+	}
+
+	// A catalog that parses to nothing is a parser or path failure wearing a
+	// success. Without this check the alignment guard's first loop has nothing
+	// to iterate and the suite passes having compared itself against an empty
+	// contract.
+	if len(cases) == 0 {
+		return "", nil, fmt.Errorf("no cases parsed from %s; the catalog-alignment guard would have nothing to check", catalogPath)
+	}
+
+	caseIDs = make([]string, 0, len(cases))
+	seen := make(map[string]int, len(cases))
+	for _, c := range cases {
+		// Ids key the registry and the report, so a duplicate would silently
+		// collapse two catalog cases into one row and let the second go
+		// unchecked.
+		if prev, dup := seen[c.ID]; dup {
+			return "", nil, fmt.Errorf("duplicate case id %q in %s (cases %d and %d); ids key the alignment guard, so the later case would be invisible to it", c.ID, catalogPath, prev+1, len(caseIDs)+1)
+		}
+		seen[c.ID] = len(caseIDs)
+		caseIDs = append(caseIDs, c.ID)
 	}
 
 	return version, caseIDs, nil
@@ -457,14 +497,33 @@ func TestMain(m *testing.M) {
 		for _, e := range alignmentErrs {
 			fmt.Fprintf(os.Stderr, "CATALOG ALIGNMENT: %s\n", e)
 		}
-		if exitCode == 0 {
-			exitCode = 1
-		}
+		exitCode = failRun(exitCode)
 	}
 
+	// A failure here used to print and leave the exit code alone, so a run
+	// whose catalog would not parse — or whose report never got written —
+	// still reported success, and the report on disk stayed at whatever the
+	// last good run left there. Both are the silent-under-check failure the
+	// alignment guard exists to prevent, so they fail the run.
 	if err := generateReports(exitCode); err != nil {
 		fmt.Fprintf(os.Stderr, "conformance report generation failed: %v\n", err)
+		exitCode = failRun(exitCode)
 	}
 
 	os.Exit(exitCode)
+}
+
+// failRun turns a guard failure discovered after m.Run into a red run.
+//
+// It raises a passing exit code to 1 and leaves a failing one alone: the code
+// m.Run returned already identifies which tests failed, and overwriting it with
+// a flat 1 would discard that. The guards this serves report their own detail
+// to stderr, so the only thing the exit code has to carry for them is "not
+// green". Extracted from TestMain so the raise is assertable — TestMain itself
+// ends in os.Exit and cannot be called from a test.
+func failRun(exitCode int) int {
+	if exitCode == 0 {
+		return 1
+	}
+	return exitCode
 }
