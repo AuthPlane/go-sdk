@@ -4,4 +4,4 @@ go 1.24.0
 
 toolchain go1.25.5
 
-require github.com/go-jose/go-jose/v4 v4.1.4
+require github.com/go-jose/go-jose/v4 v4.1.5
