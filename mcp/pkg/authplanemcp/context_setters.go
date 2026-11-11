@@ -9,11 +9,19 @@ import (
 // ContextWithClaims returns a context carrying the given VerifiedClaims,
 // as if AuthMiddleware had validated a request. Use in tests only.
 func ContextWithClaims(ctx context.Context, claims *verifier.VerifiedClaims) context.Context {
-	return context.WithValue(ctx, claimsKey{}, claims)
+	holder := &claimsHolder{claims: claims}
+	if existing := currentHolder(ctx); existing != nil {
+		holder.token = existing.token
+	}
+	return context.WithValue(ctx, claimsKey{}, holder)
 }
 
 // ContextWithToken returns a context carrying the given raw bearer token,
 // as if AuthMiddleware had injected it. Use in tests only.
 func ContextWithToken(ctx context.Context, token string) context.Context {
-	return context.WithValue(ctx, tokenKey{}, token)
+	holder := &claimsHolder{token: token}
+	if existing := currentHolder(ctx); existing != nil {
+		holder.claims = existing.claims
+	}
+	return context.WithValue(ctx, claimsKey{}, holder)
 }

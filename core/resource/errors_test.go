@@ -1,13 +1,17 @@
 package resource_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/authplane/go-sdk/core/resource"
 	"github.com/authplane/go-sdk/core/resource/verifier"
+	"github.com/authplane/go-sdk/core/resource/verifier/verifiertest"
 )
 
 // TestAuthErrorResponse_MultipleDpopProofs_MapsToInvalidDpopProof pins
@@ -80,7 +84,7 @@ func TestAuthErrorResponseWithMetadata_MatchesPreviousAdapterComposition(t *test
 			oldStatus, oldHeaders, oldBody := resource.AuthErrorResponse(tt.err)
 			want := legacyChallengeWithMetadata(oldHeaders["WWW-Authenticate"], metadataURL)
 
-			status, headers, body := resource.AuthErrorResponseWithMetadata(tt.err, metadataURL)
+			status, headers, body := resource.AuthErrorResponse(tt.err, resource.WithChallengeMetadata(metadataURL))
 			if got := headers["WWW-Authenticate"]; got != want {
 				t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 			}
@@ -164,7 +168,7 @@ func TestAuthErrorResponse_DescriptionNeverCarriesTheErrorMessage(t *testing.T) 
 func TestAuthErrorResponseVerbose_BodyIsValidJSONWithControlBytes(t *testing.T) {
 	err := fmt.Errorf("%w: token type must be \"at+jwt\", got \"a\x7fb\"", verifier.ErrInvalidClaims)
 
-	_, _, body := resource.AuthErrorResponseVerbose(err)
+	_, _, body := resource.AuthErrorResponse(err, resource.WithVerboseDescription())
 
 	var decoded struct {
 		Error       string `json:"error"`
@@ -214,7 +218,7 @@ func TestAuthErrorResponseWithMetadata_RealmAndSeparators(t *testing.T) {
 	tests := []struct {
 		name  string
 		err   error
-		realm []string
+		realm string
 		want  string
 	}{
 		{
@@ -235,7 +239,7 @@ func TestAuthErrorResponseWithMetadata_RealmAndSeparators(t *testing.T) {
 		{
 			name:  "realm present — metadata still last",
 			err:   verifier.ErrTokenMissing,
-			realm: []string{"api"},
+			realm: "api",
 			want:  `Bearer realm="api", resource_metadata="` + metadataURL + `"`,
 		},
 		{
@@ -246,7 +250,7 @@ func TestAuthErrorResponseWithMetadata_RealmAndSeparators(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, headers, _ := resource.AuthErrorResponseWithMetadata(tt.err, metadataURL, tt.realm...)
+			_, headers, _ := resource.AuthErrorResponse(tt.err, resource.WithChallengeMetadata(metadataURL), resource.WithRealm(tt.realm))
 			if got := headers["WWW-Authenticate"]; got != tt.want {
 				t.Errorf("WWW-Authenticate = %q, want %q", got, tt.want)
 			}
@@ -260,7 +264,7 @@ func TestAuthErrorResponseWithMetadata_RealmAndSeparators(t *testing.T) {
 func TestAuthErrorResponseWithMetadata_EmptyURLIsAuthErrorResponse(t *testing.T) {
 	for _, err := range []error{verifier.ErrTokenMissing, verifier.ErrInvalidSignature, verifier.ErrDPoPRequired} {
 		wantStatus, wantHeaders, wantBody := resource.AuthErrorResponse(err)
-		status, headers, body := resource.AuthErrorResponseWithMetadata(err, "")
+		status, headers, body := resource.AuthErrorResponse(err, resource.WithChallengeMetadata(""))
 		if headers["WWW-Authenticate"] != wantHeaders["WWW-Authenticate"] || status != wantStatus || body != wantBody {
 			t.Errorf("AuthErrorResponseWithMetadata(%v, \"\") = (%d, %q, %q), want (%d, %q, %q)",
 				err, status, headers["WWW-Authenticate"], body, wantStatus, wantHeaders["WWW-Authenticate"], wantBody)
@@ -279,35 +283,35 @@ func TestAuthErrorResponseWithMetadata_SanitizesCallerSuppliedValues(t *testing.
 	tests := []struct {
 		name  string
 		url   string
-		realm []string
+		realm string
 		want  string
 	}{
 		{
 			name: "quote in the metadata URL cannot close the parameter",
 			url:  `https://as.example.com/prm", resource_metadata="https://evil.example.com/prm`,
-			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/prm, resource_metadata=https://evil.example.com/prm"`,
+			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/prm , resource_metadata= https://evil.example.com/prm"`,
 		},
 		{
 			name: "backslash in the metadata URL cannot open a quoted-pair",
 			url:  `https://as.example.com/a\"b`,
-			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/ab"`,
+			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/a b"`,
 		},
 		{
 			name:  "quote in the realm cannot close the parameter",
 			url:   "https://as.example.com/prm",
-			realm: []string{`api", error="insufficient_scope`},
-			want:  `Bearer realm="api, error=insufficient_scope" error="invalid_token", resource_metadata="https://as.example.com/prm"`,
+			realm: `api", error="insufficient_scope`,
+			want:  `Bearer realm="api , error= insufficient_scope", error="invalid_token", resource_metadata="https://as.example.com/prm"`,
 		},
 		{
 			name: "CR and LF cannot split the header",
 			url:  "https://as.example.com/prm\r\nX-Injected: 1",
-			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/prmX-Injected: 1"`,
+			want: `Bearer error="invalid_token", resource_metadata="https://as.example.com/prm X-Injected: 1"`,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, headers, _ := resource.AuthErrorResponseWithMetadata(verifier.ErrInvalidSignature, tt.url, tt.realm...)
+			_, headers, _ := resource.AuthErrorResponse(verifier.ErrInvalidSignature, resource.WithChallengeMetadata(tt.url), resource.WithRealm(tt.realm))
 			got := headers["WWW-Authenticate"]
 			if got != tt.want {
 				t.Errorf("WWW-Authenticate = %q, want %q", got, tt.want)
@@ -344,8 +348,8 @@ func TestAuthErrorResponse_ScopeNamesReachTheChallengeNotTheBody(t *testing.T) {
 func TestAuthErrorResponseVerbose_RestoresTheErrorMessage(t *testing.T) {
 	err := fmt.Errorf("%w: no key for kid %q", verifier.ErrInvalidSignature, "2026-09-rotation-key")
 
-	safeStatus, safeHeaders, safeBody := resource.AuthErrorResponse(err, "https://api.example.com")
-	status, headers, body := resource.AuthErrorResponseVerbose(err, "https://api.example.com")
+	safeStatus, safeHeaders, safeBody := resource.AuthErrorResponse(err, resource.WithRealm("https://api.example.com"))
+	status, headers, body := resource.AuthErrorResponse(err, resource.WithVerboseDescription(), resource.WithRealm("https://api.example.com"))
 
 	if got := descriptionOf(t, body); got != err.Error() {
 		t.Errorf("error_description = %q, want %q", got, err.Error())
@@ -371,7 +375,7 @@ func TestAuthErrorResponse_NilErrorDoesNotPanic(t *testing.T) {
 	}{
 		{"AuthErrorResponse", func() (int, map[string]string, string) { return resource.AuthErrorResponse(nil) }},
 		{"AuthErrorResponseVerbose", func() (int, map[string]string, string) {
-			return resource.AuthErrorResponseVerbose(nil)
+			return resource.AuthErrorResponse(nil, resource.WithVerboseDescription())
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -384,5 +388,94 @@ func TestAuthErrorResponse_NilErrorDoesNotPanic(t *testing.T) {
 				t.Error("expected a body, got none")
 			}
 		})
+	}
+}
+
+func TestHTTPStatus_ContextErrors_A85(t *testing.T) {
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded} {
+		if got := resource.HTTPStatus(err); got != http.StatusServiceUnavailable {
+			t.Errorf("%v: status = %d", err, got)
+		}
+	}
+}
+
+// A failure on this side must not tell a client to discard a good token.
+func TestAuthErrorResponse_UnavailableIsNotInvalidToken_A89(t *testing.T) {
+	for _, err := range []error{
+		verifier.ErrJWKSUnavailable,
+		verifier.ErrRevocationUnavailable,
+		verifier.ErrDPoPReplayStoreUnavailable,
+		context.Canceled,
+	} {
+		status, headers, body := resource.AuthErrorResponse(err, resource.WithChallengeMetadata("https://api.example.com/prm"))
+		if status != http.StatusServiceUnavailable {
+			t.Errorf("%v: status = %d", err, status)
+		}
+		if strings.Contains(headers["WWW-Authenticate"], "error=") {
+			t.Errorf("%v: challenge = %q", err, headers["WWW-Authenticate"])
+		}
+		if strings.Contains(body, "invalid_token") || !strings.Contains(body, "temporarily_unavailable") {
+			t.Errorf("%v: body = %q", err, body)
+		}
+		if headers["Retry-After"] == "" {
+			t.Errorf("%v: no Retry-After", err)
+		}
+	}
+	_, headers, body := resource.AuthErrorResponse(verifier.ErrTokenExpired)
+	if !strings.Contains(headers["WWW-Authenticate"], `error="invalid_token"`) || !strings.Contains(body, "invalid_token") || headers["Retry-After"] != "" {
+		t.Errorf("a refused token must keep invalid_token: %q %q", headers, body)
+	}
+}
+
+// RFC 9449 section 7.1, and a challenge's parameters are separated by commas.
+func TestAuthErrorResponse_DPoPChallenges_A95(t *testing.T) {
+	policy := resource.WithDPoPPolicy([]string{"ES256", "EdDSA"}, true)
+	_, headers, _ := resource.AuthErrorResponse(verifier.ErrDPoPInvalid, policy, resource.WithRealm("api"))
+	if want := `DPoP realm="api", error="invalid_dpop_proof", algs="ES256 EdDSA"`; headers["WWW-Authenticate"] != want {
+		t.Errorf("challenge = %q, want %q", headers["WWW-Authenticate"], want)
+	}
+	_, headers, _ = resource.AuthErrorResponse(verifier.ErrTokenMissing, policy)
+	if want := `DPoP algs="ES256 EdDSA"`; headers["WWW-Authenticate"] != want {
+		t.Errorf("required, no token: %q", headers["WWW-Authenticate"])
+	}
+	_, headers, _ = resource.AuthErrorResponse(verifier.ErrTokenMissing, resource.WithDPoPPolicy([]string{"ES256"}, false))
+	if headers["WWW-Authenticate"] != "Bearer" {
+		t.Errorf("optional, no token: %q", headers["WWW-Authenticate"])
+	}
+}
+
+func TestNew_RefusesNilJWKSCache_A98(t *testing.T) {
+	if _, err := resource.New("https://api.example.com", "https://as.example.com", nil); err == nil {
+		t.Error("want an error")
+	}
+}
+
+func TestToolScopeGuard_RefuseUnlisted_A104(t *testing.T) {
+	claims, err := verifiertest.NewClaims(map[string]any{"scope": "read"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(cfg resource.ToolScopeGuardConfig, tool string) int {
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + tool + `"}}`
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		resource.ToolScopeGuard(cfg)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, req)
+		return rec.Code
+	}
+	withClaims := func(*http.Request) *verifier.VerifiedClaims { return claims }
+	open := resource.ToolScopeGuardConfig{Claims: withClaims, ToolScopes: map[string][]string{"free": nil}}
+	if got := call(open, "new-tool"); got != http.StatusOK {
+		t.Errorf("default, unlisted: %d", got)
+	}
+	strict := resource.ToolScopeGuardConfig{Claims: withClaims, ToolScopes: map[string][]string{"free": nil}, RefuseUnlisted: true}
+	if got := call(strict, "new-tool"); got != http.StatusForbidden {
+		t.Errorf("strict, unlisted: %d", got)
+	}
+	if got := call(strict, "free"); got != http.StatusOK {
+		t.Errorf("strict, listed with no scopes: %d", got)
+	}
+	noClaims := resource.ToolScopeGuardConfig{ToolScopes: map[string][]string{"guarded": {"read"}}}
+	if got := call(noClaims, "guarded"); got != http.StatusUnauthorized {
+		t.Errorf("no Claims func: %d", got)
 	}
 }

@@ -4,9 +4,10 @@
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | :white_check_mark: |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
-All 0.1.x releases of each module in this monorepo (`github.com/authplane/go-sdk/core`, `.../http`, `.../mcp`) receive security patches. Once 1.0 ships, this policy will be revisited.
+The latest 0.x minor of each module in this monorepo (`github.com/authplane/go-sdk/core`, `.../http`, `.../mcp`, `.../mark3labs`) receives security patches. Once 1.0 ships, this policy will be revisited.
 
 ## Reporting a Vulnerability
 
@@ -20,11 +21,11 @@ Instead, use [GitHub Private Vulnerability Reporting](https://github.com/AuthPla
 
 ### What to Include
 
-- Which module is affected (`core`, `http`, `mcp`) and the version (tag or commit)
+- Which module is affected (`core`, `http`, `mcp`, `mark3labs`) and the version (tag or commit)
 - Description of the vulnerability
 - Steps to reproduce (or proof of concept)
 - Impact assessment (what an attacker could do)
-- Relevant environment details (Go version, OS, adapter (`http` or `mcp`) if applicable, `authserver` version if applicable)
+- Relevant environment details (Go version, OS, adapter (`http`, `mcp` or `mark3labs`) if applicable, `authserver` version if applicable)
 
 ### Response Timeline
 
@@ -38,7 +39,6 @@ Vulnerabilities in the SDK or its adapters that affect correctness of authentica
 
 - JWT verification bypass (signature, issuer, audience, expiry, `nbf`, algorithm confusion)
 - DPoP proof verification flaws (binding, replay, key mismatch, `htm`/`htu` mishandling)
-- PKCE / state / nonce handling flaws in the OAuth client
 - Token replay or confusion between access, refresh, and exchange tokens
 - JWKS handling flaws (fetch, caching, key rotation) where the SDK owns the logic
 - Leakage of tokens, client secrets, or key material via logs, error messages, or caches

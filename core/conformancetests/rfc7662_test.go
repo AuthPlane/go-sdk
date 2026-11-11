@@ -293,7 +293,7 @@ func TestRFC7662IntrospectionFailOpenPolicyMustBeExplicitlyTested(t *testing.T) 
 	if err == nil {
 		t.Fatal("fail-closed should reject token when revocation check fails")
 	}
-	if !errors.Is(err, verifier.ErrTokenRevoked) {
-		t.Errorf("expected ErrTokenRevoked, got %v", err)
+	if !errors.Is(err, verifier.ErrRevocationUnavailable) {
+		t.Errorf("expected ErrRevocationUnavailable, got %v", err)
 	}
 }

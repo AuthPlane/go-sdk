@@ -16,7 +16,7 @@ The SDK is built around these RFCs:
 
 ### Requirements
 
-- Go 1.24+
+- Go 1.26+
 
 ### Installation
 
@@ -98,17 +98,11 @@ client, err := authplane.NewClient(ctx, "https://auth.example.com",
 | `WithCircuitBreaker(threshold, cooldown)` | `5, 30s` | Circuit breaker failure threshold and cooldown |
 | `WithTokenCacheTTLBuffer(d)` | `30s` | Evict cached tokens this long before expiry |
 
-For local development, set the `AUTHPLANE_DEV_MODE` environment variable (no code change needed):
-
-```bash
-export AUTHPLANE_DEV_MODE=1
-```
-
-This is equivalent to passing `WithFetchSettings(DevModeFetchSettings())` and is useful in CI or scripts. An explicit `WithFetchSettings` always wins over the env var.
+For local development, pass `WithFetchSettings(DevModeFetchSettings())`. The SDK reads no security policy from the environment.
 
 ### What happens during creation
 
-1. Metadata is fetched from the RFC 8414 discovery URL derived from the issuer.
+1. Metadata is fetched from the RFC 8414 discovery URL derived from the issuer, then the two OpenID Connect forms if that fails. The issuer must use `https` unless the fetch settings allow HTTP.
    For issuers with a path component, the SDK inserts `/.well-known/oauth-authorization-server` before the issuer path as required by RFC 8414.
 2. The metadata document must contain an `issuer` that exactly matches the configured issuer.
 3. Required discovered endpoints (token, introspection, revocation) are resolved from metadata only. The SDK does not synthesize fallback endpoints.
@@ -212,7 +206,8 @@ claims, err := res.VerifyToken(ctx, token, resource.WithDPoP(&verifier.DPoPConte
 
 | Field | Default | Effect |
 |---|---|---|
-| `ReplayStore` | `nil` | When non-nil, enforces JTI uniqueness within the proof lifetime window. |
+| `ReplayStore` | in-memory store | Enforces JTI uniqueness per key within the proof lifetime window. Holds 100,000 entries, and 10,000 per client and subject signed into the token, about 30 proofs per second each at the default proof lifetime; past either limit it refuses new proofs with a 503 until entries expire. Ten client and subject pairs at their limit therefore fill it for everyone, for example one user signed in to ten registered clients, so with open sign-up or open client registration, for a client above that rate, or for several replicas, use a store sized for that. |
+| `DisableReplayCheck` | `false` | Turns replay detection off, and overrides `ReplayStore`. |
 | `MaxProofAge` | `300s` (`DefaultDPoPProofLifetime`) | Maximum age of a proof, measured from its `iat`. |
 | `ClockSkew` | `30s` (`DefaultDPoPClockSkew`) | Tolerance for proof `iat` being in the future. Capped at `MaxClockSkew` (5 min). |
 | `AllowedProofAlgorithms` | `ES256, RS256, PS256` | JWS algorithms accepted for proofs. Dangerous algorithms (`none`, HMAC) are always rejected. |
@@ -233,7 +228,7 @@ When the token has a `cnf.jkt` binding, the verifier checks:
 - Proof algorithm is in `AllowedProofAlgorithms`
 - Proof `htm`, `htu`, `iat`, and `jti` are valid; `iat` is within `now − MaxProofAge − ClockSkew` to `now + ClockSkew`
 - `ath` matches the SHA-256 hash of the access token
-- Replay detection runs through the supplied `ReplayStore` (when non-nil)
+- Replay detection runs through `ReplayStore`, unless `DisableReplayCheck` is set
 - The proof key thumbprint matches the token's `cnf.jkt`
 
 ## 4. Working with VerifiedClaims
@@ -278,8 +273,6 @@ claims.Claim("email")                       // any or nil
 claims.Act()          // map[string]any for "act" claim (delegation chain)
 claims.AgentChain()   // []string for "agent_chain" claim (Authplane extension)
 ```
-
-`MayAct()` is deprecated: authserver 0.2.0 no longer issues the `may_act` claim (RFC 8693 §4.4), and the accessor is removed in the next minor.
 
 ### DPoP confirmation
 
@@ -351,7 +344,7 @@ verifier.WithRevocationChecker(func(ctx context.Context, claims *verifier.Verifi
 
 ### Fail-open behavior
 
-By default, if the revocation checker returns an error, the token is accepted (fail-open). This prevents a down revocation store from blocking all requests.
+By default, if the revocation checker returns an error, the token is accepted (fail-open). This prevents a down revocation store from blocking all requests. The exception is a caller whose context has ended: `VerifyToken` returns the context error, with status 503, in either mode.
 
 To reject tokens when the revocation check fails, use `WithFailClosed()`:
 
@@ -377,10 +370,10 @@ All AS-facing operations use the current discovered metadata endpoints and the c
 ### ClientCredentials
 
 ```go
-resp, err := client.ClientCredentials(ctx,
-    []string{"read", "write"},
-    []string{"https://api.example.com"},
-)
+resp, err := client.ClientCredentials(ctx, authplane.ClientCredentialsInput{
+    Scopes:    []string{"read", "write"},
+    Resources: []string{"https://api.example.com"},
+})
 fmt.Println(resp.AccessToken)
 fmt.Println(resp.TokenType)
 fmt.Println(resp.ExpiresIn)
@@ -553,7 +546,11 @@ type DPoPReplayStore interface {
 }
 ```
 
-Returns `stored=true` when the JTI was stored (first use), or `stored=false` when it was already present (replay detected). If `CheckAndStore` returns an error, the proof is rejected.
+The `jti` argument is `<owner>:<key thumbprint>:<hash of the proof's jti>`, so its size is bounded. The owner is a hash of the client and subject signed into the token. A custom store needs its own limit per owner, the first segment: a client generates keys at will, so a limit per key lets one client fill the store for everyone.
+
+Returns `stored=true` when the JTI was stored (first use), or `stored=false` when it was already present (replay detected). If `CheckAndStore` returns an error, the proof is rejected with `ErrDPoPReplayStoreUnavailable` and status 503.
+
+Replicas sharing a store must compute the same owner. While a rollout changes `WithClientClaims`, or moves from an older SDK with another entry format, replay detection between old and new replicas is suspended for one proof lifetime.
 
 The SDK provides `InMemoryDPoPReplayStore` for single-process deployments. For distributed systems, implement `DPoPReplayStore` with Redis or a shared database.
 
@@ -588,13 +585,16 @@ client, err := authplane.NewClient(ctx, issuer,
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `SSRFProtection` | `true` | When `false`, requests bypass DNS pinning and IP validation. |
+| `DisableSSRFProtection` | `false` | When `true`, requests bypass DNS pinning and IP validation. |
 | `AllowHTTP` | `false` | Permit `http://` URLs (HTTPS-only when `false`). |
 | `AllowLocalhost` | `false` | Permit `127.0.0.0/8` / `::1`. |
 | `AllowPrivateNets` | `false` | Permit `10/8`, `172.16/12`, `192.168/16`, `100.64/10`. |
 | `Timeout` | `10s` | Per-request HTTP timeout. |
+| `Proxy` | none | Chooses a proxy, such as `http.ProxyFromEnvironment`. Addresses are still checked and pinned. The SDK never reads a proxy from the environment by itself. |
+| `UserAgent` | `authplane-go-sdk` | Sent on every fetch. |
+| `Observe` | none | Called after every fetch with a `FetchEvent`, for metrics. Must not block. |
 
-Cloud-metadata addresses (`169.254.169.254`, link-local, multicast) are always blocked when `SSRFProtection` is enabled regardless of the other flags.
+Cloud-metadata addresses (`169.254.169.254`, link-local, multicast) are always blocked unless `DisableSSRFProtection` is set, regardless of the other flags.
 
 ### Development mode
 
@@ -608,17 +608,14 @@ client, err := authplane.NewClient(ctx, "http://localhost:9000",
 
 `DevModeFetchSettings()` allows HTTP, localhost, and private-network endpoints while keeping SSRF protection enabled for cloud-metadata addresses. It is intended for local development only.
 
-Setting `AUTHPLANE_DEV_MODE=1` in the environment achieves the same effect without code changes (useful in CI). Explicit `WithFetchSettings` always overrides the env var.
-
 ### Settings precedence
 
 1. Explicit `WithFetchSettings(...)` — highest priority.
-2. `AUTHPLANE_DEV_MODE=1` env var → `DevModeFetchSettings()`.
-3. `DefaultFetchSettings()` — production-safe defaults.
+2. `DefaultFetchSettings()` — production-safe defaults.
 
 ## 11. Error Handling
 
-All SDK errors are sentinel values testable with `errors.Is`.
+All SDK errors are testable with `errors.Is`. An error answer from the authorization server is also an `*authplane.OAuthError`, for `errors.As`.
 
 ### Verification errors (`resource/verifier`)
 
@@ -643,9 +640,10 @@ import "github.com/authplane/go-sdk/core/resource"
 
 status := resource.HTTPStatus(err)
 // 403 for ErrInsufficientScope
-// 503 for ErrJWKSUnavailable, ErrMetadataUnavailable
+// 503 for ErrJWKSUnavailable, ErrMetadataUnavailable, ErrRevocationUnavailable, ErrDPoPReplayStoreUnavailable,
+// and context.Canceled or context.DeadlineExceeded when the caller's own context ended
 // 401 for all other verifier errors
-// 500 for ErrSSRFBlocked, ErrProtocolError, and unknown errors
+// 500 for unknown errors
 ```
 
 For generating `WWW-Authenticate` headers (note this returns the status too — do not call `HTTPStatus` as well):
@@ -656,21 +654,21 @@ status, headers, body := resource.AuthErrorResponse(err)
 
 // With `resource_metadata="…"` appended to the challenge, which is what the
 // adapters emit — pass res.ResourceMetadataURL():
-status, headers, body = resource.AuthErrorResponseWithMetadata(err, res.ResourceMetadataURL())
+status, headers, body = res.AuthErrorResponse(err, resource.WithChallengeMetadata(res.ResourceMetadataURL()))
 ```
 
-The parameter goes last in the challenge, after `realm`, `error` and `scope`, separated by a space when it is the only auth-param (the no-token case, `Bearer resource_metadata="…"`) and by `, ` otherwise. An empty URL emits the challenge unchanged.
+The parameter comes after `realm`, `error` and `scope`, and before `algs` on a DPoP challenge. Parameters are separated by commas, and by a space when it is the only auth-param (the no-token case, `Bearer resource_metadata="…"`) and by `, ` otherwise. An empty URL emits the challenge unchanged.
 
 The JSON body's `error_description` is a fixed sentence chosen by the error code — `err`'s own message never reaches it. That body goes to a caller who has not authenticated, and the verifier's messages name the failing detail (the unknown `kid`, the audience the resource expects, the rejected `typ`). Log `err` for the diagnostic; it is unchanged.
 
 A request that presented no credentials at all is the one case with no `error` on either side: RFC 6750 §3 has the challenge omit it — the codes describe a request that did authenticate and failed — and the body omits the member for the same reason, carrying only `{"error_description":"The request did not carry an access token"}`. Read that absence the way the challenge reads: begin discovery and authenticate.
 
-`resource.AuthErrorResponseVerbose(err, realm...)` puts the message back in `error_description`. It is a development aid — it discloses that detail to unauthenticated callers, so do not use it in production.
+`resource.AuthErrorResponse(err, resource.WithVerboseDescription())` puts the message back in `error_description`. It is a development aid — it discloses that detail to unauthenticated callers, so do not use it in production.
 
 ### OAuth errors (`authplane`)
 
 ```go
-resp, err := client.ClientCredentials(ctx, scope, resource)
+resp, err := client.ClientCredentials(ctx, authplane.ClientCredentialsInput{Scopes: scope, Resources: resource})
 if err != nil {
     if errors.Is(err, authplane.ErrInvalidGrant) {
         // subject token invalid
@@ -758,7 +756,7 @@ authplane.WithCircuitBreaker(10, 60 * time.Second) // threshold=10, cooldown=60s
 
 ### Unknown kid
 
-If a token references an unknown `kid`, the JWKS cache is force-refreshed once before the verifier gives up. This supports normal key rotation without turning every bad token into repeated network traffic. If the key is still unresolved after that refresh, the token is rejected as invalid rather than reported as a JWKS outage.
+If a token references an unknown `kid`, the JWKS cache is force-refreshed once before the verifier gives up, at most once per minute. This supports normal key rotation without turning every bad token into repeated network traffic. If the endpoint cannot be reached, the result is `ErrJWKSUnavailable` and a 503, because the key may simply be newer than the cached set. Otherwise the token is refused as invalid.
 
 ### Strict discovery behavior
 
@@ -771,3 +769,49 @@ The SDK fails closed on discovery problems:
 ### Token caching
 
 Client-credentials responses are cached in memory by `(scope, resource)`. Token-exchange responses are cached by the effective exchange inputs so distinct subject, actor, audience, resource, or scope combinations do not reuse the same cached token. Cached entries are evicted slightly before expiry based on `WithTokenCacheTTLBuffer` (default 30 seconds).
+
+## Using another authorization server
+
+By default the verifier follows RFC 9068 strictly. For a server that issues other token shapes, set these options through `resource.WithVerifierOptions`. Each has a safe default, and none can turn off the signature, `iss`, `sub`, `aud` or `exp` checks.
+
+| Option | Sets | Default |
+|---|---|---|
+| `WithAcceptedTokenTypes` | accepted `typ`; `TokenTypeNone` accepts none | `at+jwt` |
+| `WithRequiredClaims` | required claims beyond `iss`, `sub`, `aud`, `exp` | `iat`, `jti`, `client_id` |
+| `WithScopeClaims` | claims scopes come from | `scope` |
+| `WithClientClaims` | claims `ClientID()` comes from | `client_id` |
+| `WithAccessTokenMarkers` | claims marking an untyped token as an access token | scope claims, and client claims other than `azp` |
+| `WithExpectedAudience` | the audience a token must carry, in any form | the resource URI |
+| `WithScopeImplication` | which broader scopes satisfy narrower ones | exact match |
+
+These shapes are tested with fixture tokens built from each vendor's documentation, not against live servers:
+
+| Shape | Options |
+|---|---|
+| Keycloak | `WithAcceptedTokenTypes("at+jwt", "JWT")`, `WithClientClaims("azp", "client_id")`, `WithRequiredClaims("iat")` |
+| Microsoft Entra ID | `WithAcceptedTokenTypes("JWT")`, `WithExpectedAudience("<API client ID>")`, `WithScopeClaims("scp", "roles")`, `WithClientClaims("azp", "appid")`, `WithRequiredClaims("iat", "tid")`, `WithAccessTokenMarkers("scp", "azpacr", "appidacr")` |
+| Okta | `WithAcceptedTokenTypes("at+jwt", "JWT", verifier.TokenTypeNone)`, `WithScopeClaims("scp", "scope")`, `WithClientClaims("cid", "client_id")`, `WithRequiredClaims("iat", "jti")` |
+| Auth0 | `WithAcceptedTokenTypes("at+jwt", "JWT")`, `WithScopeClaims("scope", "permissions")`, `WithClientClaims("azp", "client_id")`, `WithRequiredClaims("iat")` |
+
+**Security trade-offs.**
+
+- Accepting anything but `at+jwt` gives up explicit typing (RFC 9068 section 5), so an ID token could stand in for an access token. The verifier refuses tokens that look like ID tokens, but that check is a heuristic. Keep the expected audience different from the client ID of any OIDC client.
+- A scope claim that holds user roles, such as `roles`, lets a user's role satisfy a scope the client was never granted.
+- `Client.Metadata` shows what the server supports. With no `introspection_endpoint`, tokens are not checked for revocation before they expire; a fail-closed verifier refuses every token in that state.
+- A verifier fails open by default when a revocation check fails. Use `WithFailClosed` if a check that cannot run should refuse the token, and accept that an authorization server outage then refuses every token.
+
+Other client features: `Client.JWTBearer` performs the JWT-bearer grant, which also redeems an ID-JAG. `authplane.WithJWKSMaxStale` refuses tokens, with `ErrJWKSUnavailable`, once keys have not been refreshed for that long. `FetchSettings.RootCAs` replaces the system trust store for a server behind a private CA; set it on `DefaultFetchSettings()`, because a zero `FetchSettings` turns SSRF protection off.
+
+A fail-closed verifier that cannot run its revocation check returns `ErrRevocationUnavailable`, which `resource.HTTPStatus` maps to 503.
+
+For `private_key_jwt`, the assertion's `aud` is the issuer. Some servers, such as Microsoft Entra ID, document the token endpoint instead: set `AssertionAudienceTokenEndpoint`.
+
+## Logging, errors and metrics
+
+`WithLogger` sends a client's logs to your logger, and those of the verifiers it builds; `verifier.WithLogger`, `authplanehttp.WithLogger` and the adapters' `Options.Logger` do the same at each layer. Unset, logs go to `slog.Default()`. `ClientAuthentication`, `TokenResponse`, the input types and `DPoPProofOptions` hide their secrets when formatted or logged.
+
+An error answer from the authorization server is an `*authplane.OAuthError`, which gives `Code`, `Description`, `Status` and `RetryAfter` through `errors.As`, and still matches its sentinel through `errors.Is`. A 503 from verification carries no `error` in its challenge, a `temporarily_unavailable` body and `Retry-After`: keep the token and retry.
+
+## A client that only requests tokens
+
+`WithoutTokenVerification()` builds a client for token calls alone. `jwks_uri` becomes optional in the metadata and `Client.Resource` returns an error.

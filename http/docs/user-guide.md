@@ -10,7 +10,7 @@ This guide is the thorough reference. The [README](../README.md) holds the hero 
 go get github.com/authplane/go-sdk/http
 ```
 
-Requires Go 1.24+. The adapter depends on `github.com/authplane/go-sdk/core`; a compatible `core` version is pulled in transitively.
+Requires Go 1.26+. The adapter depends on `github.com/authplane/go-sdk/core`; a compatible `core` version is pulled in transitively.
 
 ## 2. Quickstart
 
@@ -44,7 +44,10 @@ func main() {
         panic(err)
     }
 
-    adapter := authplanehttp.New(res)
+    adapter, err := authplanehttp.New(res)
+    if err != nil {
+        panic(err)
+    }
 
     mux := http.NewServeMux()
     mux.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
@@ -72,7 +75,10 @@ On failure, the adapter writes an RFC 6750 error response: correct HTTP status, 
 ### 4.1 Construct the adapter
 
 ```go
-adapter := authplanehttp.New(res)
+adapter, err := authplanehttp.New(res)
+if err != nil {
+    panic(err)
+}
 ```
 
 `res` must be a `*resource.Resource` created via `client.Resource(uri, resource.WithScopes(...))`. The adapter is safe for concurrent use and holds no cleanup state of its own; the client (returned by `authplane.NewClient`) is what needs `Close()`.
@@ -128,7 +134,7 @@ Standard `net/http` middleware.
 - For `DPoP`, also consumes the `DPoP` request header and constructs a `*verifier.DPoPContext` with the request method, reconstructed URL (scheme + host + request URI), proof, and the adapter's replay store.
 - Calls `resource.VerifyToken(ctx, token, opts...)`.
 - On success, injects `*verifier.VerifiedClaims` and the raw token into the request context.
-- On failure, writes an RFC 6750 response via `resource.AuthErrorResponseWithMetadata`, whose challenge carries `resource_metadata="…"` (RFC 9728 §5.1) pointing at `res.ResourceMetadataURL()` — see §6.1.
+- On failure, writes an RFC 6750 response via `resource.AuthErrorResponse`, whose challenge carries `resource_metadata="…"` (RFC 9728 §5.1) pointing at `res.ResourceMetadataURL()` — see §6.1.
 - A 401 also carries `scope="…"` listing the resource's configured scopes (`resource.WithScopes`), per RFC 6750 §3 and the MCP authorization spec's SHOULD, so a client learns what to request before it holds any token — e.g. `Bearer resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp", scope="tools/add tools/multiply"`. The param is omitted when no scopes are configured. A 403 from `RequireScopes` keeps its own route-specific `scope=` (below) and is not touched.
 - Requests whose **escaped** path (`r.URL.EscapedPath()`) equals `WellKnownPRMPath()` are passed through unauthenticated. The comparison is on the escaped form on both sides: a resource identifier carrying a percent-encoded octet (e.g. `%2F`) derives a well-known path that keeps it, and comparing the decoded `r.URL.Path` would let `%2F` collapse to `/`, disagree, and return 401 for the discovery endpoint RFC 9728 §3.2 requires to be publicly reachable.
 
@@ -166,7 +172,10 @@ res, err := client.Resource("https://api.example.com",
         Required:    true,
     })),
 )
-adapter := authplanehttp.New(res)
+adapter, err := authplanehttp.New(res)
+if err != nil {
+    panic(err)
+}
 ```
 
 ### 6.1 Where the PRM document lives
@@ -182,7 +191,10 @@ res, err := client.Resource("https://api.example.com/mcp",
     resource.WithScopes("read", "write"),
     resource.WithResourceMetadataURL("https://auth.example.com/.well-known/oauth-protected-resource/mcp"),
 )
-adapter := authplanehttp.New(res)
+adapter, err := authplanehttp.New(res)
+if err != nil {
+    panic(err)
+}
 ```
 
 Only the advertisement moves. `WellKnownPRMPath()` and `PRMHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
@@ -194,10 +206,10 @@ Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resour
 The adapter auto-detects the `DPoP` authorization scheme. When it sees `Authorization: DPoP <token>`, it:
 
 1. Reads the `DPoP` request header (the proof JWT).
-2. Reconstructs the request URL from `r.TLS`, `r.Host`, and `r.URL.RequestURI()`.
+2. Builds the request URL from the configured resource URI and the request path, never from `r.TLS` or `r.Host`.
 3. Passes a `*verifier.DPoPContext` carrying only `{Method, URL, Proof}` into `resource.VerifyToken`.
 
-The verifier enforces proof signature, `htm`/`htu`/`ath` checks, the `cnf.jkt` binding on the access token, and (when an `InboundDPoPOptions.ReplayStore` is configured) replay protection.
+The verifier enforces proof signature, `htm`/`htu`/`ath` checks, the `cnf.jkt` binding on the access token, and replay protection, through `InboundDPoPOptions.ReplayStore` or an in-memory store, unless `DisableReplayCheck` is set.
 
 Errors surface through the normal middleware path:
 
@@ -209,11 +221,11 @@ Errors surface through the normal middleware path:
 
 ### 7.1 Running behind a TLS-terminating proxy
 
-`Middleware()` builds the URL with `https` if `r.TLS != nil`, otherwise `http`. If you terminate TLS upstream, the proof's `htu` must match the URL seen by the handler — configure your reverse proxy to forward the original host and scheme, or set them explicitly on the request before the middleware runs. The standard `X-Forwarded-*` handling is the caller's responsibility; the adapter does not parse those headers.
+`Middleware()` builds the URL for the `htu` comparison from the configured resource URI, never from `r.TLS` or the `Host` header, which a proxy or a client can change. So the resource URI must be the public origin clients call. Only the path comes from the request, so mount the middleware where it sees the path the client signed, before any `http.StripPrefix`.
 
 ## 8. Replay stores
 
-A replay store is a `verifier.DPoPReplayStore` provided through `verifier.WithInboundDPoP`. The HTTP adapter does not own replay state.
+A replay store is a `verifier.DPoPReplayStore` provided through `verifier.WithInboundDPoP`. With none, an in-memory store is used, which suits a single instance. `DisableReplayCheck: true` turns the check off. The HTTP adapter does not own replay state.
 
 ### 8.1 In-memory store
 
@@ -262,16 +274,16 @@ client.Resource(uri,
 
 ## 9. Error handling
 
-The middleware maps every verifier error to an RFC 6750 response via `resource.AuthErrorResponseWithMetadata`. If you need to handle errors yourself inside a custom middleware chain, call the same helper — it returns the status too, so there is no need to call `HTTPStatus` as well:
+The middleware maps every verifier error to an RFC 6750 response via `resource.AuthErrorResponse`. If you need to handle errors yourself inside a custom middleware chain, call the same helper — it returns the status too, so there is no need to call `HTTPStatus` as well:
 
 ```go
 import "github.com/authplane/go-sdk/core/resource"
 
 // status, WWW-Authenticate + Content-Type headers, and the JSON body:
-status, headers, body := resource.AuthErrorResponseWithMetadata(err, res.ResourceMetadataURL())
+status, headers, body := res.AuthErrorResponse(err, resource.WithChallengeMetadata(res.ResourceMetadataURL()))
 ```
 
-`AuthErrorResponseWithMetadata` appends the RFC 9728 §5.1 `resource_metadata` parameter to the challenge — pass `res.ResourceMetadataURL()` and your custom middleware advertises the same document the adapter does. `resource.AuthErrorResponse(err)` is the same call without that parameter.
+`WithChallengeMetadata` appends the RFC 9728 §5.1 `resource_metadata` parameter to the challenge — pass `res.ResourceMetadataURL()` and your custom middleware advertises the same document the adapter does. `resource.AuthErrorResponse(err)` is the same call without that parameter.
 
 Status mapping (from `resource.HTTPStatus`):
 
@@ -279,10 +291,10 @@ Status mapping (from `resource.HTTPStatus`):
 |---|---|
 | `ErrTokenMissing`, `ErrTokenExpired`, `ErrInvalidSignature`, `ErrInvalidClaims`, `ErrIssuerMismatch`, `ErrAudienceMismatch`, `ErrTokenRevoked`, `ErrDPoPRequired`, `ErrDPoPInvalid`, `ErrDPoPKeyMismatch`, `ErrDPoPReplayDetected` | 401 |
 | `ErrInsufficientScope` | 403 |
-| `ErrJWKSUnavailable`, `ErrMetadataUnavailable` | 503 |
-| `ErrSSRFBlocked`, `ErrProtocolError`, other | 500 |
+| `ErrJWKSUnavailable`, `ErrMetadataUnavailable`, `ErrRevocationUnavailable`, `ErrDPoPReplayStoreUnavailable` | 503 |
+| other | 500 |
 
-`WWW-Authenticate` scheme is `DPoP` for any DPoP error and `Bearer` otherwise. The JSON body's `error_description` is a fixed sentence chosen by the error code, never the verifier's own message. The adapter owns the error at that point and no longer returns it, so it writes the diagnostic to `slog.Default()` at DEBUG (`authplane: rejecting request`, with `err` and `status`); enable debug logging on your default handler to see it, or call `resource.VerifyToken` directly if you want the error in hand. The full error reference lives in the [core user guide](../../core/docs/user-guide.md).
+`WWW-Authenticate` scheme is `DPoP` for any DPoP error and `Bearer` otherwise. A bad, replayed or wrong-key proof answers `invalid_dpop_proof`, DPoP challenges list `algs`, and a resource requiring DPoP answers a request with no token with the `DPoP` scheme. A 503 has no `error` in its challenge, a `temporarily_unavailable` body and `Retry-After`: keep the token and retry. The JSON body's `error_description` is a fixed sentence chosen by the error code, never the verifier's own message. The adapter owns the error at that point and no longer returns it, so it writes the diagnostic to `slog.Default()`, at Error for a 5xx and otherwise at DEBUG (`authplane: rejecting request`, with `err` and `status`); enable debug logging on your default handler to see it, or call `resource.VerifyToken` directly if you want the error in hand. The full error reference lives in the [core user guide](../../core/docs/user-guide.md).
 
 ## 10. Lifecycle
 
@@ -303,3 +315,7 @@ If you provide a custom `DPoPReplayStore` with its own resources (connection poo
 - [Core user guide](../../core/docs/user-guide.md) — client, resource, verifier, errors, DPoP outbound signing, token exchange.
 - [MCP adapter user guide](../../mcp/docs/user-guide.md) — same ideas, MCP-specific middleware and URL elicitation for consent flows.
 - [`demo/`](../demo/) — runnable Calculator Service that exercises introspection-backed revocation and per-route scope enforcement.
+
+## Other authorization servers
+
+This adapter takes the server-neutral options of `core` through `resource.WithVerifierOptions`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience`. See [Using another authorization server](../../core/docs/user-guide.md#using-another-authorization-server).

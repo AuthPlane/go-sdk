@@ -37,7 +37,7 @@ func TestQuoteWWWAuthenticateParams(t *testing.T) {
 		{
 			name:  "multiple params — only non-token values quoted",
 			input: `Bearer realm=example, resource_metadata=http://as.example.com/meta`,
-			want:  `Bearer realm=example resource_metadata="http://as.example.com/meta"`,
+			want:  `Bearer realm=example, resource_metadata="http://as.example.com/meta"`,
 		},
 		{
 			name:  "https URL gets quoted",

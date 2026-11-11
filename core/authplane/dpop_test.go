@@ -97,7 +97,7 @@ func TestGenerateProof_WithNonce(t *testing.T) {
 		t.Fatalf("failed: %v", err)
 	}
 
-	claims, err := testutil.ParseSignedToken(proof)
+	claims, err := testutil.UnverifiedClaims(proof)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestGenerateProof_WithAccessToken(t *testing.T) {
 		t.Fatalf("failed: %v", err)
 	}
 
-	claims, err := testutil.ParseSignedToken(proof)
+	claims, err := testutil.UnverifiedClaims(proof)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestGenerateProof_NoNonceOrATH_WhenOptsEmpty(t *testing.T) {
 		t.Fatalf("failed: %v", err)
 	}
 
-	claims, err := testutil.ParseSignedToken(proof)
+	claims, err := testutil.UnverifiedClaims(proof)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestGenerateProof_UniqueJTI(t *testing.T) {
 	jtis := make(map[string]bool)
 	for range 10 {
 		proof, _ := signer.GenerateProof("GET", "https://example.com", nil)
-		claims, err := testutil.ParseSignedToken(proof)
+		claims, err := testutil.UnverifiedClaims(proof)
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)
 		}
@@ -205,7 +205,7 @@ func TestGenerateProof_HTUStripsQueryAndFragment(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GenerateProof: %v", err)
 			}
-			claims, err := testutil.ParseSignedToken(proof)
+			claims, err := testutil.UnverifiedClaims(proof)
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
@@ -244,7 +244,7 @@ func TestGenerateProof_HTUNormalizesDefaultPort(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GenerateProof: %v", err)
 			}
-			claims, err := testutil.ParseSignedToken(proof)
+			claims, err := testutil.UnverifiedClaims(proof)
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}
@@ -277,7 +277,7 @@ func TestGenerateProof_HTUStripsUserinfo(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GenerateProof: %v", err)
 			}
-			claims, err := testutil.ParseSignedToken(proof)
+			claims, err := testutil.UnverifiedClaims(proof)
 			if err != nil {
 				t.Fatalf("parse: %v", err)
 			}

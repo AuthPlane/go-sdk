@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -69,8 +70,7 @@ func TestInMemoryDPoPReplayStore_ExpiredJTIEvicted(t *testing.T) {
 
 func TestInMemoryDPoPReplayStore_CapacityBound(t *testing.T) {
 	// Eviction behavior is independent of the exact cap, so use a small value
-	// to keep this test fast. CheckAndStore is O(N) in store size; the default
-	// 100k cap makes this test take minutes under -race.
+	// to keep this test fast.
 	const testCap = 100
 
 	store := NewInMemoryDPoPReplayStore()
@@ -89,13 +89,16 @@ func TestInMemoryDPoPReplayStore_CapacityBound(t *testing.T) {
 		}
 	}
 
-	// One more should still succeed (evicts oldest).
+	// One more is refused: evicting an unexpired entry would allow its proof to be replayed.
 	stored, err := store.CheckAndStore("jti-overflow", expiresAt)
-	if err != nil {
-		t.Fatalf("unexpected error on overflow: %v", err)
+	if !errors.Is(err, ErrReplayStoreFull) {
+		t.Fatalf("err = %v, want ErrReplayStoreFull", err)
 	}
-	if !stored {
-		t.Error("expected stored=true on overflow (should evict oldest), got false")
+	if stored {
+		t.Error("expected stored=false at capacity")
+	}
+	if stored, _ := store.CheckAndStore("jti-cap-0", expiresAt); stored {
+		t.Error("an existing entry was evicted")
 	}
 
 	// Verify size is still at capacity, not above.
@@ -126,4 +129,60 @@ func TestInMemoryDPoPReplayStore_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 	// If the race detector doesn't fire, the test passes.
+}
+
+// One token holder at its limit must not lock out other clients.
+func TestInMemoryDPoPReplayStore_PerKeyLimit_A84(t *testing.T) {
+	store := NewInMemoryDPoPReplayStore()
+	store.maxPerKey = 3
+	exp := time.Now().Add(time.Minute)
+	for i := range 3 {
+		if ok, err := store.CheckAndStore(fmt.Sprintf("flood:%d", i), exp); !ok || err != nil {
+			t.Fatalf("entry %d: %v %v", i, ok, err)
+		}
+	}
+	if _, err := store.CheckAndStore("flood:over", exp); !errors.Is(err, ErrReplayStoreFull) {
+		t.Errorf("over the limit: err = %v", err)
+	}
+	if ok, err := store.CheckAndStore("victim:1", exp); !ok || err != nil {
+		t.Errorf("another key: %v %v", ok, err)
+	}
+
+	short := NewInMemoryDPoPReplayStore()
+	short.maxPerKey = 1
+	if ok, err := short.CheckAndStore("k:1", time.Now().Add(-time.Second)); !ok || err != nil {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if ok, err := short.CheckAndStore("k:2", exp); !ok || err != nil {
+		t.Errorf("expired entries must free the key's share: %v %v", ok, err)
+	}
+}
+
+// A client generates its own keys, so a new key must not give it a new share of the store.
+func TestReplayStore_NewKeysShareTheOwnersLimit_A84(t *testing.T) {
+	store := NewInMemoryDPoPReplayStore()
+	store.maxPerKey = 2
+	v := newDPoPTestVerifier(t, store)
+	const htu = "https://api.example.com/resource"
+	owner := replayOwner("c", "s")
+	other := replayOwner("c", "other")
+	if owner == "" || owner == other {
+		t.Fatalf("owners: %q, %q", owner, other)
+	}
+	send := func(owner string) error {
+		proof := generateDPoPProof(t, newTestECKey(t), "GET", htu, "", nil)
+		_, err := v.validateDPoPProof(mustCtx(t, "GET", htu, proof), "", "", owner)
+		return err
+	}
+	for i := range 2 {
+		if err := send(owner); err != nil {
+			t.Fatalf("proof %d: %v", i, err)
+		}
+	}
+	if err := send(owner); !errors.Is(err, ErrDPoPReplayStoreUnavailable) {
+		t.Errorf("third key: %v", err)
+	}
+	if err := send(other); err != nil {
+		t.Errorf("another subject: %v", err)
+	}
 }

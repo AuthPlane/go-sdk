@@ -2,9 +2,9 @@ package authplane
 
 import (
 	"container/list"
-	"fmt"
-	"net/url"
 	"sync"
+
+	"github.com/authplane/go-sdk/core/internal/oauth"
 )
 
 const maxNonceStoreEntries = 128
@@ -86,30 +86,4 @@ func (s *inMemoryDPoPNonceStore) Put(origin, nonce string) {
 }
 
 // originFromURL extracts the scheme://host:port origin from rawURL.
-// Default ports are filled in: 443 for https, 80 for http, so that URLs with
-// and without explicit default ports map to the same origin bucket.
-// Returns "" for invalid or empty URLs.
-func originFromURL(rawURL string) string {
-	if rawURL == "" {
-		return ""
-	}
-
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-
-	host := u.Hostname()
-	port := u.Port()
-
-	if port == "" {
-		switch u.Scheme {
-		case "https":
-			port = "443"
-		case "http":
-			port = "80"
-		}
-	}
-
-	return fmt.Sprintf("%s://%s:%s", u.Scheme, host, port)
-}
+func originFromURL(rawURL string) string { return oauth.OriginFromURL(rawURL) }

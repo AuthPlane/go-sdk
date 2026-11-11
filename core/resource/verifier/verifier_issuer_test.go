@@ -1,8 +1,10 @@
 package verifier_test
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/authplane/go-sdk/core/resource"
 	"github.com/authplane/go-sdk/core/resource/verifier"
@@ -41,7 +43,12 @@ func TestNewTokenVerifierAcceptsIssuerWithTerminatingSlash(t *testing.T) {
 	// The slash is part of the identifier, not a defect: RFC 8414 §4 compares
 	// code-point-for-code-point, so an AS whose identifier ends in "/" must be
 	// storable verbatim.
-	if _, err := verifier.NewTokenVerifier("https://as.example.com/", "https://api.example.com", nil); err != nil {
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		DefaultTTL: time.Hour,
+		FetchFn:    func(context.Context) ([]byte, map[string][]string, error) { return []byte(`{"keys":[]}`), nil, nil },
+	})
+	t.Cleanup(jc.Close)
+	if _, err := verifier.NewTokenVerifier("https://as.example.com/", "https://api.example.com", jc); err != nil {
 		t.Fatalf("trailing-slash issuer must be accepted, got %v", err)
 	}
 }

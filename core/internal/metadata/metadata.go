@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/authplane/go-sdk/core/internal/cache"
@@ -33,10 +32,22 @@ type ASMetadata struct {
 	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported,omitempty"`
 	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported,omitempty"`
 	DPoPSigningAlgValuesSupported     []string `json:"dpop_signing_alg_values_supported,omitempty"`
+
+	BackchannelAuthenticationEndpoint   string   `json:"backchannel_authentication_endpoint,omitempty"`
+	AuthorizationDetailsTypesSupported  []string `json:"authorization_details_types_supported,omitempty"`
+	AuthorizationGrantProfilesSupported []string `json:"authorization_grant_profiles_supported,omitempty"`
+
+	raw []byte
 }
 
-// OnJWKSURIChangeFunc is called when the JWKS URI changes between refreshes.
-type OnJWKSURIChangeFunc func(oldJWKSURI, newJWKSURI string)
+// Raw returns a copy of the whole document, including members with no typed field.
+func (m *ASMetadata) Raw() map[string]any {
+	var out map[string]any
+	if err := json.Unmarshal(m.raw, &out); err != nil {
+		return nil
+	}
+	return out
+}
 
 // Config holds MetadataCache configuration.
 type Config struct {
@@ -46,9 +57,8 @@ type Config struct {
 	FetchSettings ssrf.FetchSettings
 	// RefreshInterval is how long fetched metadata is cached. Defaults to DefaultRefreshInterval.
 	RefreshInterval time.Duration
-	// OnJWKSURIChange is an optional callback fired when the jwks_uri field changes
-	// between cache refreshes.
-	OnJWKSURIChange OnJWKSURIChangeFunc
+	// JWKSOptional accepts a document with no jwks_uri, for a client that verifies no tokens.
+	JWKSOptional bool
 }
 
 // MetadataCache fetches and caches OAuth 2.0 authorization server metadata,
@@ -58,10 +68,7 @@ type MetadataCache struct { //nolint:revive // MetadataCache is the established 
 	docCache      *cache.DocumentCache
 	issuerURL     string
 	fetchSettings ssrf.FetchSettings
-	onChange      OnJWKSURIChangeFunc
-
-	mu          sync.Mutex
-	lastJWKSURI string
+	jwksOptional  bool
 }
 
 // New creates a new MetadataCache and starts its background refresh goroutine.
@@ -74,15 +81,12 @@ func New(cfg Config) *MetadataCache {
 	mc := &MetadataCache{
 		issuerURL:     cfg.IssuerURL,
 		fetchSettings: cfg.FetchSettings,
-		onChange:      cfg.OnJWKSURIChange,
+		jwksOptional:  cfg.JWKSOptional,
 	}
 
 	mc.docCache = cache.New(cache.Config{
 		FetchFn:    mc.fetchMetadata,
 		DefaultTTL: cfg.RefreshInterval,
-		OnChange: func(old, cur []byte) {
-			mc.detectJWKSURIChange(old, cur)
-		},
 	})
 
 	return mc
@@ -98,52 +102,7 @@ func (mc *MetadataCache) Get(ctx context.Context) (*ASMetadata, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Seed lastJWKSURI on the first successful fetch so that detectJWKSURIChange
-	// can compare against it on subsequent refreshes. DocumentCache.OnChange is
-	// only called when old bytes are non-nil (i.e. not on the first fetch), so we
-	// must initialize the baseline here.
-	mc.mu.Lock()
-	if mc.lastJWKSURI == "" && meta.JWKSURI != "" {
-		mc.lastJWKSURI = meta.JWKSURI
-	}
-	mc.mu.Unlock()
 	return meta, nil
-}
-
-// GetJWKSURI returns the jwks_uri field from the metadata document.
-func (mc *MetadataCache) GetJWKSURI(ctx context.Context) (string, error) {
-	meta, err := mc.Get(ctx)
-	if err != nil {
-		return "", err
-	}
-	return meta.JWKSURI, nil
-}
-
-// GetTokenEndpoint returns the token_endpoint field from the metadata document.
-func (mc *MetadataCache) GetTokenEndpoint(ctx context.Context) (string, error) {
-	meta, err := mc.Get(ctx)
-	if err != nil {
-		return "", err
-	}
-	return meta.TokenEndpoint, nil
-}
-
-// GetIntrospectionEndpoint returns the introspection_endpoint field from the metadata document.
-func (mc *MetadataCache) GetIntrospectionEndpoint(ctx context.Context) (string, error) {
-	meta, err := mc.Get(ctx)
-	if err != nil {
-		return "", err
-	}
-	return meta.IntrospectionEndpoint, nil
-}
-
-// GetRevocationEndpoint returns the revocation_endpoint field from the metadata document.
-func (mc *MetadataCache) GetRevocationEndpoint(ctx context.Context) (string, error) {
-	meta, err := mc.Get(ctx)
-	if err != nil {
-		return "", err
-	}
-	return meta.RevocationEndpoint, nil
 }
 
 // Close stops the background refresh goroutine. Idempotent.
@@ -151,29 +110,24 @@ func (mc *MetadataCache) Close() {
 	mc.docCache.Close()
 }
 
-// discoveryFetchSettings returns a copy of the configured fetch settings with
-// AllowHTTP and AllowLocalhost relaxed for the metadata discovery URL itself.
-// The discovery URL is user-provided configuration (IssuerURL), not untrusted
-// data from a metadata document, so it is safe to fetch over HTTP/localhost.
-// Endpoint URLs inside the metadata document are validated strictly via parse().
-func (mc *MetadataCache) discoveryFetchSettings() ssrf.FetchSettings {
-	s := mc.fetchSettings
-	s.AllowHTTP = true
-	s.AllowLocalhost = true
-	return s
-}
-
 // fetchMetadata implements cache.FetchFunc: tries each discovery path in order
 // and returns the raw JSON body plus any cache-related response headers.
 func (mc *MetadataCache) fetchMetadata(ctx context.Context) (data []byte, headers map[string][]string, err error) {
-	discoveryURLs := []string{
-		buildOAuthMetadataURL(mc.issuerURL),
-		buildOIDCDiscoveryURL(mc.issuerURL),
+	// Metadata names the keys tokens are verified with, so it needs https whatever the
+	// other fetch settings say. DisableSSRFProtection does not relax this.
+	if !mc.fetchSettings.AllowHTTP && !strings.HasPrefix(strings.ToLower(mc.issuerURL), "https://") {
+		return nil, nil, fmt.Errorf("metadata: %w: issuer must use https unless the fetch settings allow HTTP", ssrf.ErrSSRFBlocked)
 	}
-	fetchSettings := mc.discoveryFetchSettings()
-	var lastErr error
+	discoveryURLs := []string{buildOAuthMetadataURL(mc.issuerURL)}
+	if inserted := buildOIDCInsertedURL(mc.issuerURL); inserted != buildOIDCDiscoveryURL(mc.issuerURL) {
+		discoveryURLs = append(discoveryURLs, inserted)
+	}
+	discoveryURLs = append(discoveryURLs, buildOIDCDiscoveryURL(mc.issuerURL))
+	fetchSettings := mc.fetchSettings
+	// A document that fails validation says more than a 404 from a later URL.
+	var lastErr, invalidDoc error
 	for _, url := range discoveryURLs {
-		resp, err := ssrf.SSRFSafeGet(ctx, url, fetchSettings, nil, ssrf.MaxMetadataSize)
+		resp, err := ssrf.SSRFSafeGet(ctx, url, fetchSettings, ssrf.MaxMetadataSize)
 		if err != nil {
 			lastErr = err
 			continue
@@ -182,10 +136,10 @@ func (mc *MetadataCache) fetchMetadata(ctx context.Context) (data []byte, header
 			lastErr = fmt.Errorf("metadata: %s returned HTTP %d", url, resp.Status)
 			continue
 		}
-		// Validate JSON before caching.
-		var meta ASMetadata
-		if err := json.Unmarshal(resp.Body, &meta); err != nil {
-			lastErr = fmt.Errorf("metadata: invalid JSON from %s: %w", url, err)
+		// Validate before caching: a bad document counts as a failed fetch, so the
+		// next discovery URL is tried and a good cached document stays in use.
+		if _, err := mc.parse(resp.Body); err != nil {
+			invalidDoc = fmt.Errorf("metadata: %s: %w", url, err)
 			continue
 		}
 		// Propagate cache headers so DocumentCache can respect them.
@@ -197,6 +151,9 @@ func (mc *MetadataCache) fetchMetadata(ctx context.Context) (data []byte, header
 			headers["Expires"] = []string{exp}
 		}
 		return resp.Body, headers, nil
+	}
+	if invalidDoc != nil {
+		lastErr = invalidDoc
 	}
 	return nil, nil, fmt.Errorf("metadata: discovery failed (tried RFC 8414 and OIDC): %w", lastErr)
 }
@@ -243,29 +200,16 @@ func buildOIDCDiscoveryURL(issuer string) string {
 	return strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
 }
 
-// detectJWKSURIChange is called by DocumentCache.OnChange when the raw bytes differ.
-// It compares the jwks_uri field and fires mc.onChange when it changes.
-func (mc *MetadataCache) detectJWKSURIChange(old, cur []byte) {
-	if mc.onChange == nil {
-		return
+// buildOIDCInsertedURL derives the form with the well-known path between the host and
+// the issuer's path, the second of the three forms MCP clients try. For an issuer with
+// no path it equals buildOIDCDiscoveryURL.
+func buildOIDCInsertedURL(issuer string) string {
+	u, err := url.Parse(issuer)
+	if err != nil {
+		return buildOIDCDiscoveryURL(issuer)
 	}
-	var curMeta ASMetadata
-	if err := json.Unmarshal(cur, &curMeta); err != nil {
-		return
-	}
-	newJWKSURI := curMeta.JWKSURI
-
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	if old == nil {
-		mc.lastJWKSURI = newJWKSURI
-		return
-	}
-	if mc.lastJWKSURI != "" && mc.lastJWKSURI != newJWKSURI {
-		mc.onChange(mc.lastJWKSURI, newJWKSURI)
-	}
-	mc.lastJWKSURI = newJWKSURI
+	ref, _ := url.Parse("/.well-known/openid-configuration" + strings.TrimRight(u.EscapedPath(), "/"))
+	return u.ResolveReference(ref).String()
 }
 
 // parse unmarshals raw JSON bytes into an ASMetadata value and validates
@@ -290,7 +234,7 @@ func (mc *MetadataCache) parse(data []byte) (*ASMetadata, error) {
 	if meta.Issuer != mc.issuerURL {
 		return nil, fmt.Errorf("metadata: issuer mismatch: expected %q, got %q", mc.issuerURL, meta.Issuer)
 	}
-	if meta.JWKSURI == "" {
+	if meta.JWKSURI == "" && !mc.jwksOptional {
 		return nil, fmt.Errorf("metadata: missing required field \"jwks_uri\"")
 	}
 
@@ -312,6 +256,7 @@ func (mc *MetadataCache) parse(data []byte) (*ASMetadata, error) {
 		}
 	}
 
+	meta.raw = data
 	return &meta, nil
 }
 

@@ -45,9 +45,10 @@ func main() {
 
     streamable := server.NewStreamableHTTPServer(mcpServer,
         server.WithHTTPContextFunc(adapter.HTTPContextFunc()),
+        server.WithSessionIdManagerResolver(adapter.SessionManager()),
     )
 
-    http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+    http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
     http.Handle("/mcp", adapter.AuthMiddleware(streamable))
 
     http.ListenAndServe(":8080", nil)
@@ -55,3 +56,11 @@ func main() {
 ```
 
 See the **[User Guide](docs/user-guide.md)** for the full API, per-tool scope enforcement, revocation checking, token exchange, the URL elicitation propagation caveat, dev mode, and lifecycle details.
+
+## Protocol and sessions
+
+This adapter uses mcp-go v1.5 and speaks protocol 2026-07-28. `AuthMiddleware` binds legacy sessions to the user, which needs `SessionManager`, as the quickstart shows. See the [user guide](docs/user-guide.md#sessions-and-step-up).
+
+## Other authorization servers
+
+This adapter takes the server-neutral options of `core` through `resource.WithVerifierOptions`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience`. See [Using another authorization server](../core/docs/user-guide.md#using-another-authorization-server).

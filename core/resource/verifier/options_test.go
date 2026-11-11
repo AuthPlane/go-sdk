@@ -98,12 +98,18 @@ func TestWithInboundDPoP_RequiredFlagSet(t *testing.T) {
 	}
 }
 
-func TestWithInboundDPoP_NilReplayStoreAllowed(t *testing.T) {
+func TestWithInboundDPoP_NilReplayStoreUsesDefault(t *testing.T) {
 	v := makeVerifierForOptionTest(t)
 	if err := WithInboundDPoP(InboundDPoPOptions{ReplayStore: nil})(v); err != nil {
 		t.Fatalf("nil ReplayStore should be allowed, got %v", err)
 	}
+	if v.inboundDPoP.replayStore == nil {
+		t.Error("nil ReplayStore should resolve to the in-memory store")
+	}
+	if err := WithInboundDPoP(InboundDPoPOptions{DisableReplayCheck: true})(v); err != nil {
+		t.Fatalf("DisableReplayCheck: %v", err)
+	}
 	if v.inboundDPoP.replayStore != nil {
-		t.Error("nil ReplayStore should remain nil in resolved bundle")
+		t.Error("DisableReplayCheck should leave no store")
 	}
 }

@@ -5,22 +5,11 @@ name: Security Audit
 # finding fails the build.
 
 on:
+  # Every change: code can newly reach a vulnerable function with no dependency change.
   pull_request:
-    paths:
-      - "**/go.mod"
-      - "**/go.sum"
-      - "go.work"
-      - "go.work.sum"
-      - ".github/workflows/security.yml"
   push:
     branches:
       - main
-    paths:
-      - "**/go.mod"
-      - "**/go.sum"
-      - "go.work"
-      - "go.work.sum"
-      - ".github/workflows/security.yml"
   schedule:
     # Mondays 06:00 UTC — after dependabot runs.
     - cron: "0 6 * * 1"
@@ -47,8 +36,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: "1.25.x"
-          # Force fetching the latest patch matching 1.25.x even when an older
+          go-version: "1.27.x"
+          # Force fetching the latest patch matching 1.27.x even when an older
           # patch is pre-installed on the runner. Without this, govulncheck
           # flags fixed-upstream stdlib CVEs because the runner's cached
           # toolchain trails by one or two patch versions.

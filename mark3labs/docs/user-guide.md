@@ -10,7 +10,7 @@ This guide is the thorough reference. The [README](../README.md) holds the hero 
 go get github.com/authplane/go-sdk/mark3labs
 ```
 
-Requires Go 1.25.5+ (the minimum mark3labs/mcp-go v0.54.0 needs). Also pulls in `github.com/authplane/go-sdk/core` and `github.com/mark3labs/mcp-go`.
+Requires Go 1.26+. Also pulls in `github.com/authplane/go-sdk/core` and `github.com/mark3labs/mcp-go`.
 
 ## 2. Quickstart
 
@@ -45,9 +45,10 @@ func main() {
 
     streamable := server.NewStreamableHTTPServer(mcpServer,
         server.WithHTTPContextFunc(adapter.HTTPContextFunc()),
+        server.WithSessionIdManagerResolver(adapter.SessionManager()),
     )
 
-    http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+    http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
     http.Handle("/mcp", adapter.AuthMiddleware(streamable))
 
     http.ListenAndServe(":8080", nil)
@@ -62,7 +63,7 @@ func main() {
 2. `client.Resource(uri, resource.WithScopes(...))` builds the resource (the JWKS cache is warmed and background refresh starts).
 3. If `ClientOptions` includes `WithClientCredentials` or `WithClientAuthentication`, RFC 7662 introspection is auto-wired as the revocation checker, and `TokenExchange` becomes operational. The credentials must belong to a confidential client that is the issuing client or a runtime-client of the Resource — see §8.
 
-Internally `*Adapter` embeds [`*authplanehttp.Adapter`](../../http/docs/user-guide.md) — the generic Authplane net/http adapter — so the Bearer/DPoP middleware, scope-enforcing middleware, context helpers, and RFC 6750 / RFC 9728 `WWW-Authenticate` response (including `resource_metadata="..."` advertisement) all come from one shared implementation rather than being re-implemented per adapter. mark3labs-only additions are the context bridge and the URL-elicitation mapping.
+Internally `*Adapter` wraps [`*authplanehttp.Adapter`](../../http/docs/user-guide.md) — the generic Authplane net/http adapter — so the Bearer/DPoP middleware, scope-enforcing middleware, context helpers, and RFC 6750 / RFC 9728 `WWW-Authenticate` response (including `resource_metadata="..."` advertisement) all come from one shared implementation rather than being re-implemented per adapter. mark3labs-only additions are the context bridge and the URL-elicitation mapping.
 
 The adapter integrates with mark3labs/mcp-go through **two coordinated hooks**:
 
@@ -96,15 +97,16 @@ mcpServer := server.NewMCPServer("My Server", "1.0.0",
 )
 streamable := server.NewStreamableHTTPServer(mcpServer,
     server.WithHTTPContextFunc(adapter.HTTPContextFunc()),
+    server.WithSessionIdManagerResolver(adapter.SessionManager()),
 )
 
-http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 http.Handle("/mcp", adapter.AuthMiddleware(streamable))
 ```
 
 PRM is always served unauthenticated. `AuthMiddleware` wraps the streamable HTTP server.
 
-> **Don't use `server.WithProtectedResourceMetadata(...)`** for this adapter. That option only takes effect when the streamable server owns the top-level mux (i.e. when you call `streamable.Start()`); with a custom router, PRM never gets registered. `adapter.ProtectedResourceMetadataHandler()` wraps mark3labs/mcp-go's `server.NewProtectedResourceMetadataHandler` and is mounted on your outer router so it stays reachable independently of the auth-wrapped MCP endpoint.
+> **Don't use `server.WithProtectedResourceMetadata(...)`** for this adapter. That option only takes effect when the streamable server owns the top-level mux (i.e. when you call `streamable.Start()`); with a custom router, PRM never gets registered. `adapter.PRMHandler()` wraps mark3labs/mcp-go's `server.NewProtectedResourceMetadataHandler` and is mounted on your outer router so it stays reachable independently of the auth-wrapped MCP endpoint.
 
 ### 4.3 Enforce scope inside tool handlers
 
@@ -145,19 +147,20 @@ Why `mcp.NewToolResultError(...)` instead of returning `err`? mark3labs/mcp-go c
 |---|---|---|---|
 | `Issuer` | `string` | yes | Authorization server issuer URL. |
 | `Resource` | `string` | yes | Protected resource URL (also used to derive the PRM path). |
-| `Scopes` | `[]string` | yes | Scopes advertised in the PRM document. |
-| `DevMode` | `bool` | no | Relaxes SSRF to allow HTTP, localhost, private networks. Also enabled if `AUTHPLANE_DEV_MODE=1`. Remove before production. |
+| `Scopes` | `[]string` | no | Scopes advertised in the PRM document. |
+| `Logger` | `*slog.Logger` | no | Receives this adapter's logs. Nil means `slog.Default()`. |
+| `DevMode` | `bool` | no | Relaxes SSRF to allow HTTP, localhost, private networks. |
 | `ClientOptions` | `[]authplane.Option` | no | SDK-level options: `WithClientCredentials`, `WithClientAuthentication`, `WithJWKSCacheTTL`, `WithCircuitBreaker`, `WithDPoP`, etc. |
 | `VerifierOptions` | `[]verifier.Option` | no | Verifier-level options: `WithAlgorithms`, `WithClockSkew`, `WithRevocationChecker`, `WithFailClosed`. |
 | `ResourceMetadataURL` | `string` | no | Overrides the URL advertised in `resource_metadata`. Empty advertises the document this adapter serves. See §5.1. |
 
-`VerifierOptions` **replaces** the verifier option list set by `client.Resource`. When `ClientOptions` supplies credentials, the SDK auto-wires an introspection-backed revocation checker — if you also pass `VerifierOptions`, include `verifier.WithRevocationChecker(...)` (or `NullRevocationChecker`) explicitly if you want to keep, replace, or disable it.
+`VerifierOptions` adds to the options set by `client.Resource`, so unrelated options keep auto-wired introspection. To turn it off, pass `verifier.WithRevocationChecker(verifier.NullRevocationChecker)`.
 
 ### 5.1 Where the PRM document lives
 
 RFC 9728 admits two topologies, and the adapter serves both.
 
-**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from `Options.Resource`, `ProtectedResourceMetadataHandler()` serves the document, and the 401 challenge advertises that URL. Nothing to configure.
+**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from `Options.Resource`, `PRMHandler()` serves the document, and the 401 challenge advertises that URL. Nothing to configure.
 
 **(b) AS-hosted.** authserver 0.2.0 and later publishes a document for every registered Resource at `<issuer>/.well-known/oauth-protected-resource/{ref}`, where `{ref}` is the RFC 9728 §3.1 path suffix of the Resource URI (or its slug). Point the challenge there when the resource server cannot host well-known paths — a platform that owns `/.well-known`, a proxy that will not forward it:
 
@@ -170,7 +173,7 @@ adapter, err := authplanemark3labs.NewAdapter(ctx, authplanemark3labs.Options{
 })
 ```
 
-Only the advertisement moves. `WellKnownPRMPath()` and `ProtectedResourceMetadataHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
+Only the advertisement moves. `WellKnownPRMPath()` and `PRMHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
 
 Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resource` member inside the document must equal the URL clients call, byte for byte — a client must discard a document whose `resource` differs from the identifier it derived the request from. So the Resource URI registered at the authorization server, the identifier you configure here, and the public URL your server is reached on must be one and the same string, trailing slash and port included.
 
@@ -180,18 +183,18 @@ Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resour
 
 Constructs an adapter. Performs AS metadata discovery and warms the JWKS cache using `ctx`. Background refresh goroutines use their own context; `ctx` is only for startup.
 
-### `NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource) (*Adapter, error)`
+### `NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource, session SessionOptions) (*Adapter, error)`
 
 Constructs an adapter from an already-built client and resource. Use this when sharing a single client across multiple adapters or when you need full control over construction. Returns an error if `client` is nil.
 
-> **Lifecycle note.** `adapter.Close()` calls `client.Close()` regardless of which constructor you used. If you share a client across multiple adapters, do *not* defer `adapter.Close()` on every one — manage `client.Close()` yourself and let the adapters go out of scope.
+> **Lifecycle note.** `adapter.Close()` closes the client only for an adapter built with `NewAdapter`. For one built with `NewAdapterFromClientAndResource` it does nothing, and you close the client yourself.
 
 ### `(a *Adapter) AuthMiddleware(handler http.Handler) http.Handler`
 
-Wraps an HTTP handler with Bearer (and DPoP) token authentication. Equivalent to `a.Middleware()(handler)`; the call shape is preserved for fluency in mark3labs code.
+Wraps an HTTP handler with Bearer (and DPoP) token authentication and the session binding described under Sessions and step-up. Equivalent to `a.Middleware()(handler)`; the call shape is preserved for fluency in mark3labs code.
 
 - Rejects unauthenticated requests with 401 and a `WWW-Authenticate: Bearer resource_metadata="…", scope="…"` header — the PRM URL per RFC 9728 §5.1, and the resource's configured scopes (`Options.Scopes`) per RFC 6750 §3 and the MCP authorization spec's SHOULD. The `scope` param is omitted when `Options.Scopes` is empty.
-- Rejects invalid Bearer tokens with 401 + `error="invalid_token"`; DPoP-bound errors return the `DPoP` scheme as required by RFC 9449.
+- Rejects invalid Bearer tokens with 401 + `error="invalid_token"`; a bad, replayed or wrong-key DPoP proof returns the `DPoP` scheme with `invalid_dpop_proof`, as RFC 9449 requires. An outage returns 503 with no `error` in the challenge and `Retry-After`: keep the token and retry.
 - On success, injects `*verifier.VerifiedClaims` and the raw token into the request context.
 - The PRM well-known path is auto-excluded so the metadata endpoint stays publicly reachable even when this middleware wraps a broad route prefix.
 
@@ -199,10 +202,9 @@ Scopes are not checked at this layer; tools enforce their own scope (see §4.3).
 
 ### Inherited from `*authplanehttp.Adapter`
 
-Because `*Adapter` embeds `*authplanehttp.Adapter`, the following methods from the http adapter are available directly:
+Because `*Adapter` wraps `*authplanehttp.Adapter`, the following methods from the http adapter are available directly:
 
 - `Middleware() func(http.Handler) http.Handler` — the underlying middleware (`AuthMiddleware` is a one-line wrapper).
-- `PRMHandler() http.Handler` — the plain-HTTP PRM handler (`max-age=3600`, no CORS). Prefer `ProtectedResourceMetadataHandler()` below for MCP clients.
 - `WellKnownPRMPath() string` — the RFC 9728 well-known path. Derivation strips any terminating slash after the host component (§3.1) and preserves percent-encoded octets in the path; the resource identifier itself is unchanged.
 - `RequireScopes(scopes ...string) func(http.Handler) http.Handler` — RFC 6750 `insufficient_scope` middleware (useful for non-MCP HTTP routes mounted alongside `/mcp`).
 
@@ -233,7 +235,7 @@ By default only the auth pair is forwarded — values placed on the upstream req
   ))
   ```
 
-### `(a *Adapter) ProtectedResourceMetadataHandler() http.Handler`
+### `(a *Adapter) PRMHandler() http.Handler`
 
 Returns mark3labs/mcp-go's `server.NewProtectedResourceMetadataHandler` configured from `core`'s `resource.PRMResponse()`. The values (`resource`, `authorization_servers`, `bearer_methods_supported`, `scopes_supported`, DPoP fields) come from `core` so they stay aligned with what other Authplane adapters advertise; HTTP framing is mark3labs/mcp-go's (per RFC 9728 / the MCP authorization spec):
 
@@ -264,7 +266,7 @@ Returns the underlying resource. Useful for calling `VerifyToken` directly with 
 
 ### `(a *Adapter) Close() error`
 
-Stops background refresh goroutines and closes idle HTTP connections. Safe to call more than once.
+Stops background refresh goroutines of a client this adapter owns. Safe to call more than once.
 
 ### `ClaimsFromContext(ctx context.Context) *verifier.VerifiedClaims`
 
@@ -397,7 +399,7 @@ By default a checker error is treated as *not revoked* (fail-open). Pair with `v
 
 ## 9. DPoP (sender-constrained tokens)
 
-`AuthMiddleware` accepts both `Authorization: Bearer …` and `Authorization: DPoP …` schemes — that comes from the embedded `*authplanehttp.Adapter`. Inbound DPoP policy (replay store, proof age, allowed algorithms, required flag) is configured on the wrapped `*resource.Resource` via `verifier.WithInboundDPoP(...)` passed in `Options.VerifierOptions`. See the [http user guide §7](../../http/docs/user-guide.md#7-dpop-sender-constrained-tokens) for the full DPoP recipe; everything there applies here.
+`AuthMiddleware` accepts both `Authorization: Bearer …` and `Authorization: DPoP …` schemes — that comes from the wrappedded `*authplanehttp.Adapter`. Inbound DPoP policy (replay store, proof age, allowed algorithms, required flag) is configured on the wrapped `*resource.Resource` via `verifier.WithInboundDPoP(...)` passed in `Options.VerifierOptions`. See the [http user guide §7](../../http/docs/user-guide.md#7-dpop-sender-constrained-tokens) for the full DPoP recipe; everything there applies here.
 
 Outbound DPoP (signing token requests to the AS) is configured on the client via `authplane.WithDPoP(km)` in `Options.ClientOptions` and is independent of the inbound middleware — see the [core user guide](../../core/docs/user-guide.md).
 
@@ -413,15 +415,12 @@ defer client.Close()
 resA, _ := client.Resource("https://mcp.example.com/mcp-a", resource.WithScopes("tools/a"))
 resB, _ := client.Resource("https://mcp.example.com/mcp-b", resource.WithScopes("tools/b"))
 
-adapterA, _ := authplanemark3labs.NewAdapterFromClientAndResource(client, resA)
-adapterB, _ := authplanemark3labs.NewAdapterFromClientAndResource(client, resB)
-// Do NOT defer adapterA.Close() or adapterB.Close() — they would both call client.Close().
+adapterA, _ := authplanemark3labs.NewAdapterFromClientAndResource(client, resA, authplanemark3labs.SessionOptions{})
+adapterB, _ := authplanemark3labs.NewAdapterFromClientAndResource(client, resB, authplanemark3labs.SessionOptions{})
+// adapterA.Close() and adapterB.Close() do not close the shared client: close it yourself.
 ```
 
-One `*authplane.Client` can back many resources and adapters. When you use `NewAdapterFromClientAndResource`, the adapter still calls `client.Close()` on its own `Close()`, so either:
-
-- Use `adapter.Close()` on exactly one adapter per client, or
-- Call `client.Close()` yourself and let adapters go out of scope.
+One `*authplane.Client` can back many resources and adapters. An adapter built with `NewAdapterFromClientAndResource` does not own the client, so call `client.Close()` yourself once every adapter is finished.
 
 ## 11. Development mode
 
@@ -434,7 +433,7 @@ adapter, err := authplanemark3labs.NewAdapter(ctx, authplanemark3labs.Options{
 })
 ```
 
-`DevMode: true` relaxes the SDK's SSRF defenses: HTTP (non-TLS) issuers, `localhost`, private networks, and link-local addresses are allowed. It is also honored via the `AUTHPLANE_DEV_MODE=1` environment variable as a fallback.
+`DevMode: true` relaxes the SDK's SSRF defenses: HTTP (non-TLS) issuers, `localhost`, private networks, and link-local addresses are allowed.
 
 Do not enable `DevMode` in production. Metadata discovery and JWKS fetching are the primary attack surface the setting loosens.
 
@@ -473,7 +472,7 @@ if err != nil {
 defer adapter.Close() // stops JWKS/metadata refresh goroutines, closes the client
 ```
 
-`Close()` is safe to call multiple times and always calls `client.Close()`. See §10 for the shared-client nuance.
+`Close()` is safe to call multiple times. It closes the client only for an adapter built with `NewAdapter`. See §10.
 
 ## 14. See also
 
@@ -481,3 +480,17 @@ defer adapter.Close() // stops JWKS/metadata refresh goroutines, closes the clie
 - [Official MCP Go SDK adapter](../../mcp/docs/user-guide.md) — same SDK, different MCP library (`modelcontextprotocol/go-sdk`). Use that one if you're already on the official SDK.
 - [HTTP adapter user guide](../../http/docs/user-guide.md) — parallel middleware for plain HTTP resource servers, including DPoP inbound verification.
 - [`demo/`](../demo/) — runnable Calculator Service with introspection-backed revocation and per-tool scope enforcement.
+
+## Sessions and step-up
+
+`AuthMiddleware` binds legacy sessions to the user: a session ID must be minted for the caller's OAuth client and `sub` together. Add `server.WithSessionIdManagerResolver(adapter.SessionManager())` to the streamable server. A server without it gets every session refused, with a log line naming the fix. `Options.AllowUnboundSessions` opts out. Replicas share `Options.SessionKey`, at least 32 bytes; empty means a random per-process key. Requests on protocol 2026-07-28 have no sessions. `server.SSEServer` is not supported behind this middleware.
+
+`RequireToolScopes` goes inside `AuthMiddleware`. Pass `RefuseUnlistedTools()` to answer 403 for a tool not in the map. A legacy session binds to the OAuth client and the subject together. It answers a `tools/call` missing a required scope with 403 and an `insufficient_scope` challenge before the tool runs.
+
+## Other authorization servers
+
+This adapter takes the server-neutral options of `core` through `resource.WithVerifierOptions`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience`. See [Using another authorization server](../../core/docs/user-guide.md#using-another-authorization-server).
+
+## Known upstream issue
+
+mcp-go v1.5.0 has an advisory with no fix yet, GO-2026-6911, on how its client follows a `Location` header. This adapter uses mcp-go's server side and does not reach that code, which `govulncheck` confirms. Do not build an mcp-go client in the same program on the strength of this adapter's check.

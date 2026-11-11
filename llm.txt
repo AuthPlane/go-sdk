@@ -78,8 +78,7 @@ For a runnable end-to-end example see `http/demo/` (net/http resource server),
   breaker, DPoP signer. Construct with `NewClient`; tear down with `Close()`.
 - `authplane.FetchSettings` — SSRF / HTTP transport tuning. Use
   `DefaultFetchSettings()` (production) or `DevModeFetchSettings()` (local
-  dev) and pass via `WithFetchSettings(...)`. Env var
-  `AUTHPLANE_DEV_MODE=1` selects dev settings without code changes.
+  dev) and pass via `WithFetchSettings(...)`.
 - `resource.Resource` — protected-resource facade. Verifies tokens via
   `VerifyToken(ctx, token, opts...)`; emits RFC 9728 PRM via `PRMJSON()` /
   `WellKnownPRMPath()`.
@@ -95,11 +94,17 @@ For a runnable end-to-end example see `http/demo/` (net/http resource server),
 
 ## Go version floor
 
-- `core/`, `http/`: Go 1.24+.
-- `mcp/`: Go 1.25+ (forced by `github.com/modelcontextprotocol/go-sdk`).
-- `mark3labs/`: Go 1.25+ (forced by `github.com/mark3labs/mcp-go`).
+- All modules: Go 1.26+.
 
 ## Cross-repo references
 
 - Authplane authorization server: `https://github.com/AuthPlane/authserver`
 - Conformance catalog: `https://github.com/AuthPlane/conformance`
+
+## Other servers, MCP 2026-07-28 and 0.5 changes
+
+- Verifier options for other authorization servers: `WithAcceptedTokenTypes`, `TokenTypeNone`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers`, `WithExpectedAudience`, `WithScopeImplication`. See `core/docs/user-guide.md`.
+- `Client.Metadata` returns discovered metadata. `ClientAuthPrivateKeyJWT`, `Client.JWTBearer` and `authorization_details` are supported. `WithJWKSMaxStale` limits trust in stale keys. `FetchSettings.RootCAs` trusts a private CA.
+- `mcp`: a handler needs `&mcp.StreamableHTTPOptions{Stateless: true}` to speak protocol 2026-07-28. Add `server.AddReceivingMiddleware(adapter.ReceivingMiddleware())`, or `ClaimsFromContext` reads nil on later calls in a legacy session. `RequireToolScopes` gives a 403 step-up.
+- `mark3labs`: add `server.WithSessionIdManagerResolver(adapter.SessionManager())`, or sessions answer 404.
+- `http` issuers need settings that allow HTTP. `WithVerifierOptions` accumulates. `WithInboundDPoP` checks replay by default.

@@ -13,21 +13,29 @@ var (
 	//
 	// authplane.ErrInvalidIssuer is an alias of this value, so errors.Is
 	// matches regardless of which boundary rejected the identifier.
-	ErrInvalidIssuer      = errors.New("verifier: invalid issuer")
-	ErrTokenMissing       = errors.New("verifier: token missing")
-	ErrTokenExpired       = errors.New("verifier: token expired")
-	ErrInvalidSignature   = errors.New("verifier: invalid signature")
-	ErrInvalidClaims      = errors.New("verifier: invalid claims")
-	ErrIssuerMismatch     = errors.New("verifier: issuer mismatch")
-	ErrAudienceMismatch   = errors.New("verifier: audience mismatch")
-	ErrInsufficientScope  = errors.New("verifier: insufficient scope")
-	ErrTokenRevoked       = errors.New("verifier: token revoked")
-	ErrJWKSUnavailable    = errors.New("verifier: JWKS unavailable")
-	ErrSSRFBlocked        = errors.New("verifier: SSRF blocked")
-	ErrDPoPRequired       = errors.New("verifier: DPoP required")
-	ErrDPoPInvalid        = errors.New("verifier: DPoP invalid")
-	ErrDPoPKeyMismatch    = errors.New("verifier: DPoP key mismatch")
-	ErrDPoPReplayDetected = errors.New("verifier: DPoP replay detected")
+	ErrInvalidIssuer     = errors.New("verifier: invalid issuer")
+	ErrTokenMissing      = errors.New("verifier: token missing")
+	ErrTokenExpired      = errors.New("verifier: token expired")
+	ErrInvalidSignature  = errors.New("verifier: invalid signature")
+	ErrInvalidClaims     = errors.New("verifier: invalid claims")
+	ErrIssuerMismatch    = errors.New("verifier: issuer mismatch")
+	ErrAudienceMismatch  = errors.New("verifier: audience mismatch")
+	ErrInsufficientScope = errors.New("verifier: insufficient scope")
+	ErrTokenRevoked      = errors.New("verifier: token revoked")
+	// ErrDPoPReplayStoreUnavailable: the replay store could not answer or is full, so the
+	// proof cannot be accepted. A flood filling the store refuses proofs until entries
+	// expire, rather than evicting the record that would catch a replay.
+	ErrDPoPReplayStoreUnavailable = errors.New("verifier: DPoP replay store unavailable")
+	// ErrRevocationUnavailable: a fail-closed verifier could not run its revocation check.
+	ErrRevocationUnavailable = errors.New("verifier: revocation check unavailable")
+	// ErrRevocationNotSupported is what a RevocationChecker returns when the server offers
+	// no way to check. A fail-open verifier then accepts without logging on every request.
+	ErrRevocationNotSupported = errors.New("verifier: revocation check not supported")
+	ErrJWKSUnavailable        = errors.New("verifier: JWKS unavailable")
+	ErrDPoPRequired           = errors.New("verifier: DPoP required")
+	ErrDPoPInvalid            = errors.New("verifier: DPoP invalid")
+	ErrDPoPKeyMismatch        = errors.New("verifier: DPoP key mismatch")
+	ErrDPoPReplayDetected     = errors.New("verifier: DPoP replay detected")
 	// ErrMultipleDpopProofs is returned when an inbound request carries more
 	// than one DPoP HTTP header. RFC 9449 §4.3 #1 is a MUST-level
 	// receiving-server check; the spec-correct response per §7.1 is HTTP 401
@@ -47,5 +55,4 @@ var (
 	// resource requires DPoP but the request did not satisfy the requirement.
 	ErrDPoPNotSupported    = errors.New("verifier: DPoP not supported by this resource")
 	ErrMetadataUnavailable = errors.New("verifier: metadata unavailable")
-	ErrProtocolError       = errors.New("verifier: protocol error")
 )

@@ -92,7 +92,7 @@ func TestClientAndResourceAccessors(t *testing.T) {
 func TestNewAdapterFromClientAndResource(t *testing.T) {
 	e := newTestEnv(t)
 
-	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource())
+	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource(), authplanemark3labs.SessionOptions{})
 	if err != nil {
 		t.Fatalf("NewAdapterFromClientAndResource: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestNewAdapterFromClientAndResource(t *testing.T) {
 func TestNewAdapterFromClientAndResource_CloseDoesNotCloseSharedClient(t *testing.T) {
 	e := newTestEnv(t)
 
-	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource())
+	adapter2, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), e.adapter.Resource(), authplanemark3labs.SessionOptions{})
 	if err != nil {
 		t.Fatalf("NewAdapterFromClientAndResource: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestNewAdapterFromClientAndResource_CloseDoesNotCloseSharedClient(t *testin
 // yields a clear error rather than a panic — the constructor's signature
 // matches the sibling mcp adapter.
 func TestNewAdapterFromClientAndResourceNilClient(t *testing.T) {
-	_, err := authplanemark3labs.NewAdapterFromClientAndResource(nil, nil)
+	_, err := authplanemark3labs.NewAdapterFromClientAndResource(nil, nil, authplanemark3labs.SessionOptions{})
 	if err == nil {
 		t.Fatal("expected error on nil client")
 	}
@@ -150,7 +150,7 @@ func TestNewAdapterFromClientAndResourceNilClient(t *testing.T) {
 func TestNewAdapterFromClientAndResourceNilResource(t *testing.T) {
 	e := newTestEnv(t)
 
-	_, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), nil)
+	_, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), nil, authplanemark3labs.SessionOptions{})
 	if err == nil {
 		t.Fatal("expected error on nil resource")
 	}

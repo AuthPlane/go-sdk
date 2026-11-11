@@ -11,10 +11,10 @@ func TestSentinelErrors_AreDistinct(t *testing.T) {
 		ErrTokenMissing, ErrTokenExpired, ErrInvalidSignature,
 		ErrInvalidClaims, ErrIssuerMismatch, ErrAudienceMismatch,
 		ErrInsufficientScope, ErrTokenRevoked, ErrJWKSUnavailable,
-		ErrSSRFBlocked, ErrDPoPRequired, ErrDPoPInvalid,
+		ErrDPoPRequired, ErrDPoPInvalid,
 		ErrDPoPKeyMismatch, ErrDPoPReplayDetected,
 		ErrDPoPNotSupported,
-		ErrMetadataUnavailable, ErrProtocolError,
+		ErrMetadataUnavailable,
 	}
 	for i, a := range sentinels {
 		for j, b := range sentinels {
@@ -37,54 +37,5 @@ func TestSentinelErrors_DoubleWrapping(t *testing.T) {
 	outer := fmt.Errorf("outer: %w", inner)
 	if !errors.Is(outer, ErrInsufficientScope) {
 		t.Error("double-wrapped error should match ErrInsufficientScope")
-	}
-}
-
-func TestStringOrSlice_UnmarshalString(t *testing.T) {
-	var s StringOrSlice
-	if err := s.UnmarshalJSON([]byte(`"single"`)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(s) != 1 || s[0] != "single" {
-		t.Errorf("expected [single], got %v", s)
-	}
-}
-
-func TestStringOrSlice_UnmarshalArray(t *testing.T) {
-	var s StringOrSlice
-	if err := s.UnmarshalJSON([]byte(`["a","b"]`)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(s) != 2 || s[0] != "a" || s[1] != "b" {
-		t.Errorf("expected [a b], got %v", s)
-	}
-}
-
-func TestStringOrSlice_UnmarshalInvalid(t *testing.T) {
-	var s StringOrSlice
-	if err := s.UnmarshalJSON([]byte(`123`)); err == nil {
-		t.Error("expected error for non-string, non-array")
-	}
-}
-
-func TestStringOrSlice_MarshalSingle(t *testing.T) {
-	s := StringOrSlice{"only"}
-	data, err := s.MarshalJSON()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != `"only"` {
-		t.Errorf("expected \"only\", got %s", data)
-	}
-}
-
-func TestStringOrSlice_MarshalMultiple(t *testing.T) {
-	s := StringOrSlice{"a", "b"}
-	data, err := s.MarshalJSON()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if string(data) != `["a","b"]` {
-		t.Errorf("expected [\"a\",\"b\"], got %s", data)
 	}
 }

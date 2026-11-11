@@ -110,8 +110,48 @@ func newTestEnvWith(t *testing.T, resourceMetadataURL string, scopes ...string) 
 	return &testEnv{adapter: adapter, key: key, ecKey: ecKey, issuer: srv.URL, kid: kid, ecKid: ecKid}
 }
 
+// newTestEnvWithOptions is newTestEnv with an adapter built from adjusted Options.
+func newTestEnvWithOptions(t *testing.T, adjust func(*authplanemark3labs.Options)) *testEnv {
+	t.Helper()
+	return newTestEnv(t).sibling(t, adjust)
+}
+
+// sibling is the same environment with a second adapter on the same authorization server.
+func (e *testEnv) sibling(t *testing.T, adjust func(*authplanemark3labs.Options)) *testEnv {
+	t.Helper()
+	opts := authplanemark3labs.Options{Issuer: e.issuer, Resource: testResource, DevMode: true}
+	adjust(&opts)
+	adapter, err := authplanemark3labs.NewAdapter(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+	t.Cleanup(func() { adapter.Close() })
+	other := *e
+	other.adapter = adapter
+	return &other
+}
+
+// newAdapterErr returns the error from building an adapter with adjusted Options.
+func newAdapterErr(t *testing.T, adjust func(*authplanemark3labs.Options)) error {
+	t.Helper()
+	e := newTestEnv(t)
+	opts := authplanemark3labs.Options{Issuer: e.issuer, Resource: testResource, DevMode: true}
+	adjust(&opts)
+	adapter, err := authplanemark3labs.NewAdapter(context.Background(), opts)
+	if err == nil {
+		adapter.Close()
+	}
+	return err
+}
+
 // makeToken signs a minimal RS256 JWT (typ=at+jwt) using only stdlib crypto.
 func (e *testEnv) makeToken(t *testing.T, scopes []string, exp time.Time) string {
+	t.Helper()
+	return e.makeTokenFor(t, "user-test", scopes, exp)
+}
+
+// makeTokenFor is makeToken for a chosen subject.
+func (e *testEnv) makeTokenFor(t *testing.T, sub string, scopes []string, exp time.Time) string {
 	t.Helper()
 
 	headerJSON := mustMarshal(t, map[string]string{
@@ -122,7 +162,7 @@ func (e *testEnv) makeToken(t *testing.T, scopes []string, exp time.Time) string
 	claimsJSON := mustMarshal(t, map[string]any{
 		"iss":       e.issuer,
 		"aud":       testResource,
-		"sub":       "user-test",
+		"sub":       sub,
 		"jti":       "jti-test",
 		"client_id": testResource, // required by authplane verifier
 		"iat":       time.Now().Unix(),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,9 @@ import (
 
 	"github.com/authplane/go-sdk/core/resource"
 	"github.com/authplane/go-sdk/core/resource/verifier"
+	"github.com/authplane/go-sdk/core/testutil"
 	"github.com/authplane/go-sdk/http/pkg/authplanehttp"
+	"github.com/go-jose/go-jose/v4"
 )
 
 // Context tests
@@ -919,5 +922,191 @@ func TestWriteAuthError_EmitsTheSuppressedDiagnostic(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), verifier.ErrTokenMissing.Error()) {
 		t.Errorf("response body = %q; the verifier message must stay out of it", rec.Body.String())
+	}
+}
+
+// The middleware answers the metadata path itself. A next handler that does not
+// route by path must never run there without a token.
+func TestMiddlewareNeverCallsNextOnPRMPath_A32_A33(t *testing.T) {
+	e := newTestEnv(t)
+	ran := false
+	handler := e.adapter.Middleware()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ran = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	for _, tt := range []struct {
+		method    string
+		wantCode  int
+		wantAllow bool
+		wantBody  bool
+	}{
+		{http.MethodGet, http.StatusOK, false, true},
+		{http.MethodHead, http.StatusOK, false, false},
+		{http.MethodOptions, http.StatusNoContent, true, false},
+		{http.MethodPost, http.StatusMethodNotAllowed, true, false},
+		{http.MethodDelete, http.StatusMethodNotAllowed, true, false},
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			ran = false
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), tt.method, e.adapter.WellKnownPRMPath(), nil))
+			if rec.Code != tt.wantCode {
+				t.Errorf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+			if ran {
+				t.Error("next handler ran on the metadata path")
+			}
+			if got := rec.Header().Get("Allow"); tt.wantAllow && got != "GET, HEAD, OPTIONS" {
+				t.Errorf("Allow = %q", got)
+			}
+			if tt.wantBody && !strings.Contains(rec.Body.String(), `"resource"`) {
+				t.Errorf("body = %q, want the document", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMiddleware_OutageLogsAtError(t *testing.T) {
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(old)
+
+	const uri = "https://api.example.com/mcp"
+	const issuer = "https://as.example.com"
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		DefaultTTL: time.Hour,
+		FetchFn: func(context.Context) ([]byte, map[string][]string, error) {
+			return nil, nil, errors.New("down")
+		},
+	})
+	t.Cleanup(jc.Close)
+	res, err := resource.New(uri, issuer, jc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := testutil.SignTokenWithClaims(key, jose.ES256, "k", issuer, uri, "u", "c", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.Middleware()(okHandler()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("logs = %q", logs.String())
+	}
+}
+
+func TestMiddleware_DepartedCallerNotLoggedAsOutage_A85(t *testing.T) {
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(old)
+
+	const uri = "https://api.example.com/mcp"
+	const issuer = "https://as.example.com"
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		DefaultTTL: time.Hour,
+		FetchFn: func(context.Context) ([]byte, map[string][]string, error) {
+			return nil, nil, errors.New("down")
+		},
+	})
+	t.Cleanup(jc.Close)
+	res, err := resource.New(uri, issuer, jc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := testutil.GenerateES256Key()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := testutil.SignTokenWithClaims(key, jose.ES256, "k", issuer, uri, "u", "c", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gone, cancel := context.WithCancel(t.Context())
+	cancel()
+	req := httptest.NewRequestWithContext(gone, http.MethodGet, "/mcp", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.Middleware()(okHandler()).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("logs = %q", logs.String())
+	}
+}
+
+// The DPoP scheme with an unbound token is refused, with no proof or without DPoP support.
+func TestMiddleware_DPoPSchemeNeedsABoundToken_A95(t *testing.T) {
+	for name, env := range map[string]*testEnv{
+		"bearer-only": newTestEnv(t),
+		"dpop":        newTestEnvWithOptions(t, resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{}))),
+	} {
+		t.Run(name, func(t *testing.T) {
+			token := env.makeToken(t, []string{"tools/add"}, time.Now().Add(time.Hour))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:8080/mcp/add", nil)
+			req.Header.Set("Authorization", "DPoP "+token)
+			rec := httptest.NewRecorder()
+			env.adapter.Middleware()(okHandler()).ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+func TestNew_RefusesNilResource_A96(t *testing.T) {
+	if _, err := authplanehttp.New(nil); err == nil {
+		t.Error("want an error")
+	}
+}
+
+// The policy must reach the wire through the adapter, not only through the core function.
+func TestMiddleware_ChallengeCarriesTheDPoPPolicy_A95(t *testing.T) {
+	env := newTestEnvWithOptions(t, resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{Required: true})))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:8080/mcp/add", nil)
+	rec := httptest.NewRecorder()
+	env.adapter.Middleware()(okHandler()).ServeHTTP(rec, req)
+	challenge := rec.Header().Get("WWW-Authenticate")
+	if rec.Code != http.StatusUnauthorized || !strings.HasPrefix(challenge, "DPoP ") || !strings.Contains(challenge, `algs="`) {
+		t.Errorf("status %d, challenge %q", rec.Code, challenge)
+	}
+}
+
+func TestWithLogger_ReceivesAdapterLogs_A102(t *testing.T) {
+	env := newTestEnv(t)
+	var logs bytes.Buffer
+	adapter, err := authplanehttp.New(env.adapter.Resource(), authplanehttp.WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost:8080/mcp/add", nil)
+	req.Header.Set("Authorization", "Bearer garbage")
+	adapter.Middleware()(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(logs.String(), "rejecting request") {
+		t.Errorf("logs = %q", logs.String())
 	}
 }

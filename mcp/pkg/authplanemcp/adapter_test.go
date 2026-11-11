@@ -198,7 +198,7 @@ func TestAuthMiddlewareExpiredTokenReturns401(t *testing.T) {
 // TestProtectedResourceMetadataHandler verifies the PRM handler.
 func TestProtectedResourceMetadataHandler(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	t.Run("GET returns JSON", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -291,7 +291,7 @@ func TestAuthMiddlewareES256Token(t *testing.T) {
 // sets a Cache-Control header on GET responses.
 func TestProtectedResourceMetadataHandlerCacheControl(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/.well-known/oauth-protected-resource", nil))

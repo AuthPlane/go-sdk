@@ -20,13 +20,12 @@ func testClaims() map[string]any {
 		"agent_chain": []any{"agent-1", "agent-2"},
 		"cnf":         map[string]any{"jkt": "thumb-abc"},
 		"act":         map[string]any{"sub": "delegator"},
-		"may_act":     map[string]any{"sub": "potential-actor"},
 		"custom":      "value",
 	}
 }
 
 func TestVerifiedClaims_BasicAccessors(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid-1")
+	c := parseClaims(testClaims(), "kid-1")
 
 	if c.Sub() != "user-123" {
 		t.Errorf("Sub: expected 'user-123', got %q", c.Sub())
@@ -55,7 +54,7 @@ func TestVerifiedClaims_BasicAccessors(t *testing.T) {
 }
 
 func TestVerifiedClaims_Scopes(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	scopes := c.Scopes()
 	if len(scopes) != 3 {
 		t.Fatalf("expected 3 scopes, got %d", len(scopes))
@@ -66,7 +65,7 @@ func TestVerifiedClaims_Scopes(t *testing.T) {
 }
 
 func TestVerifiedClaims_Scopes_ReturnsCopy(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	scopes := c.Scopes()
 	scopes[0] = "MUTATED"
 	if c.Scopes()[0] == "MUTATED" {
@@ -75,7 +74,7 @@ func TestVerifiedClaims_Scopes_ReturnsCopy(t *testing.T) {
 }
 
 func TestVerifiedClaims_Audience(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	aud := c.Audience()
 	if len(aud) != 1 || aud[0] != "https://api.example.com" {
 		t.Errorf("unexpected audience: %v", aud)
@@ -85,7 +84,7 @@ func TestVerifiedClaims_Audience(t *testing.T) {
 func TestVerifiedClaims_Audience_Array(t *testing.T) {
 	raw := testClaims()
 	raw["aud"] = []any{"aud1", "aud2"}
-	c := ParseClaims(raw, "kid")
+	c := parseClaims(raw, "kid")
 	aud := c.Audience()
 	if len(aud) != 2 || aud[0] != "aud1" || aud[1] != "aud2" {
 		t.Errorf("unexpected audience: %v", aud)
@@ -93,7 +92,7 @@ func TestVerifiedClaims_Audience_Array(t *testing.T) {
 }
 
 func TestVerifiedClaims_Audience_ReturnsCopy(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	aud := c.Audience()
 	aud[0] = "MUTATED"
 	if c.Audience()[0] == "MUTATED" {
@@ -102,7 +101,7 @@ func TestVerifiedClaims_Audience_ReturnsCopy(t *testing.T) {
 }
 
 func TestVerifiedClaims_AgentChain(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	chain := c.AgentChain()
 	if len(chain) != 2 || chain[0] != "agent-1" || chain[1] != "agent-2" {
 		t.Errorf("unexpected agent chain: %v", chain)
@@ -110,7 +109,7 @@ func TestVerifiedClaims_AgentChain(t *testing.T) {
 }
 
 func TestVerifiedClaims_HasScope(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if !c.HasScope("read") {
 		t.Error("expected HasScope('read') = true")
 	}
@@ -120,7 +119,7 @@ func TestVerifiedClaims_HasScope(t *testing.T) {
 }
 
 func TestVerifiedClaims_RequireScope(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if err := c.RequireScope("read"); err != nil {
 		t.Errorf("RequireScope('read') should succeed: %v", err)
 	}
@@ -139,7 +138,7 @@ func TestVerifiedClaims_RequireScope_EnrichedErrorString(t *testing.T) {
 	// rich shape. Pin the message so a future refactor that reverts the
 	// delegation (or changes the format) fails this test instead of
 	// silently regressing what the resource server logs.
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	err := c.RequireScope("delete")
 	if err == nil {
 		t.Fatal("RequireScope('delete') should fail")
@@ -166,7 +165,7 @@ func TestVerifiedClaims_RequireScopes_EmptyInputIsNoOp(t *testing.T) {
 	// `(*Adapter).RequireScopes(...)` semantic in http/pkg/authplanehttp.
 	// A handler that calls `claims.RequireScopes()` with no args should
 	// not need to special-case the empty-slice path.
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if err := c.RequireScopes(); err != nil {
 		t.Errorf("RequireScopes() (no args) should be a no-op, got %v", err)
 	}
@@ -177,14 +176,14 @@ func TestVerifiedClaims_RequireScopes_EmptyInputIsNoOp(t *testing.T) {
 
 func TestVerifiedClaims_RequireScopes_AllPresent(t *testing.T) {
 	// testClaims() carries "read write admin". The union must succeed.
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if err := c.RequireScopes("read", "write", "admin"); err != nil {
 		t.Errorf("RequireScopes('read', 'write', 'admin') should succeed: %v", err)
 	}
 }
 
 func TestVerifiedClaims_RequireScopes_SingleMissing(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	err := c.RequireScopes("read", "delete")
 	if err == nil {
 		t.Fatal("RequireScopes('read', 'delete') should fail")
@@ -206,7 +205,7 @@ func TestVerifiedClaims_RequireScopes_SingleMissing(t *testing.T) {
 }
 
 func TestVerifiedClaims_RequireScopes_MultipleMissing(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	// Both "delete" and "billing" are NOT in the test fixture (which has
 	// "read write admin"), so both must be reported.
 	err := c.RequireScopes("delete", "billing")
@@ -237,7 +236,7 @@ func TestVerifiedClaims_RequireScopes_NoScopesToken(t *testing.T) {
 		"iat":       float64(1_700_000_000),
 		"jti":       "jti-1",
 	}
-	c := ParseClaims(raw, "kid")
+	c := parseClaims(raw, "kid")
 	err := c.RequireScopes("read")
 	if err == nil {
 		t.Fatal("expected RequireScopes('read') to fail on a scope-less token")
@@ -248,7 +247,7 @@ func TestVerifiedClaims_RequireScopes_NoScopesToken(t *testing.T) {
 }
 
 func TestVerifiedClaims_HasClaim(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if !c.HasClaim("custom") {
 		t.Error("expected HasClaim('custom') = true")
 	}
@@ -258,7 +257,7 @@ func TestVerifiedClaims_HasClaim(t *testing.T) {
 }
 
 func TestVerifiedClaims_HasClaimValue(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if !c.HasClaimValue("custom", "value") {
 		t.Error("expected HasClaimValue('custom', 'value') = true")
 	}
@@ -268,7 +267,7 @@ func TestVerifiedClaims_HasClaimValue(t *testing.T) {
 }
 
 func TestVerifiedClaims_Claim(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if c.Claim("custom") != "value" {
 		t.Errorf("expected 'value', got %v", c.Claim("custom"))
 	}
@@ -278,7 +277,7 @@ func TestVerifiedClaims_Claim(t *testing.T) {
 }
 
 func TestVerifiedClaims_DPoP(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	if !c.IsDPoPBound() {
 		t.Error("expected IsDPoPBound() = true")
 	}
@@ -289,7 +288,7 @@ func TestVerifiedClaims_DPoP(t *testing.T) {
 
 func TestVerifiedClaims_DPoP_NoCnf(t *testing.T) {
 	raw := map[string]any{"sub": "user"}
-	c := ParseClaims(raw, "kid")
+	c := parseClaims(raw, "kid")
 	if c.IsDPoPBound() {
 		t.Error("expected IsDPoPBound() = false without cnf")
 	}
@@ -299,25 +298,15 @@ func TestVerifiedClaims_DPoP_NoCnf(t *testing.T) {
 }
 
 func TestVerifiedClaims_Act(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	act := c.Act()
 	if act["sub"] != "delegator" {
 		t.Errorf("expected act.sub = 'delegator', got %v", act["sub"])
 	}
 }
 
-// TestVerifiedClaims_MayAct keeps the deprecated accessor honest until it
-// is removed: a token that still carries may_act is parsed unchanged.
-func TestVerifiedClaims_MayAct(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
-	mayAct := c.MayAct() //nolint:staticcheck // deprecated accessor kept until the next minor
-	if mayAct["sub"] != "potential-actor" {
-		t.Errorf("expected may_act.sub = 'potential-actor', got %v", mayAct["sub"])
-	}
-}
-
 func TestVerifiedClaims_Raw_ReturnsCopy(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	raw := c.Raw()
 	raw["MUTATED"] = true
 	if c.Raw()["MUTATED"] != nil {
@@ -326,7 +315,7 @@ func TestVerifiedClaims_Raw_ReturnsCopy(t *testing.T) {
 }
 
 func TestVerifiedClaims_Cnf_ReturnsCopy(t *testing.T) {
-	c := ParseClaims(testClaims(), "kid")
+	c := parseClaims(testClaims(), "kid")
 	cnf := c.Cnf()
 	cnf["MUTATED"] = true
 	if c.Cnf()["MUTATED"] != nil {
@@ -336,7 +325,7 @@ func TestVerifiedClaims_Cnf_ReturnsCopy(t *testing.T) {
 
 func TestParseClaims_MissingFields(t *testing.T) {
 	raw := map[string]any{}
-	c := ParseClaims(raw, "")
+	c := parseClaims(raw, "")
 	if c.Sub() != "" {
 		t.Error("expected empty Sub for missing claim")
 	}

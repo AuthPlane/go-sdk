@@ -2,6 +2,7 @@
 package verifier
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -10,6 +11,8 @@ import (
 
 // VerifiedClaims holds the validated claims from a JWT access token.
 // All fields are unexported; use accessor methods to read values.
+// Every method is safe on a nil receiver: it returns the zero value, and nil claims
+// hold no scopes, so a handler that got no claims refuses rather than crashes.
 // Returned slices and maps are copies to prevent mutation.
 type VerifiedClaims struct {
 	sub        string
@@ -26,78 +29,165 @@ type VerifiedClaims struct {
 	notBefore  int64
 	cnf        map[string]any
 	act        map[string]any
-	mayAct     map[string]any
 	raw        map[string]any
 	dpopProof  *VerifiedDPoPProof
+	implies    func(granted, required string) bool
 }
 
 // Sub returns the subject (sub) claim.
-func (c *VerifiedClaims) Sub() string { return c.sub }
+func (c *VerifiedClaims) Sub() string {
+	if c == nil {
+		return ""
+	}
+	return c.sub
+}
 
 // ClientID returns the client_id claim.
-func (c *VerifiedClaims) ClientID() string { return c.clientID }
+func (c *VerifiedClaims) ClientID() string {
+	if c == nil {
+		return ""
+	}
+	return c.clientID
+}
 
 // Issuer returns the issuer (iss) claim.
-func (c *VerifiedClaims) Issuer() string { return c.issuer }
+func (c *VerifiedClaims) Issuer() string {
+	if c == nil {
+		return ""
+	}
+	return c.issuer
+}
 
 // JTI returns the JWT ID (jti) claim.
-func (c *VerifiedClaims) JTI() string { return c.jti }
+func (c *VerifiedClaims) JTI() string {
+	if c == nil {
+		return ""
+	}
+	return c.jti
+}
 
 // KID returns the key ID from the JWT header.
-func (c *VerifiedClaims) KID() string { return c.kid }
+func (c *VerifiedClaims) KID() string {
+	if c == nil {
+		return ""
+	}
+	return c.kid
+}
 
 // AgentID returns the agent_id claim.
-func (c *VerifiedClaims) AgentID() string { return c.agentID }
+func (c *VerifiedClaims) AgentID() string {
+	if c == nil {
+		return ""
+	}
+	return c.agentID
+}
 
 // ExpiresAt returns the expiration time (exp) claim as Unix seconds.
-func (c *VerifiedClaims) ExpiresAt() int64 { return c.expiresAt }
+func (c *VerifiedClaims) ExpiresAt() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.expiresAt
+}
 
 // IssuedAt returns the issued-at (iat) claim as Unix seconds.
-func (c *VerifiedClaims) IssuedAt() int64 { return c.issuedAt }
+func (c *VerifiedClaims) IssuedAt() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.issuedAt
+}
 
 // NotBefore returns the not-before (nbf) claim as Unix seconds.
-func (c *VerifiedClaims) NotBefore() int64 { return c.notBefore }
+func (c *VerifiedClaims) NotBefore() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.notBefore
+}
 
 // Scopes returns a copy of the token's scopes.
 func (c *VerifiedClaims) Scopes() []string {
+	if c == nil {
+		return nil
+	}
 	return slices.Clone(c.scopes)
 }
 
 // Audience returns a copy of the audience (aud) claim.
 func (c *VerifiedClaims) Audience() []string {
+	if c == nil {
+		return nil
+	}
 	return slices.Clone(c.audience)
 }
 
 // AgentChain returns a copy of the agent_chain claim.
 func (c *VerifiedClaims) AgentChain() []string {
+	if c == nil {
+		return nil
+	}
 	return slices.Clone(c.agentChain)
 }
 
 // Cnf returns a copy of the confirmation (cnf) claim.
 func (c *VerifiedClaims) Cnf() map[string]any {
+	if c == nil {
+		return nil
+	}
 	return cloneMap(c.cnf)
 }
 
 // Act returns a copy of the actor (act) claim.
 func (c *VerifiedClaims) Act() map[string]any {
+	if c == nil {
+		return nil
+	}
 	return cloneMap(c.act)
-}
-
-// MayAct returns a copy of the may_act claim (RFC 8693 §4.4).
-//
-// Deprecated: authserver 0.2.0 no longer issues may_act; removed in the next minor.
-func (c *VerifiedClaims) MayAct() map[string]any {
-	return cloneMap(c.mayAct)
 }
 
 // Raw returns a copy of the raw claims map.
 func (c *VerifiedClaims) Raw() map[string]any {
+	if c == nil {
+		return nil
+	}
 	return cloneMap(c.raw)
 }
 
-// HasScope returns true if the token has the given scope.
+// AuthorizationDetails returns the RFC 9396 authorization_details claim as raw JSON, or
+// nil when the token has none.
+func (c *VerifiedClaims) AuthorizationDetails() json.RawMessage {
+	if c == nil {
+		return nil
+	}
+	value, ok := c.raw["authorization_details"]
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// HasScope returns true if the token has the given scope, or one that implies it
+// (WithScopeImplication). Nil claims have no scopes.
 func (c *VerifiedClaims) HasScope(scope string) bool {
-	return slices.Contains(c.scopes, scope)
+	if c == nil {
+		return false
+	}
+	if slices.Contains(c.scopes, scope) {
+		return true
+	}
+	if c.implies != nil {
+		for _, granted := range c.scopes {
+			if c.implies(granted, scope) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RequireScope returns ErrInsufficientScope if the token lacks the given scope.
@@ -147,7 +237,7 @@ func (c *VerifiedClaims) RequireScopes(scopes ...string) error {
 		plural = "s"
 	}
 	available := "(none)"
-	if len(c.scopes) > 0 {
+	if c != nil && len(c.scopes) > 0 {
 		available = strings.Join(c.scopes, " ")
 	}
 	return fmt.Errorf(
@@ -176,26 +266,48 @@ func quoteAll(values []string) []string {
 
 // HasClaim returns true if the raw claims contain the given key.
 func (c *VerifiedClaims) HasClaim(key string) bool {
+	if c == nil {
+		return false
+	}
 	_, ok := c.raw[key]
 	return ok
 }
 
-// HasClaimValue returns true if the raw claims contain the given key with the given value.
+// HasClaimValue returns true if the raw claims contain the given key with the given
+// value. Values compare by their JSON form, so true does not match "true", and 1000000
+// matches whichever Go number holds it.
 func (c *VerifiedClaims) HasClaimValue(key string, value any) bool {
+	if c == nil {
+		return false
+	}
 	v, ok := c.raw[key]
 	if !ok {
 		return false
 	}
-	return fmt.Sprintf("%v", v) == fmt.Sprintf("%v", value)
+	have, err := json.Marshal(v)
+	if err != nil {
+		return false
+	}
+	want, err := json.Marshal(value)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(have, want)
 }
 
 // Claim returns the raw claim value for the given key.
 func (c *VerifiedClaims) Claim(key string) any {
-	return c.raw[key]
+	if c == nil {
+		return nil
+	}
+	return cloneValue(c.raw[key])
 }
 
 // IsDPoPBound returns true if the token has a DPoP confirmation (cnf.jkt).
 func (c *VerifiedClaims) IsDPoPBound() bool {
+	if c == nil {
+		return false
+	}
 	if c.cnf == nil {
 		return false
 	}
@@ -205,6 +317,9 @@ func (c *VerifiedClaims) IsDPoPBound() bool {
 
 // DPoPThumbprint returns the DPoP JWK thumbprint from the cnf claim.
 func (c *VerifiedClaims) DPoPThumbprint() string {
+	if c == nil {
+		return ""
+	}
 	if c.cnf == nil {
 		return ""
 	}
@@ -217,12 +332,15 @@ func (c *VerifiedClaims) DPoPThumbprint() string {
 // VerifyToken. The returned pointer references an immutable snapshot — the
 // verifier never mutates VerifiedDPoPProof after publication.
 func (c *VerifiedClaims) DPoPProof() *VerifiedDPoPProof {
+	if c == nil {
+		return nil
+	}
 	return c.dpopProof
 }
 
-// ParseClaims parses a raw claims map (from JWT payload) into VerifiedClaims.
-// kid is the key ID from the JWT header.
-func ParseClaims(raw map[string]any, kid string) *VerifiedClaims {
+// parseClaims builds VerifiedClaims from a raw claims map. It verifies nothing, so only the
+// verifier may call it, after checking the signature. kid is the key ID from the JWT header.
+func parseClaims(raw map[string]any, kid string) *VerifiedClaims {
 	c := &VerifiedClaims{
 		raw: cloneMap(raw),
 		kid: kid,
@@ -274,7 +392,6 @@ func ParseClaims(raw map[string]any, kid string) *VerifiedClaims {
 	// Parse structured claims.
 	c.cnf = parseMapClaim(raw, "cnf")
 	c.act = parseMapClaim(raw, "act")
-	c.mayAct = parseMapClaim(raw, "may_act")
 
 	return c
 }
@@ -295,8 +412,25 @@ func cloneMap(m map[string]any) map[string]any {
 	if m == nil {
 		return nil
 	}
-	data, _ := json.Marshal(m)
-	var cp map[string]any
-	_ = json.Unmarshal(data, &cp)
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = cloneValue(v)
+	}
 	return cp
+}
+
+// cloneValue copies a decoded JSON value, so a caller's write cannot reach the claims.
+func cloneValue(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		return cloneMap(typed)
+	case []any:
+		cp := make([]any, len(typed))
+		for i, item := range typed {
+			cp[i] = cloneValue(item)
+		}
+		return cp
+	default:
+		return v
+	}
 }

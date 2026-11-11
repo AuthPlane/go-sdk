@@ -1,12 +1,14 @@
+// Package authplanemcp is the auth adapter for the official MCP Go SDK: bearer token middleware,
+// RFC 9728 metadata, per-tool scopes and claims for tool handlers.
 package authplanemcp
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/authplane/go-sdk/core/authplane"
@@ -17,23 +19,36 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// claimsKey is the context key used to store VerifiedClaims for downstream handlers.
+// claimsKey is the context key for the claimsHolder of the current request.
 type claimsKey struct{}
 
-// tokenKey is the context key used to store the raw bearer token for downstream handlers.
-type tokenKey struct{}
-
-// claimsBoxKey is the context key for the per-request claimsBox used to pass
-// VerifiedClaims from the verifyToken callback to the inner handler without
-// a second VerifyToken call.
+// claimsBoxKey is the context key for the per-request claimsBox.
 type claimsBoxKey struct{}
 
-// claimsBox is a per-request mutable container that allows verifyToken to pass
-// VerifiedClaims to the inner handler through the request context. This avoids
-// a second VerifyToken call (and duplicate introspection round-trip).
+// TokenInfo.Extra keys carrying the verified claims and raw token with each request.
+const (
+	extraClaimsKey = "authplane.claims"
+	extraTokenKey  = "authplane.token"
+)
+
+// claimsBox carries the outcome of verification and the caller's response writer
+// through the MCP SDK's auth middleware.
 type claimsBox struct {
+	claims   *verifier.VerifiedClaims
+	token    string
+	err      error
+	verified bool
+	writer   http.ResponseWriter
+}
+
+// claimsHolder is what the context carries. An MCP session keeps the context of the
+// request that created it, so a value stored there outlives that request. The holder is
+// closed when its request ends, so a later call in the session reads nothing rather
+// than a token that may since have been narrowed or replaced.
+type claimsHolder struct {
 	claims *verifier.VerifiedClaims
 	token  string
+	closed atomic.Bool
 }
 
 // Options holds the configuration for creating an Adapter.
@@ -41,7 +56,9 @@ type Options struct {
 	// Required
 	Issuer   string
 	Resource string
-	Scopes   []string
+
+	// Scopes are the scopes this resource advertises. Optional.
+	Scopes []string
 
 	// ResourceMetadataURL overrides the URL advertised in the RFC 9728 §5.1
 	// resource_metadata parameter of the WWW-Authenticate challenge. Leave it
@@ -51,18 +68,16 @@ type Options struct {
 	// construction if it is not an absolute http(s) URL.
 	ResourceMetadataURL string
 
+	// Logger receives this adapter's logs. Nil means slog's default. Pass authplane.WithLogger
+	// in ClientOptions for the client's own logs.
+	Logger *slog.Logger
+
 	// DevMode relaxes SSRF protection to allow HTTP and localhost — required when
 	// the issuer runs on a local development server. Remove before deploying to production.
-	// The SDK also checks the AUTHPLANE_DEV_MODE=1 env var as a fallback.
 	DevMode bool
 
 	// ClientOptions are SDK-level options: WithClientCredentials, WithClientAuthentication,
 	// WithJWKSCacheTTL, WithCircuitBreaker, WithDPoP, etc.
-	//
-	// When WithClientCredentials or WithClientAuthentication is present, RFC 7662
-	// introspection is automatically wired as the default revocation checker.
-	// To disable it, pass verifier.WithRevocationChecker(verifier.NullRevocationChecker)
-	// in VerifierOptions.
 	ClientOptions []authplane.Option
 
 	// VerifierOptions are verifier-level options: WithAlgorithms, WithClockSkew,
@@ -74,8 +89,9 @@ type Options struct {
 // for integrating with the MCP Go SDK and the authplane authentication system.
 //
 // Always call Close() when the adapter is no longer needed to stop background
-// refresh goroutines and release HTTP connections.
+// refresh goroutines.
 type Adapter struct {
+	logger   *slog.Logger // nil means slog's default at the time
 	client   *authplane.Client
 	resource *resource.Resource
 	// resourceMetadataURL is the full URL handed to the MCP go-sdk's
@@ -89,45 +105,22 @@ type Adapter struct {
 
 // NewAdapter creates and initializes an Adapter. It calls authplane.NewClient,
 // which performs RFC 8414 AS metadata discovery and warms the JWKS cache.
-//
-// When ClientOptions includes WithClientCredentials or WithClientAuthentication,
-// RFC 7662 introspection is automatically wired as the default revocation checker,
-// and TokenExchange becomes operational.
-//
-// The provided ctx is used only for initial discovery; background refresh
-// goroutines use their own context. Call Close() when the adapter is no longer needed.
 func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
-	// Prepend dev-mode fetch settings (when requested) so explicit ClientOptions
-	// can override via their own WithFetchSettings.
-	clientOpts := make([]authplane.Option, 0, 1+len(options.ClientOptions))
-	if options.DevMode {
-		clientOpts = append(clientOpts, authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
-	}
-	clientOpts = append(clientOpts, options.ClientOptions...)
-
-	client, err := authplane.NewClient(ctx, options.Issuer, clientOpts...)
+	client, res, err := authplane.NewClientAndResource(ctx, authplane.Setup{
+		Issuer:              options.Issuer,
+		Resource:            options.Resource,
+		Scopes:              options.Scopes,
+		ResourceMetadataURL: options.ResourceMetadataURL,
+		DevMode:             options.DevMode,
+		ClientOptions:       options.ClientOptions,
+		VerifierOptions:     options.VerifierOptions,
+	})
 	if err != nil {
-		return nil, err
-	}
-
-	resourceOpts := []resource.Option{resource.WithScopes(options.Scopes...)}
-	if options.ResourceMetadataURL != "" {
-		resourceOpts = append(resourceOpts, resource.WithResourceMetadataURL(options.ResourceMetadataURL))
-	}
-	if len(options.VerifierOptions) > 0 {
-		// Only pass WithVerifierOptions when non-empty: WithVerifierOptions replaces
-		// (not appends) the verifier option list, so passing an empty slice would
-		// overwrite any options already auto-wired by client.Resource (e.g. the
-		// RFC 7662 introspection revocation checker).
-		resourceOpts = append(resourceOpts, resource.WithVerifierOptions(options.VerifierOptions...))
-	}
-	res, err := client.Resource(options.Resource, resourceOpts...)
-	if err != nil {
-		_ = client.Close()
 		return nil, err
 	}
 
 	return &Adapter{
+		logger:              options.Logger,
 		client:              client,
 		resource:            res,
 		resourceMetadataURL: res.ResourceMetadataURL(),
@@ -140,15 +133,6 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 // authplane.Client and resource.Resource. The caller retains ownership of both
 // objects and is responsible for closing the client when done — adapter.Close()
 // is a no-op for adapters created this way.
-//
-// Use this when you need to share a single client across multiple adapters, or
-// when you need full control over client and resource construction.
-//
-// Returns an error if client or res is nil. The (*Adapter, error) signature
-// mirrors NewAdapter (which legitimately fails on discovery) so the two
-// constructors stay swappable; the resource URL no longer needs parsing here
-// because resource.Resource precomputes the absolute PRM URL at construction
-// time.
 func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource) (*Adapter, error) {
 	if client == nil {
 		return nil, errors.New("authplane-mcp: client must not be nil")
@@ -166,73 +150,138 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 }
 
 // AuthMiddleware returns an HTTP handler that enforces bearer token authentication.
-//
-// It uses auth.RequireBearerToken from the MCP go-sdk so that auth.TokenInfo is
-// correctly placed in the context — the MCP streamable transport reads it for
-// session hijacking protection (binding UserID to a session).
-//
-// The MCP go-sdk has a bug where it emits an unquoted URL in the WWW-Authenticate
-// header (e.g. Bearer resource_metadata=http://...) which violates RFC 6750 §3
-// and causes MCP clients to fail discovery. httputil.WWWAuthenticateQuoter
-// intercepts the header and adds the required quotes before it reaches the client.
-//
-// The MCP go-sdk also writes no `scope` param, and RequireBearerTokenOptions
-// has no field for one — its Scopes field only enforces (403), it never
-// advertises. httputil.WWWAuthenticateScopeHint appends `scope="..."` with the
-// resource's configured scopes to every 401 (RFC 6750 §3; the MCP
-// authorization spec says the server SHOULD name them on the first challenge).
-//
-// On success the verified claims are also injected into the request context and are
-// accessible via ClaimsFromContext — allowing individual tool handlers to perform
-// fine-grained per-tool scope checks. A per-request claimsBox is used to pass
-// claims from the verifyToken callback to the inner handler without a second
-// VerifyToken call.
 func (a *Adapter) AuthMiddleware(handler http.Handler) http.Handler {
-	// inner reads the already-verified claims from the claimsBox that
-	// verifyToken populated, and injects them into context for downstream
-	// tool handlers. No second VerifyToken call is needed.
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if box, ok := r.Context().Value(claimsBoxKey{}).(*claimsBox); ok && box.claims != nil {
-			ctx := context.WithValue(r.Context(), claimsKey{}, box.claims)
-			ctx = context.WithValue(ctx, tokenKey{}, box.token)
-			r = r.WithContext(ctx)
+	inner := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		box, _ := r.Context().Value(claimsBoxKey{}).(*claimsBox)
+		if box == nil {
+			return
 		}
-		handler.ServeHTTP(w, r)
+		holder := &claimsHolder{claims: box.claims, token: box.token}
+		defer holder.closed.Store(true)
+		handler.ServeHTTP(box.writer, r.WithContext(context.WithValue(r.Context(), claimsKey{}, holder)))
 	})
 
-	// Scopes are NOT checked here — individual tool handlers enforce per-tool
-	// scope via ClaimsFromContext + RequireScope. The initialize handshake and
-	// other protocol messages must succeed with any valid token.
+	// Scopes are NOT checked here — use RequireToolScopes or per-tool checks. Protocol
+	// messages must succeed with any valid token. Core has already applied its own
+	// expiry check and clock skew, so the SDK's repeat of it must never be stricter.
 	mux := auth.RequireBearerToken(a.verifyToken, &auth.RequireBearerTokenOptions{
 		ResourceMetadataURL: a.resourceMetadataURL,
+		ClockSkew:           verifier.MaxClockSkew,
 	})(inner)
 
-	// Wrap with httputil.WWWAuthenticateQuoter to ensure the WWW-Authenticate header
-	// emitted by the MCP go-sdk is RFC 6750 §3.1 compliant, then with
-	// WWWAuthenticateScopeHint to add the scope param. The quoter runs first
-	// (outermost), so it only ever sees the bare upstream value; the hint it
-	// hands down is already a quoted-string.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Inject an empty claimsBox into context for verifyToken to populate.
-		ctx := context.WithValue(r.Context(), claimsBoxKey{}, &claimsBox{})
+		box := &claimsBox{writer: w}
+		if token := bearerToken(r); token != "" {
+			box.token = token
+			box.verified = true
+			box.claims, box.err = a.resource.VerifyToken(r.Context(), token)
+			if box.err != nil {
+				status := resource.HTTPStatus(box.err)
+				if status >= http.StatusInternalServerError {
+					// A caller who left is not an outage.
+					if !errors.Is(box.err, context.Canceled) && !errors.Is(box.err, context.DeadlineExceeded) {
+						a.log().ErrorContext(r.Context(), "authplane: cannot verify tokens", "error", box.err, "status", status)
+					}
+					a.writeError(w, box.err)
+					return
+				}
+				a.log().DebugContext(r.Context(), "authplane: rejecting request", "error", box.err, "status", status)
+			}
+		}
+		ctx := context.WithValue(r.Context(), claimsBoxKey{}, box)
 		hinted := &httputil.WWWAuthenticateScopeHint{ResponseWriter: w, Scope: a.scopeHint}
 		mux.ServeHTTP(&httputil.WWWAuthenticateQuoter{ResponseWriter: hinted}, r.WithContext(ctx))
 	})
 }
 
-// ProtectedResourceMetadataHandler returns an HTTP handler that serves the
-// Protected Resource Metadata (PRM) document as JSON per RFC 9728. Only GET
-// is allowed; other methods return 405.
-func (a *Adapter) ProtectedResourceMetadataHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+// bearerToken reads the token the way the MCP go-sdk does.
+func bearerToken(r *http.Request) string {
+	fields := strings.Fields(r.Header.Get("Authorization"))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "bearer") {
+		return ""
+	}
+	return fields[1]
+}
+
+func (a *Adapter) writeError(w http.ResponseWriter, err error) {
+	status, headers, body := a.resource.AuthErrorResponse(err, resource.WithChallengeMetadata(a.resourceMetadataURL))
+	for k, v := range headers {
+		w.Header().Set(k, v)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}
+
+// ReceivingMiddleware returns MCP middleware that gives each call the claims and token of
+// its own HTTP request, for ClaimsFromContext and TokenFromContext. Add it to the server:
+//
+//	server.AddReceivingMiddleware(adapter.ReceivingMiddleware())
+func (a *Adapter) ReceivingMiddleware() mcp.Middleware {
+	return func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			holder := &claimsHolder{claims: ClaimsFromRequest(req)}
+			if holder.claims != nil {
+				holder.token, _ = req.GetExtra().TokenInfo.Extra[extraTokenKey].(string)
+			}
+			return next(context.WithValue(ctx, claimsKey{}, holder), method, req)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "max-age=3600")
-		_, _ = w.Write(a.resource.PRMJSON())
+	}
+}
+
+// ClaimsFromRequest returns the claims verified for this request, or nil.
+func ClaimsFromRequest(req mcp.Request) *verifier.VerifiedClaims {
+	extra := req.GetExtra()
+	if extra == nil || extra.TokenInfo == nil {
+		return nil
+	}
+	claims, _ := extra.TokenInfo.Extra[extraClaimsKey].(*verifier.VerifiedClaims)
+	return claims
+}
+
+// ToolScopeOption adjusts RequireToolScopes.
+type ToolScopeOption func(*toolScopeConfig)
+
+type toolScopeConfig struct {
+	refuseUnlisted bool
+}
+
+// RefuseUnlistedTools answers 403 for a tool not in the map, so a newly added tool has no access
+// until someone decides its scopes. List a tool with no scopes to allow it for any token.
+func RefuseUnlistedTools() ToolScopeOption {
+	return func(c *toolScopeConfig) { c.refuseUnlisted = true }
+}
+
+// RequireToolScopes returns HTTP middleware, for use inside AuthMiddleware, that answers a
+// tools/call missing a required scope with 403 and an insufficient_scope challenge before
+// the tool runs, so the client can step up. See resource.ToolScopeGuard.
+func (a *Adapter) RequireToolScopes(toolScopes map[string][]string, opts ...ToolScopeOption) func(http.Handler) http.Handler {
+	var cfg toolScopeConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return resource.ToolScopeGuard(resource.ToolScopeGuardConfig{
+		Claims:              func(r *http.Request) *verifier.VerifiedClaims { return ClaimsFromContext(r.Context()) },
+		ResourceMetadataURL: a.resourceMetadataURL,
+		ToolScopes:          toolScopes,
+		RefuseUnlisted:      cfg.refuseUnlisted,
 	})
+}
+
+// PRMHandler serves the Protected Resource Metadata document; see resource.Resource.PRMHandler.
+func (a *Adapter) PRMHandler() http.Handler {
+	return a.resource.PRMHandler()
+}
+
+func (a *Adapter) log() *slog.Logger {
+	if a.logger != nil {
+		return a.logger
+	}
+	return slog.Default()
+}
+
+// Middleware is AuthMiddleware in the shape net/http middleware chains use.
+func (a *Adapter) Middleware() func(http.Handler) http.Handler {
+	return a.AuthMiddleware
 }
 
 // WellKnownPRMPath returns the RFC 9728 well-known path for this resource,
@@ -240,18 +289,13 @@ func (a *Adapter) ProtectedResourceMetadataHandler() http.Handler {
 //
 // Use this to register the PRM handler:
 //
-//	http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+//	http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 func (a *Adapter) WellKnownPRMPath() string {
 	return a.resource.WellKnownPRMPath()
 }
 
 // Client returns the underlying authplane.Client, providing access to all SDK
 // operations: TokenExchange, Revoke, Introspect, ClientCredentials, DPoPSigner, etc.
-//
-// For adapters built with NewAdapter, do not call Close() on the returned client
-// directly — call adapter.Close() instead, as the adapter owns the client lifecycle.
-// For adapters built with NewAdapterFromClientAndResource, the caller owns the
-// client and is responsible for closing it.
 func (a *Adapter) Client() *authplane.Client {
 	return a.client
 }
@@ -262,26 +306,33 @@ func (a *Adapter) Resource() *resource.Resource {
 	return a.resource
 }
 
-// TokenFromContext returns the raw bearer token injected by AuthMiddleware into
-// the request context. Returns an empty string if called outside an authenticated request.
+// TokenFromContext returns the raw bearer token of the current request, on the same terms
+// as ClaimsFromContext, or an empty string.
 //
-// Use this inside MCP tool handlers when the raw token is needed — for example,
-// to revoke or exchange the caller's token via adapter.Client():
+// Use it inside MCP tool handlers when the raw token is needed — for example, to revoke or
+// exchange the caller's token via adapter.Client(). Never forward it to an upstream API:
+// the MCP authorization spec forbids token passthrough, so exchange it instead.
 //
 //	token := authplanemcp.TokenFromContext(ctx)
 //	err := adapter.Client().Revoke(ctx, token)
 func TokenFromContext(ctx context.Context) string {
-	token, _ := ctx.Value(tokenKey{}).(string)
-	return token
+	holder := currentHolder(ctx)
+	if holder == nil {
+		return ""
+	}
+	return holder.token
+}
+
+func currentHolder(ctx context.Context) *claimsHolder {
+	holder, _ := ctx.Value(claimsKey{}).(*claimsHolder)
+	if holder == nil || holder.closed.Load() {
+		return nil
+	}
+	return holder
 }
 
 // Close stops all background goroutines and releases resources held by the
 // underlying client. It is safe to call Close multiple times.
-//
-// For adapters built with NewAdapter, Close closes the underlying client.
-// For adapters built with NewAdapterFromClientAndResource, the caller owns the
-// client; Close is a no-op so a client shared across multiple adapters keeps
-// running even after one of them is closed.
 func (a *Adapter) Close() error {
 	if !a.ownsClient {
 		return nil
@@ -314,7 +365,7 @@ func ConsentElicitationError(err error) error {
 		Mode:          "url",
 		URL:           consentErr.ConsentURL,
 		Message:       msg,
-		ElicitationID: newUUID(),
+		ElicitationID: authplane.NewElicitationID(),
 	}})
 }
 
@@ -323,9 +374,6 @@ func ConsentElicitationError(err error) error {
 // a consent URL is available. This triggers the MCP client's URL elicitation flow
 // so the user can complete consent out-of-band, after which the client retries the
 // original operation.
-//
-// For custom consent handling, use Client().TokenExchange() directly and pass the
-// error through ConsentElicitationError.
 func (a *Adapter) TokenExchange(ctx context.Context, input authplane.TokenExchangeInput) (*authplane.TokenResponse, error) {
 	resp, err := a.client.TokenExchange(ctx, input)
 	if err != nil {
@@ -334,38 +382,28 @@ func (a *Adapter) TokenExchange(ctx context.Context, input authplane.TokenExchan
 	return resp, nil
 }
 
-// newUUID generates a random v4 UUID string without external dependencies.
-func newUUID() string {
-	var u [16]byte
-	_, _ = rand.Read(u[:])      // crypto/rand.Read never returns an error on supported platforms
-	u[6] = (u[6] & 0x0f) | 0x40 // version 4
-	u[8] = (u[8] & 0x3f) | 0x80 // variant 10
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
-}
-
-// verifyToken is the token verification callback used by auth.RequireBearerToken.
-// Errors are wrapped with auth.ErrInvalidToken so the go-sdk returns 401 (not 500)
-// and sets the WWW-Authenticate header on the response.
+// verifyToken is the token verification callback used by auth.RequireBearerToken. The
+// outcome comes from AuthMiddleware, which has already run the verification. Errors are
+// bare auth.ErrInvalidToken so the go-sdk answers 401 and the body holds no verifier text.
 func (a *Adapter) verifyToken(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
-	claims, err := a.resource.VerifyToken(ctx, token)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", auth.ErrInvalidToken, err)
+	box, _ := ctx.Value(claimsBoxKey{}).(*claimsBox)
+	if box == nil || !box.verified {
+		return nil, auth.ErrInvalidToken
 	}
-	// Pass verified claims to the inner handler via the per-request claimsBox,
-	// avoiding a second VerifyToken call (and duplicate introspection round-trip).
-	if box, ok := ctx.Value(claimsBoxKey{}).(*claimsBox); ok {
-		box.claims = claims
-		box.token = token
+	if box.err != nil || box.claims == nil {
+		return nil, auth.ErrInvalidToken
 	}
 	return &auth.TokenInfo{
-		Scopes:     claims.Scopes(),
-		Expiration: time.Unix(claims.ExpiresAt(), 0),
-		UserID:     claims.Sub(),
+		Scopes:     box.claims.Scopes(),
+		Expiration: time.Unix(box.claims.ExpiresAt(), 0),
+		UserID:     box.claims.Sub(),
+		Extra:      map[string]any{extraClaimsKey: box.claims, extraTokenKey: token},
 	}, nil
 }
 
-// ClaimsFromContext returns the VerifiedClaims injected by AuthMiddleware into
-// the request context. Returns nil if called outside an authenticated request.
+// ClaimsFromContext returns the verified claims of the current request, or nil outside an
+// authenticated request, including a later call in a legacy session on a server without
+// ReceivingMiddleware. Nil claims have no scopes, so the check below refuses.
 //
 // Use this inside MCP tool handlers to enforce per-tool scope:
 //
@@ -374,6 +412,9 @@ func (a *Adapter) verifyToken(ctx context.Context, token string, _ *http.Request
 //	    return nil, nil, err
 //	}
 func ClaimsFromContext(ctx context.Context) *verifier.VerifiedClaims {
-	claims, _ := ctx.Value(claimsKey{}).(*verifier.VerifiedClaims)
-	return claims
+	holder := currentHolder(ctx)
+	if holder == nil {
+		return nil
+	}
+	return holder.claims
 }

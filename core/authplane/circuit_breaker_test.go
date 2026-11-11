@@ -1,6 +1,7 @@
 package authplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -56,6 +57,9 @@ func TestShouldTripCircuitBreaker(t *testing.T) {
 			Cause:      oauth.ErrConsentRequired,
 		}), false},
 		{"wrapped ssrf", fmt.Errorf("metadata: %w", ssrf.ErrSSRFBlocked), false},
+		{"wrapped DNS failure", fmt.Errorf("metadata: %w", ssrf.ErrDNSResolution), false},
+		{"wrapped cancellation", fmt.Errorf("token: %w", context.Canceled), false},
+		{"invalid_request", oauth.ErrInvalidRequest, false},
 		{"wrapped access_denied", fmt.Errorf("exchange: %w: client not allowlisted", oauth.ErrAccessDenied), false},
 		{"wrapped invalid_target", fmt.Errorf("exchange: %w: resource mismatch", oauth.ErrInvalidTarget), false},
 	}

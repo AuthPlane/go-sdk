@@ -1,14 +1,15 @@
 # Contributing to the Authplane Go SDK
 
-Thanks for your interest in contributing. This repository is a Go workspace with three modules published via git tags and served by `proxy.golang.org`:
+Thanks for your interest in contributing. This repository is a Go workspace with four modules published via git tags and served by `proxy.golang.org`:
 
 | Module import path | Directory |
 |---|---|
 | `github.com/authplane/go-sdk/core` | `core/` |
 | `github.com/authplane/go-sdk/http` | `http/` |
 | `github.com/authplane/go-sdk/mcp` | `mcp/` |
+| `github.com/authplane/go-sdk/mark3labs` | `mark3labs/` |
 
-`http` and `mcp` depend on `core`. A single tagged release tags all three (`core/vX.Y.Z`, `http/vX.Y.Z`, `mcp/vX.Y.Z`, plus an umbrella `vX.Y.Z`).
+`http`, `mcp` and `mark3labs` depend on `core`, and `mark3labs` also on `http`. A single tagged release tags all four (`core/vX.Y.Z`, `http/vX.Y.Z`, `mcp/vX.Y.Z`, `mark3labs/vX.Y.Z`, plus an umbrella `vX.Y.Z`).
 
 ## Reporting Issues
 
@@ -21,7 +22,7 @@ Thanks for your interest in contributing. This repository is a Go workspace with
 
 ### Prerequisites
 
-- Go 1.25+ — required by the workspace (`go.work` pins ≥ 1.25 because `mcp` requires it, forced by `modelcontextprotocol/go-sdk`). Per-module consumer contracts are looser: `core`/`http` declare `go 1.24.0` with `toolchain go1.25.0`; `mcp` declares `go 1.25.0`.
+- Go 1.26+, the floor of every module and of the workspace (`go.work`).
 - `git`
 
 ### Clone and build
@@ -29,12 +30,12 @@ Thanks for your interest in contributing. This repository is a Go workspace with
 ```bash
 git clone https://github.com/AuthPlane/go-sdk.git
 cd go-sdk
-# Workspace resolves the three modules from go.work
+# Workspace resolves the four modules from go.work
 go work sync
 go build ./...
 ```
 
-The top-level `go.work` ties `core/`, `http/`, and `mcp/` into a single workspace, so inter-module changes are picked up without publishing.
+The top-level `go.work` ties `core/`, `http/`, `mcp/`, and `mark3labs/` into a single workspace, so inter-module changes are picked up without publishing.
 
 ## Local Verification
 
@@ -43,7 +44,7 @@ Run the same checks CI runs before opening a PR. All commands assume you're at t
 **Vet:**
 
 ```bash
-go vet ./core/... ./http/... ./mcp/...
+go vet ./core/... ./http/... ./mcp/... ./mark3labs/...
 ```
 
 **Tests:**
@@ -52,6 +53,7 @@ go vet ./core/... ./http/... ./mcp/...
 (cd core && go test ./...)
 (cd http && go test ./...)
 (cd mcp  && go test ./...)
+(cd mark3labs && go test ./...)
 ```
 
 **Race detector (for anything concurrent):**
@@ -74,6 +76,7 @@ go install golang.org/x/vuln/cmd/govulncheck@latest
 (cd core && govulncheck ./...)
 (cd http && govulncheck ./...)
 (cd mcp  && govulncheck ./...)
+(cd mark3labs && govulncheck ./...)
 ```
 
 **Conformance catalog:**
@@ -91,7 +94,7 @@ A weekly `conformance-catalog-drift` workflow runs the alignment check against t
 
 ## Pull Request Guidelines
 
-- Branch off `main`. Release branches (`release/v*`, `hotfix/v*`) are managed by the release flow — see [RELEASE_POLICY.md](RELEASE_POLICY.md).
+- Branch off `main`. A release is a PR titled `release: prepare vX.Y.Z`; merging it releases — see [RELEASE_POLICY.md](RELEASE_POLICY.md).
 - PR titles follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `ci:`, `deps:`, `refactor:`, `test:`, `chore:`.
 - Link the related GitHub issue (e.g., `Fixes #123`) in the PR description.
 - Fill out the PR template (summary, testing, checklist).

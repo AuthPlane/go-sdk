@@ -13,7 +13,7 @@ Tokens must carry the scope for the specific tool being called. A token with onl
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - The **Authplane authserver** running locally — from a checkout of the `authserver` repo, run:
 
   ```bash

@@ -2,12 +2,17 @@ package ssrf
 
 import (
 	"context"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,7 +29,6 @@ func TestIsIPAllowed_CloudMetadataAlwaysBlocked(t *testing.T) {
 		{"link-local IPv6 full", "fe80::abcd:ef01:2345:6789"},
 	}
 	settings := FetchSettings{
-		SSRFProtection:   true,
 		AllowHTTP:        true,
 		AllowLocalhost:   true,
 		AllowPrivateNets: true,
@@ -45,7 +49,6 @@ func TestIsIPAllowed_CloudMetadataAlwaysBlocked(t *testing.T) {
 func TestIsIPAllowed_MulticastAlwaysBlocked(t *testing.T) {
 	cases := []string{"224.0.0.1", "239.255.255.255", "ff02::1"}
 	settings := FetchSettings{
-		SSRFProtection:   true,
 		AllowHTTP:        true,
 		AllowLocalhost:   true,
 		AllowPrivateNets: true,
@@ -194,7 +197,7 @@ func TestValidateURL_HTTPSRequired(t *testing.T) {
 }
 
 func TestValidateURL_HTTPAllowed(t *testing.T) {
-	settings := FetchSettings{SSRFProtection: true, AllowHTTP: true}
+	settings := FetchSettings{AllowHTTP: true}
 	_, err := ValidateURL(context.Background(), "http://8.8.8.8/path", settings)
 	if err != nil {
 		t.Errorf("HTTP should be allowed when AllowHTTP=true: %v", err)
@@ -237,8 +240,8 @@ func TestSSRFSafeGet_SizeLimit(t *testing.T) {
 		w.Write([]byte(largeBody))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 100)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, 100)
 	if err == nil {
 		t.Error("should reject response exceeding size limit")
 	}
@@ -250,8 +253,8 @@ func TestSSRFSafeGet_ContentLengthFastReject(t *testing.T) {
 		w.Write([]byte("small"))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 100)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, 100)
 	if err == nil {
 		t.Error("should reject large Content-Length")
 	}
@@ -263,8 +266,8 @@ func TestSSRFSafeGet_Success(t *testing.T) {
 		w.Write([]byte(`{"keys":[]}`))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
-	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxJWKSSize)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
+	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, MaxJWKSSize)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -286,12 +289,12 @@ func TestSSRFSafePost_FormData(t *testing.T) {
 		w.Write([]byte(`{"active":true}`))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
 	opts := PostOptions{
 		FormData: map[string][]string{"token": {"abc123"}, "token_type_hint": {"access_token"}},
 		MaxSize:  MaxMetadataSize,
 	}
-	resp, err := SSRFSafePost(context.Background(), server.URL, settings, nil, opts)
+	resp, err := SSRFSafePost(context.Background(), server.URL, settings, opts)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -313,12 +316,12 @@ func TestSSRFSafePost_ExtraHeaders(t *testing.T) {
 		w.Write([]byte(`{}`))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
 	opts := PostOptions{
 		ExtraHeaders: map[string]string{"Authorization": "Basic dXNlcjpwYXNz"},
 		MaxSize:      MaxMetadataSize,
 	}
-	_, err := SSRFSafePost(context.Background(), server.URL, settings, nil, opts)
+	_, err := SSRFSafePost(context.Background(), server.URL, settings, opts)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -336,8 +339,8 @@ func TestSSRFSafeGet_RedirectBlocked(t *testing.T) {
 		http.Redirect(w, r, redirectTarget.URL, http.StatusFound)
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, Timeout: 5 * time.Second}
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxJWKSSize)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, Timeout: 5 * time.Second}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, MaxJWKSSize)
 	if err == nil {
 		t.Error("redirects should be blocked")
 	}
@@ -345,7 +348,7 @@ func TestSSRFSafeGet_RedirectBlocked(t *testing.T) {
 
 func TestDefaultFetchSettings(t *testing.T) {
 	s := DefaultFetchSettings()
-	if !s.SSRFProtection {
+	if s.DisableSSRFProtection {
 		t.Error("SSRF protection should be enabled by default")
 	}
 	if s.AllowHTTP {
@@ -364,7 +367,7 @@ func TestDefaultFetchSettings(t *testing.T) {
 
 func TestDevModeFetchSettings(t *testing.T) {
 	s := DevModeFetchSettings()
-	if !s.SSRFProtection {
+	if s.DisableSSRFProtection {
 		t.Error("SSRF protection should stay enabled in dev mode")
 	}
 	if !s.AllowHTTP {
@@ -435,7 +438,7 @@ func TestSSRFSafeGet_PinnedMode_HostHeaderIncludesPort(t *testing.T) {
 	defer server.Close()
 	wantHost := strings.TrimPrefix(server.URL, "http://")
 	settings := DevModeFetchSettings()
-	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, nil, MaxJWKSSize); err != nil {
+	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, MaxJWKSSize); err != nil {
 		t.Fatalf("pinnedGet should succeed: %v", err)
 	}
 	if receivedHost != wantHost {
@@ -459,32 +462,11 @@ func TestSSRFSafePost_PinnedMode_HostHeaderIncludesPort(t *testing.T) {
 		FormData: map[string][]string{"grant_type": {"client_credentials"}},
 		MaxSize:  MaxMetadataSize,
 	}
-	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, opts); err != nil {
 		t.Fatalf("pinnedPost should succeed: %v", err)
 	}
 	if receivedHost != wantHost {
 		t.Errorf("Host header = %q, want %q (port must be preserved for DPoP htu)", receivedHost, wantHost)
-	}
-}
-
-func TestParseJSONResponse_Valid(t *testing.T) {
-	resp := &HTTPResponse{Body: []byte(`{"issuer":"https://auth.example.com"}`)}
-	var result map[string]any
-	err := ParseJSONResponse(resp, &result)
-	if err != nil {
-		t.Fatalf("expected success: %v", err)
-	}
-	if result["issuer"] != "https://auth.example.com" {
-		t.Errorf("unexpected issuer: %v", result["issuer"])
-	}
-}
-
-func TestParseJSONResponse_Invalid(t *testing.T) {
-	resp := &HTTPResponse{Body: []byte(`not json`)}
-	var result map[string]any
-	err := ParseJSONResponse(resp, &result)
-	if err == nil {
-		t.Error("expected error for invalid JSON")
 	}
 }
 
@@ -496,7 +478,7 @@ func TestSSRFSafeGet_PinnedMode_Success(t *testing.T) {
 	}))
 	defer server.Close()
 	settings := DevModeFetchSettings()
-	resp, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, nil, MaxJWKSSize)
+	resp, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, MaxJWKSSize)
 	if err != nil {
 		t.Fatalf("pinnedGet should succeed for localhost in dev mode: %v", err)
 	}
@@ -526,7 +508,7 @@ func TestSSRFSafePost_PinnedMode_Success(t *testing.T) {
 		FormData: map[string][]string{"token": {"my-token"}},
 		MaxSize:  MaxMetadataSize,
 	}
-	resp, err := SSRFSafePost(context.Background(), server.URL+"/introspect", settings, nil, opts)
+	resp, err := SSRFSafePost(context.Background(), server.URL+"/introspect", settings, opts)
 	if err != nil {
 		t.Fatalf("pinnedPost should succeed for localhost in dev mode: %v", err)
 	}
@@ -554,7 +536,7 @@ func TestSSRFSafePost_PinnedMode_ExtraHeaders(t *testing.T) {
 		ExtraHeaders: map[string]string{"Authorization": "Basic Y2xpZW50OnNlY3JldA=="},
 		MaxSize:      MaxMetadataSize,
 	}
-	_, err := SSRFSafePost(context.Background(), server.URL+"/token", settings, nil, opts)
+	_, err := SSRFSafePost(context.Background(), server.URL+"/token", settings, opts)
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
@@ -573,7 +555,7 @@ func TestSSRFSafeGet_PinnedMode_RedirectBlocked(t *testing.T) {
 	}))
 	defer server.Close()
 	settings := DevModeFetchSettings()
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxJWKSSize)
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, MaxJWKSSize)
 	if err == nil {
 		t.Error("redirects should be blocked in pinned mode")
 	}
@@ -585,7 +567,7 @@ func TestSSRFSafeGet_PinnedMode_SizeLimit(t *testing.T) {
 	}))
 	defer server.Close()
 	settings := DevModeFetchSettings()
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 100)
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, 100)
 	if err == nil {
 		t.Error("should reject oversized response in pinned mode")
 	}
@@ -662,7 +644,7 @@ func TestErrSSRFBlocked_IsWrapped(t *testing.T) {
 func TestSSRFSafeGet_BlocksPrivateIP(t *testing.T) {
 	settings := DefaultFetchSettings()
 	settings.AllowHTTP = true
-	_, err := SSRFSafeGet(context.Background(), "http://10.0.0.1/jwks", settings, nil, MaxJWKSSize)
+	_, err := SSRFSafeGet(context.Background(), "http://10.0.0.1/jwks", settings, MaxJWKSSize)
 	if err == nil {
 		t.Error("should block private IP with SSRF protection")
 	}
@@ -670,7 +652,7 @@ func TestSSRFSafeGet_BlocksPrivateIP(t *testing.T) {
 
 func TestSSRFSafeGet_BlocksCloudMetadata(t *testing.T) {
 	settings := DevModeFetchSettings()
-	_, err := SSRFSafeGet(context.Background(), "http://169.254.169.254/latest/meta-data/", settings, nil, MaxJWKSSize)
+	_, err := SSRFSafeGet(context.Background(), "http://169.254.169.254/latest/meta-data/", settings, MaxJWKSSize)
 	if err == nil {
 		t.Error("cloud metadata should be blocked even in dev mode")
 	}
@@ -681,8 +663,8 @@ func TestSSRFSafeGet_DevModeAllowsLocalhost(t *testing.T) {
 		fmt.Fprint(w, `{"keys":[]}`)
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true, AllowLocalhost: true, Timeout: 5 * time.Second}
-	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxJWKSSize)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true, AllowLocalhost: true, Timeout: 5 * time.Second}
+	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, MaxJWKSSize)
 	if err != nil {
 		t.Fatalf("dev mode should allow localhost: %v", err)
 	}
@@ -720,7 +702,7 @@ func TestSSRFSafeGet_PinnedMode_IPv6HostHeaderBracketed(t *testing.T) {
 	defer server.Close()
 	wantHost := strings.TrimPrefix(server.URL, "http://")
 	settings := DevModeFetchSettings()
-	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, nil, MaxJWKSSize); err != nil {
+	if _, err := SSRFSafeGet(context.Background(), server.URL+"/.well-known/jwks.json", settings, MaxJWKSSize); err != nil {
 		t.Fatalf("pinnedGet should succeed: %v", err)
 	}
 	if receivedHost != wantHost {
@@ -739,7 +721,7 @@ func TestSSRFSafePost_PinnedMode_IPv6HostHeaderBracketed(t *testing.T) {
 	settings := DevModeFetchSettings()
 	// MaxSize left zero to exercise the default-size branch in pinnedPost.
 	opts := PostOptions{FormData: map[string][]string{"grant_type": {"client_credentials"}}}
-	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, opts); err != nil {
 		t.Fatalf("pinnedPost should succeed: %v", err)
 	}
 	if receivedHost != wantHost {
@@ -747,15 +729,15 @@ func TestSSRFSafePost_PinnedMode_IPv6HostHeaderBracketed(t *testing.T) {
 	}
 }
 
-// TestSSRFSafeGet_UnprotectedMode covers the unsafeGet path (SSRFProtection
+// TestSSRFSafeGet_UnprotectedMode covers the unsafeGet path (DisableSSRFProtection
 // disabled), including the nil-client default-client construction.
 func TestSSRFSafeGet_UnprotectedMode(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"ok":true}`)
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
-	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, MaxMetadataSize)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
+	resp, err := SSRFSafeGet(context.Background(), server.URL, settings, MaxMetadataSize)
 	if err != nil {
 		t.Fatalf("unprotected GET should succeed: %v", err)
 	}
@@ -774,12 +756,12 @@ func TestSSRFSafePost_UnprotectedMode(t *testing.T) {
 		fmt.Fprint(w, `{}`)
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
 	opts := PostOptions{
 		FormData:     map[string][]string{"grant_type": {"client_credentials"}},
 		ExtraHeaders: map[string]string{"X-Test": "v"},
 	}
-	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, nil, opts); err != nil {
+	if _, err := SSRFSafePost(context.Background(), server.URL+"/oauth/token", settings, opts); err != nil {
 		t.Fatalf("unprotected POST should succeed: %v", err)
 	}
 	if gotCT != "application/x-www-form-urlencoded" {
@@ -797,8 +779,8 @@ func TestReadLimitedResponse_ContentLengthTooLarge(t *testing.T) {
 		w.Write(make([]byte, 200)) // Content-Length set by the server
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 50)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, 50)
 	if err == nil {
 		t.Fatal("expected error for response exceeding Content-Length limit")
 	}
@@ -817,8 +799,8 @@ func TestReadLimitedResponse_BodyExceedsWithoutContentLength(t *testing.T) {
 		w.Write(make([]byte, 40))
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
-	_, err := SSRFSafeGet(context.Background(), server.URL, settings, nil, 50)
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
+	_, err := SSRFSafeGet(context.Background(), server.URL, settings, 50)
 	if err == nil {
 		t.Fatal("expected error for body exceeding limit without Content-Length")
 	}
@@ -837,6 +819,12 @@ func TestValidateURL_DNSResolutionFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected DNS resolution failure for .invalid host")
 	}
+	if !errors.Is(err, ErrDNSResolution) {
+		t.Errorf("err = %v, want ErrDNSResolution", err)
+	}
+	if errors.Is(err, ErrSSRFBlocked) {
+		t.Errorf("err = %v, a DNS failure must not read as an SSRF block", err)
+	}
 }
 
 func TestIsIPAllowed_MalformedIP(t *testing.T) {
@@ -854,8 +842,6 @@ func TestExtractEmbeddedIPv4(t *testing.T) {
 	}{
 		{"malformed length", net.IP{1, 2, 3}, ""},
 		{"6to4 maps embedded v4", net.ParseIP("2002:0102:0304::1"), "1.2.3.4"},
-		{"teredo blocked server returns server", net.ParseIP("2001:0000:a9fe:0001:0000:0000:0000:0000"), "169.254.0.1"},
-		{"teredo all-global returns nil", net.ParseIP("2001:0000:0809:0a0b:0000:0000:0000:0000"), ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -874,24 +860,24 @@ func TestExtractEmbeddedIPv4(t *testing.T) {
 }
 
 func TestSSRFSafePost_PinnedMode_InvalidURL(t *testing.T) {
-	// SSRFProtection on → ValidateURL runs and rejects the malformed URL.
+	// Protection on → ValidateURL runs and rejects the malformed URL.
 	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
-	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", DevModeFetchSettings(), nil, opts); err == nil {
+	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", DevModeFetchSettings(), opts); err == nil {
 		t.Fatal("expected validation error for malformed URL in pinned POST")
 	}
 }
 
 func TestSSRFSafeGet_UnprotectedMode_InvalidURL(t *testing.T) {
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
-	if _, err := SSRFSafeGet(context.Background(), "http://exa\x7fmple.com", settings, nil, MaxMetadataSize); err == nil {
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
+	if _, err := SSRFSafeGet(context.Background(), "http://exa\x7fmple.com", settings, MaxMetadataSize); err == nil {
 		t.Fatal("expected request-creation error for malformed URL in unsafe GET")
 	}
 }
 
 func TestSSRFSafePost_UnprotectedMode_InvalidURL(t *testing.T) {
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
 	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
-	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", settings, nil, opts); err == nil {
+	if _, err := SSRFSafePost(context.Background(), "http://exa\x7fmple.com", settings, opts); err == nil {
 		t.Fatal("expected request-creation error for malformed URL in unsafe POST")
 	}
 }
@@ -903,9 +889,242 @@ func TestSSRFSafePost_UnprotectedMode_RedirectBlocked(t *testing.T) {
 		http.Redirect(w, r, "http://example.com/", http.StatusFound)
 	}))
 	defer server.Close()
-	settings := FetchSettings{SSRFProtection: false, AllowHTTP: true}
+	settings := FetchSettings{DisableSSRFProtection: true, AllowHTTP: true}
 	opts := PostOptions{FormData: map[string][]string{"a": {"b"}}}
-	if _, err := SSRFSafePost(context.Background(), server.URL, settings, nil, opts); err == nil {
+	if _, err := SSRFSafePost(context.Background(), server.URL, settings, opts); err == nil {
 		t.Fatal("expected redirect to be blocked in unsafe POST")
+	}
+}
+
+func TestRootCAs_A30_A31(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+	ctx := context.Background()
+
+	settings := DefaultFetchSettings()
+	settings.AllowLocalhost = true
+	if _, err := SSRFSafeGet(ctx, ts.URL, settings, MaxJWKSSize); err == nil {
+		t.Error("system trust: want a TLS failure")
+	}
+
+	settings.RootCAs = x509.NewCertPool()
+	settings.RootCAs.AddCert(ts.Certificate())
+	resp, err := SSRFSafeGet(ctx, ts.URL, settings, MaxJWKSSize)
+	if err != nil {
+		t.Fatalf("with RootCAs: %v", err)
+	}
+	if string(resp.Body) != "ok" {
+		t.Errorf("body = %q", resp.Body)
+	}
+}
+
+func TestIsIPAllowed_AddedRanges_A42_A43(t *testing.T) {
+	defaults := DefaultFetchSettings()
+	for _, ip := range []string{
+		"0.1.2.3", "192.0.0.192", "198.18.0.1", "240.0.0.1", "fd00:ec2::254", "fc00::1", "fd12::1",
+		"64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "::7f00:1", "::a9fe:a9fe",
+		"64:ff9b:1::a9fe:a9fe", "::ffff:0:a9fe:a9fe", "2001:db8::5efe:a9fe:a9fe", "fec0::1",
+		"2001:0:7f00:1::f7f7:f7f7", "2001:0:808:808::1", "64:ff9b:1:a9fe:a9:fe00:808:808", "168.63.129.16",
+	} {
+		if IsIPAllowed(net.ParseIP(ip), defaults) {
+			t.Errorf("%s allowed on defaults", ip)
+		}
+	}
+	for _, ip := range []string{"8.8.8.8", "2606:4700::1111", "64:ff9b::808:808"} {
+		if !IsIPAllowed(net.ParseIP(ip), defaults) {
+			t.Errorf("%s refused on defaults", ip)
+		}
+	}
+	private := DefaultFetchSettings()
+	private.AllowPrivateNets = true
+	if !IsIPAllowed(net.ParseIP("fc00::1"), private) {
+		t.Error("fc00::1 refused with AllowPrivateNets")
+	}
+	for _, ip := range []string{"fd00:ec2::254", "fd20:ce::254"} {
+		if IsIPAllowed(net.ParseIP(ip), private) {
+			t.Errorf("%s allowed with AllowPrivateNets", ip)
+		}
+	}
+	if IsIPAllowed(net.ParseIP("::1"), defaults) {
+		t.Error("::1 allowed on defaults")
+	}
+}
+
+// An address must pass as itself as well as by the IPv4 address inside it.
+func TestIsIPAllowed_EmbeddedIPv4DoesNotSkipTheOuterChecks_A86(t *testing.T) {
+	for _, addr := range []string{"fd00::5efe:8.8.8.8", "fc00:1:2:3:200:5efe:8.8.8.8", "fd00::1"} {
+		if IsIPAllowed(net.ParseIP(addr), DefaultFetchSettings()) {
+			t.Errorf("%s allowed by default", addr)
+		}
+	}
+	private := FetchSettings{AllowPrivateNets: true}
+	if !IsIPAllowed(net.ParseIP("fd00::5efe:8.8.8.8"), private) {
+		t.Error("a permitted outer range with a public inner address must pass")
+	}
+	if IsIPAllowed(net.ParseIP("fd00::5efe:169.254.169.254"), private) {
+		t.Error("the inner address must still be checked")
+	}
+}
+
+// The zero value must protect, so that setting one field cannot turn the guard off.
+func TestFetchSettings_ZeroValueProtects_A87(t *testing.T) {
+	ctx := context.Background()
+	for _, settings := range []FetchSettings{{}, {AllowHTTP: true, Timeout: time.Second}, {RootCAs: x509.NewCertPool()}} {
+		if _, err := ValidateURL(ctx, "https://127.0.0.1/x", settings); !errors.Is(err, ErrSSRFBlocked) {
+			t.Errorf("%+v: err = %v, want blocked", settings, err)
+		}
+		if _, err := ValidateURL(ctx, "https://169.254.169.254/x", settings); !errors.Is(err, ErrSSRFBlocked) {
+			t.Errorf("%+v: metadata address: err = %v", settings, err)
+		}
+	}
+}
+
+// Every address reaching the guard must not panic, and nothing in a blocked range may pass
+// by being wrapped in another form.
+func FuzzIsIPAllowed(f *testing.F) {
+	for _, seed := range []string{
+		"127.0.0.1", "::1", "::ffff:127.0.0.1", "169.254.169.254", "fd00::5efe:8.8.8.8", "64:ff9b::a00:1",
+		"2002:a00:1::", "2001:0:a00:1::", "::a00:1", "8.8.8.8", "2606:4700::1",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			return
+		}
+		allowed := IsIPAllowed(ip, DefaultFetchSettings())
+		if !allowed {
+			return
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			t.Errorf("%s allowed by default", ip)
+		}
+		if inner := extractEmbeddedIPv4(ip); inner != nil && !IsIPAllowed(inner, DefaultFetchSettings()) {
+			t.Errorf("%s allowed while its inner address %s is not", ip, inner)
+		}
+	})
+}
+
+func TestFetch_ReusesConnectionsAndReportsThem_A102(t *testing.T) {
+	var conns atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "my-agent" {
+			t.Errorf("User-Agent = %q", got)
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+	var events []FetchEvent
+	settings := DevModeFetchSettings()
+	settings.UserAgent = "my-agent"
+	settings.Observe = func(e FetchEvent) { events = append(events, e) }
+	for range 5 {
+		if _, err := SSRFSafeGet(context.Background(), server.URL, settings, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := conns.Load(); got != 1 {
+		t.Errorf("connections = %d, want 1", got)
+	}
+	if len(events) != 5 || events[0].Status != 200 || events[0].Method != http.MethodGet || events[0].Host == "" {
+		t.Errorf("events = %+v", events)
+	}
+}
+
+func TestPinnedFetch_TriesTheNextAddressWhenOneIsDown_A102(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The server listens on 127.0.0.1 only, so nothing answers on 127.0.0.2.
+	req := fetchRequest{method: http.MethodGet, maxSize: 100}
+	down := &ValidatedURL{Scheme: "http", Host: "localhost", Port: port, Path: "/", ResolvedIPs: []net.IP{net.ParseIP("127.0.0.2")}}
+	if _, err := pinnedFetch(context.Background(), down, DevModeFetchSettings(), req); !isConnectFailure(err) {
+		t.Fatalf("down address: err = %v, want a connect failure", err)
+	}
+	both := &ValidatedURL{Scheme: "http", Host: "localhost", Port: port, Path: "/", ResolvedIPs: []net.IP{net.ParseIP("127.0.0.2"), net.ParseIP("127.0.0.1")}}
+	resp, err := pinnedFetch(context.Background(), both, DevModeFetchSettings(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != "ok" {
+		t.Errorf("body = %q", resp.Body)
+	}
+}
+
+func TestFetch_UsesAnExplicitProxy_A102(t *testing.T) {
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxied.Add(1)
+		_, _ = w.Write([]byte("via proxy"))
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := DevModeFetchSettings()
+	settings.Proxy = http.ProxyURL(proxyURL)
+	resp, err := SSRFSafeGet(context.Background(), "http://127.0.0.1:1/x", settings, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resp.Body) != "via proxy" || proxied.Load() != 1 {
+		t.Errorf("body = %q, proxied = %d", resp.Body, proxied.Load())
+	}
+}
+
+// http.ProxyURL closures all share one code pointer, so a pool keyed on them would mix proxies.
+func TestFetch_DoesNotShareATransportBetweenProxies_A105(t *testing.T) {
+	var a, b atomic.Int32
+	proxy := func(hits *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	}
+	proxyA, proxyB := proxy(&a), proxy(&b)
+	defer proxyA.Close()
+	defer proxyB.Close()
+	for _, p := range []*httptest.Server{proxyA, proxyB} {
+		proxyURL, err := url.Parse(p.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settings := DevModeFetchSettings()
+		settings.Proxy = http.ProxyURL(proxyURL)
+		if _, err := SSRFSafeGet(context.Background(), "http://127.0.0.1:1/x", settings, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if a.Load() != 1 || b.Load() != 1 {
+		t.Errorf("proxy A hits = %d, proxy B hits = %d", a.Load(), b.Load())
+	}
+}
+
+func TestUnprotectedFetch_ReadsNoProxyFromTheEnvironment_A105(t *testing.T) {
+	transport, ok := unprotectedTransport(FetchSettings{DisableSSRFProtection: true}).(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Error("the unprotected transport must use no proxy unless one is set")
+	}
+}
+
+func TestIsIPAllowed_DocumentationRanges_A86(t *testing.T) {
+	for _, addr := range []string{"192.0.2.1", "198.51.100.1", "203.0.113.1", "2001:db8::1", "100::1"} {
+		if IsIPAllowed(net.ParseIP(addr), DefaultFetchSettings()) {
+			t.Errorf("%s allowed", addr)
+		}
 	}
 }

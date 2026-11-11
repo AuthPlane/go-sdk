@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,10 +17,10 @@ import (
 // testSettings returns FetchSettings suitable for tests against httptest servers.
 func testSettings() ssrf.FetchSettings {
 	return ssrf.FetchSettings{
-		SSRFProtection: false,
-		AllowHTTP:      true,
-		AllowLocalhost: true,
-		Timeout:        5 * time.Second,
+		DisableSSRFProtection: true,
+		AllowHTTP:             true,
+		AllowLocalhost:        true,
+		Timeout:               5 * time.Second,
 	}
 }
 
@@ -180,199 +181,6 @@ func TestMetadataCache_Get_Cached(t *testing.T) {
 	}
 }
 
-// TestMetadataCache_GetJWKSURI checks the GetJWKSURI convenience accessor.
-func TestMetadataCache_GetJWKSURI(t *testing.T) {
-	var serverURL string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/.well-known/oauth-authorization-server" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(buildMetadata(serverURL))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	serverURL = server.URL
-
-	mc := New(Config{
-		IssuerURL:       server.URL,
-		FetchSettings:   testSettings(),
-		RefreshInterval: time.Hour,
-	})
-	defer mc.Close()
-
-	uri, err := mc.GetJWKSURI(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := server.URL + "/jwks"
-	if uri != want {
-		t.Errorf("expected %q, got %q", want, uri)
-	}
-}
-
-// TestMetadataCache_GetTokenEndpoint checks the GetTokenEndpoint convenience accessor.
-func TestMetadataCache_GetTokenEndpoint(t *testing.T) {
-	var serverURL string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/.well-known/oauth-authorization-server" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(buildMetadata(serverURL))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	serverURL = server.URL
-
-	mc := New(Config{
-		IssuerURL:       server.URL,
-		FetchSettings:   testSettings(),
-		RefreshInterval: time.Hour,
-	})
-	defer mc.Close()
-
-	ep, err := mc.GetTokenEndpoint(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := server.URL + "/token"
-	if ep != want {
-		t.Errorf("expected %q, got %q", want, ep)
-	}
-}
-
-// TestMetadataCache_GetIntrospectionEndpoint checks the GetIntrospectionEndpoint convenience accessor.
-func TestMetadataCache_GetIntrospectionEndpoint(t *testing.T) {
-	var serverURL string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/.well-known/oauth-authorization-server" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(buildMetadata(serverURL))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	serverURL = server.URL
-
-	mc := New(Config{
-		IssuerURL:       server.URL,
-		FetchSettings:   testSettings(),
-		RefreshInterval: time.Hour,
-	})
-	defer mc.Close()
-
-	ep, err := mc.GetIntrospectionEndpoint(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := server.URL + "/introspect"
-	if ep != want {
-		t.Errorf("expected %q, got %q", want, ep)
-	}
-}
-
-// TestMetadataCache_GetRevocationEndpoint checks the GetRevocationEndpoint convenience accessor.
-func TestMetadataCache_GetRevocationEndpoint(t *testing.T) {
-	var serverURL string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/.well-known/oauth-authorization-server" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(buildMetadata(serverURL))
-		} else {
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	serverURL = server.URL
-
-	mc := New(Config{
-		IssuerURL:       server.URL,
-		FetchSettings:   testSettings(),
-		RefreshInterval: time.Hour,
-	})
-	defer mc.Close()
-
-	ep, err := mc.GetRevocationEndpoint(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := server.URL + "/revoke"
-	if ep != want {
-		t.Errorf("expected %q, got %q", want, ep)
-	}
-}
-
-// TestMetadataCache_JWKSURIChange verifies that OnJWKSURIChange is called when
-// the jwks_uri changes between cache refreshes.
-func TestMetadataCache_JWKSURIChange(t *testing.T) {
-	var serverURL string
-	var callCount atomic.Int32
-	var (
-		capturedOld string
-		capturedNew string
-	)
-
-	// First response: original JWKS URI.
-	// Second response (ForceRefresh): different JWKS URI.
-	var serveAlt atomic.Bool
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/oauth-authorization-server" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		jwksURI := serverURL + "/jwks"
-		if serveAlt.Load() {
-			jwksURI = serverURL + "/jwks-v2"
-		}
-		meta := ASMetadata{
-			Issuer:  serverURL,
-			JWKSURI: jwksURI,
-		}
-		data, _ := json.Marshal(meta)
-		w.Write(data)
-	}))
-	defer server.Close()
-	serverURL = server.URL
-
-	mc := New(Config{
-		IssuerURL:       server.URL,
-		FetchSettings:   testSettings(),
-		RefreshInterval: time.Hour,
-		OnJWKSURIChange: func(old, new string) {
-			callCount.Add(1)
-			capturedOld = old
-			capturedNew = new
-		},
-	})
-	defer mc.Close()
-
-	ctx := context.Background()
-
-	// Warm the cache with the original JWKS URI.
-	if _, err := mc.Get(ctx); err != nil {
-		t.Fatalf("initial Get failed: %v", err)
-	}
-	// Force a refresh with a different JWKS URI.
-	serveAlt.Store(true)
-	if _, err := mc.docCache.ForceRefresh(ctx); err != nil {
-		t.Fatalf("ForceRefresh failed: %v", err)
-	}
-
-	if n := callCount.Load(); n != 1 {
-		t.Errorf("expected onChange called once, got %d", n)
-	}
-	if capturedOld != server.URL+"/jwks" {
-		t.Errorf("expected old %q, got %q", server.URL+"/jwks", capturedOld)
-	}
-	if capturedNew != server.URL+"/jwks-v2" {
-		t.Errorf("expected new %q, got %q", server.URL+"/jwks-v2", capturedNew)
-	}
-}
-
 // TestMetadataCache_IssuerTrailingSlashMismatch is the regression for the
 // RFC 8414 §3.3 comparison: the configured issuer and the document "issuer"
 // are compared byte-for-byte (§4, code-point-for-code-point, no normalization).
@@ -516,5 +324,138 @@ func TestBuildOAuthMetadataURL_TrailingSlash(t *testing.T) {
 				t.Errorf("buildOAuthMetadataURL(%q) = %q, want %q", tt.issuer, got, tt.want)
 			}
 		})
+	}
+}
+
+func discoveryServer(t *testing.T, serve func(issuer, path string) (int, string)) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		code, body := serve(srv.URL, r.URL.Path)
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func metadataDoc(issuer string) string {
+	return `{"issuer":"` + issuer + `","jwks_uri":"` + issuer + `/jwks","backchannel_authentication_endpoint":"` + issuer + `/bc","x_custom":"y"}`
+}
+
+func TestDiscovery_ThreeForms_A18(t *testing.T) {
+	for _, servedAt := range []string{
+		"/.well-known/oauth-authorization-server/tenant",
+		"/.well-known/openid-configuration/tenant",
+		"/tenant/.well-known/openid-configuration",
+	} {
+		t.Run(servedAt, func(t *testing.T) {
+			srv := discoveryServer(t, func(issuer, path string) (int, string) {
+				if path == servedAt {
+					return http.StatusOK, metadataDoc(issuer + "/tenant")
+				}
+				return http.StatusNotFound, ""
+			})
+			mc := New(Config{IssuerURL: srv.URL + "/tenant", FetchSettings: ssrf.DevModeFetchSettings()})
+			defer mc.Close()
+			if _, err := mc.Get(context.Background()); err != nil {
+				t.Errorf("Get: %v", err)
+			}
+		})
+	}
+}
+
+func TestDiscovery_NothingAnswers_A19(t *testing.T) {
+	srv := discoveryServer(t, func(string, string) (int, string) { return http.StatusNotFound, "" })
+	mc := New(Config{IssuerURL: srv.URL + "/tenant", FetchSettings: ssrf.DevModeFetchSettings()})
+	defer mc.Close()
+	_, err := mc.Get(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "RFC 8414") || !strings.Contains(err.Error(), "OIDC") {
+		t.Errorf("err = %v, want it to name RFC 8414 and OIDC", err)
+	}
+}
+
+func TestDiscovery_HTTPIssuerNeedsSettings_A36_A37(t *testing.T) {
+	var requests atomic.Int32
+	srv := discoveryServer(t, func(issuer, _ string) (int, string) {
+		requests.Add(1)
+		return http.StatusOK, metadataDoc(issuer)
+	})
+
+	mc := New(Config{IssuerURL: srv.URL, FetchSettings: ssrf.DefaultFetchSettings()})
+	defer mc.Close()
+	if _, err := mc.Get(context.Background()); !errors.Is(err, ssrf.ErrSSRFBlocked) {
+		t.Errorf("default settings: err = %v, want ErrSSRFBlocked", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("default settings sent %d requests", n)
+	}
+
+	// A zero-value FetchSettings turns SSRF protection off, which must not relax this.
+	zero := New(Config{IssuerURL: srv.URL, FetchSettings: ssrf.FetchSettings{}})
+	defer zero.Close()
+	if _, err := zero.Get(context.Background()); !errors.Is(err, ssrf.ErrSSRFBlocked) {
+		t.Errorf("zero settings: err = %v, want ErrSSRFBlocked", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("zero settings sent %d requests", n)
+	}
+
+	dev := New(Config{IssuerURL: srv.URL, FetchSettings: ssrf.DevModeFetchSettings()})
+	defer dev.Close()
+	if _, err := dev.Get(context.Background()); err != nil {
+		t.Errorf("dev settings: %v", err)
+	}
+}
+
+func TestMetadata_BadRefreshKeepsGoodDocument_A53(t *testing.T) {
+	var broken atomic.Bool
+	srv := discoveryServer(t, func(issuer, _ string) (int, string) {
+		if broken.Load() {
+			return http.StatusOK, `{}`
+		}
+		return http.StatusOK, metadataDoc(issuer)
+	})
+	mc := New(Config{IssuerURL: srv.URL, FetchSettings: ssrf.DevModeFetchSettings(), RefreshInterval: 50 * time.Millisecond})
+	defer mc.Close()
+	ctx := context.Background()
+	if _, err := mc.Get(ctx); err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	time.Sleep(200 * time.Millisecond)
+	meta, err := mc.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get after a bad refresh: %v", err)
+	}
+	if meta.JWKSURI == "" {
+		t.Error("good document lost")
+	}
+}
+
+func TestMetadata_Raw_A16(t *testing.T) {
+	srv := discoveryServer(t, func(issuer, _ string) (int, string) { return http.StatusOK, metadataDoc(issuer) })
+	mc := New(Config{IssuerURL: srv.URL, FetchSettings: ssrf.DevModeFetchSettings()})
+	defer mc.Close()
+	ctx := context.Background()
+	meta, err := mc.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.BackchannelAuthenticationEndpoint == "" {
+		t.Error("typed field empty")
+	}
+	raw := meta.Raw()
+	if raw["x_custom"] != "y" {
+		t.Errorf("Raw = %v", raw)
+	}
+	raw["x_custom"] = "changed"
+	meta.ScopesSupported = append(meta.ScopesSupported, "changed")
+	again, err := mc.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Raw()["x_custom"] != "y" || len(again.ScopesSupported) != 0 {
+		t.Error("changing a result changed the next call's")
 	}
 }

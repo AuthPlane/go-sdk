@@ -3,6 +3,7 @@ package conformancetests
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,7 +117,7 @@ func TestRFC8414JWKSURIRequiredForJWTValidation(t *testing.T) {
 
 	// Attempt to get the JWKS URI for JWT validation — should reject because
 	// jwks_uri is missing from the metadata.
-	jwksURI, err := mc.GetJWKSURI(ctx)
+	jwksURI, err := metadataField(ctx, mc, func(m *metadata.ASMetadata) string { return m.JWKSURI })
 	if err != nil {
 		// Implementation rejects at fetch time — satisfies catalog requirement.
 		if !strings.Contains(err.Error(), "jwks_uri") {
@@ -205,7 +206,7 @@ func TestRFC8414JWKSURIMustBeAbsoluteHTTPSURL(t *testing.T) {
 	ctx := context.Background()
 
 	// JWKS URI is relative (not absolute HTTPS) — must be rejected.
-	ts := metadataServerDynamic(t, func(issuer string) map[string]any {
+	ts := metadataTLSServerDynamic(t, func(issuer string) map[string]any {
 		return map[string]any{
 			"issuer":   issuer,
 			"jwks_uri": "/relative/jwks",
@@ -214,7 +215,7 @@ func TestRFC8414JWKSURIMustBeAbsoluteHTTPSURL(t *testing.T) {
 
 	mc := metadata.New(metadata.Config{
 		IssuerURL:     ts.URL,
-		FetchSettings: ssrf.DefaultFetchSettings(),
+		FetchSettings: tlsFetchSettings(ts),
 	})
 	defer mc.Close()
 
@@ -246,7 +247,7 @@ func TestRFC8414TokenEndpointRequiredWhenTokenOperationIsUsed(t *testing.T) {
 	defer mc.Close()
 
 	// Fetch the token endpoint from metadata — should be empty.
-	tokenEndpoint, err := mc.GetTokenEndpoint(ctx)
+	tokenEndpoint, err := metadataField(ctx, mc, func(m *metadata.ASMetadata) string { return m.TokenEndpoint })
 	if err != nil {
 		// Implementation rejects at fetch time — satisfies catalog requirement.
 		if !strings.Contains(err.Error(), "token_endpoint") {
@@ -269,7 +270,7 @@ func TestRFC8414TokenEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 	Case(t, "rfc8414-token-endpoint-must-be-absolute-https-url")
 	ctx := context.Background()
 
-	ts := metadataServerDynamic(t, func(issuer string) map[string]any {
+	ts := metadataTLSServerDynamic(t, func(issuer string) map[string]any {
 		return map[string]any{
 			"issuer":         issuer,
 			"jwks_uri":       "https://auth.example.com/jwks",
@@ -279,7 +280,7 @@ func TestRFC8414TokenEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 
 	mc := metadata.New(metadata.Config{
 		IssuerURL:     ts.URL,
-		FetchSettings: ssrf.DefaultFetchSettings(),
+		FetchSettings: tlsFetchSettings(ts),
 	})
 	defer mc.Close()
 
@@ -296,7 +297,7 @@ func TestRFC8414IntrospectionEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 	Case(t, "rfc8414-introspection-endpoint-must-be-absolute-https-url")
 	ctx := context.Background()
 
-	ts := metadataServerDynamic(t, func(issuer string) map[string]any {
+	ts := metadataTLSServerDynamic(t, func(issuer string) map[string]any {
 		return map[string]any{
 			"issuer":                 issuer,
 			"jwks_uri":               "https://auth.example.com/jwks",
@@ -306,7 +307,7 @@ func TestRFC8414IntrospectionEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 
 	mc := metadata.New(metadata.Config{
 		IssuerURL:     ts.URL,
-		FetchSettings: ssrf.DefaultFetchSettings(),
+		FetchSettings: tlsFetchSettings(ts),
 	})
 	defer mc.Close()
 
@@ -323,7 +324,7 @@ func TestRFC8414RevocationEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 	Case(t, "rfc8414-revocation-endpoint-must-be-absolute-https-url")
 	ctx := context.Background()
 
-	ts := metadataServerDynamic(t, func(issuer string) map[string]any {
+	ts := metadataTLSServerDynamic(t, func(issuer string) map[string]any {
 		return map[string]any{
 			"issuer":              issuer,
 			"jwks_uri":            "https://auth.example.com/jwks",
@@ -333,7 +334,7 @@ func TestRFC8414RevocationEndpointMustBeAbsoluteHTTPSURL(t *testing.T) {
 
 	mc := metadata.New(metadata.Config{
 		IssuerURL:     ts.URL,
-		FetchSettings: ssrf.DefaultFetchSettings(),
+		FetchSettings: tlsFetchSettings(ts),
 	})
 	defer mc.Close()
 
@@ -365,7 +366,7 @@ func TestRFC8414IntrospectionEndpointRequiredWhenIntrospectionIsUsed(t *testing.
 	defer mc.Close()
 
 	// Fetch the introspection endpoint from metadata — should be empty.
-	introspectionEndpoint, err := mc.GetIntrospectionEndpoint(ctx)
+	introspectionEndpoint, err := metadataField(ctx, mc, func(m *metadata.ASMetadata) string { return m.IntrospectionEndpoint })
 	if err != nil {
 		// Implementation rejects at fetch time — satisfies catalog requirement.
 		if !strings.Contains(err.Error(), "introspection_endpoint") {
@@ -403,7 +404,7 @@ func TestRFC8414RevocationEndpointRequiredWhenRevocationIsUsed(t *testing.T) {
 	defer mc.Close()
 
 	// Fetch the revocation endpoint from metadata — should be empty.
-	revocationEndpoint, err := mc.GetRevocationEndpoint(ctx)
+	revocationEndpoint, err := metadataField(ctx, mc, func(m *metadata.ASMetadata) string { return m.RevocationEndpoint })
 	if err != nil {
 		// Implementation rejects at fetch time — satisfies catalog requirement.
 		if !strings.Contains(err.Error(), "revocation_endpoint") {
@@ -756,7 +757,7 @@ func TestRFC8414RotationControlPinnedJWKSURIMustFailOnSignature(t *testing.T) {
 	pinnedURI := as.issuer + "/jwks-v1.json"
 	jwksCache := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
 		FetchFn: func(ctx context.Context) ([]byte, map[string][]string, error) {
-			resp, err := ssrf.SSRFSafeGet(ctx, pinnedURI, ssrf.DevModeFetchSettings(), nil, ssrf.MaxJWKSSize)
+			resp, err := ssrf.SSRFSafeGet(ctx, pinnedURI, ssrf.DevModeFetchSettings(), ssrf.MaxJWKSSize)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -926,4 +927,33 @@ func TestRFC8414RotationControlSameKIDBlocksTheKIDMissShortcut(t *testing.T) {
 			t.Errorf("the rotated jwks_uri was fetched %d times with no escalation to trigger it", n)
 		}
 	})
+}
+
+// metadataTLSServerDynamic is metadataServerDynamic over TLS: an http issuer is refused
+// on settings that refuse http endpoints, so these cases need a real https issuer.
+func metadataTLSServerDynamic(t *testing.T, build func(issuer string) map[string]any) *httptest.Server {
+	t.Helper()
+	var ts *httptest.Server
+	ts = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(build(ts.URL))
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// tlsFetchSettings is the default policy, trusting the test server and allowing loopback.
+func tlsFetchSettings(ts *httptest.Server) ssrf.FetchSettings {
+	settings := ssrf.DefaultFetchSettings()
+	settings.AllowLocalhost = true
+	settings.RootCAs = x509.NewCertPool()
+	settings.RootCAs.AddCert(ts.Certificate())
+	return settings
+}
+
+func metadataField(ctx context.Context, mc *metadata.MetadataCache, field func(*metadata.ASMetadata) string) (string, error) {
+	meta, err := mc.Get(ctx)
+	if err != nil {
+		return "", err
+	}
+	return field(meta), nil
 }

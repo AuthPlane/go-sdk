@@ -23,7 +23,18 @@ type TokenVerifier struct {
 	revChecker  RevocationChecker
 	failClosed  bool
 	jwks        *JWKSCache
+	logger      *slog.Logger
 	inboundDPoP *resolvedInboundDPoP // nil ⇒ DPoP not supported on this resource
+
+	// Server-neutral policy. Each nil or empty field keeps the RFC 9068 default.
+	expectedAudience string   // replaces audience in the aud check when set
+	tokenTypes       []string // normalized accepted typ values
+	acceptNoType     bool     // a token with no typ header is accepted
+	requiredClaims   []string
+	scopeClaims      []string
+	clientClaims     []string
+	markerClaims     []string
+	scopeImplication func(granted, required string) bool
 }
 
 // resolvedInboundDPoP is the post-defaulting form of InboundDPoPOptions.
@@ -66,6 +77,9 @@ func NewTokenVerifier(issuer, audience string, jwksCache *JWKSCache, opts ...Opt
 	if _, err := url.ParseRequestURI(v.audience); err != nil {
 		return nil, fmt.Errorf("verifier: invalid audience URI: %w", err)
 	}
+	if jwksCache == nil {
+		return nil, errors.New("verifier: JWKS cache must not be nil")
+	}
 
 	return v, nil
 }
@@ -89,187 +103,177 @@ func (v *TokenVerifier) InboundDPoPView() *InboundDPoPView {
 	}
 }
 
-// Algorithms returns the allowed signing algorithms as strings (for PRM generation).
-func (v *TokenVerifier) Algorithms() []string {
-	out := make([]string, len(v.algorithms))
-	for i, a := range v.algorithms {
-		out[i] = string(a)
-	}
-	return out
-}
-
 // VerifyToken validates a raw JWT access token string and returns the verified claims.
 func (v *TokenVerifier) VerifyToken(ctx context.Context, rawToken string, dpop *DPoPContext) (*VerifiedClaims, error) {
 	if rawToken == "" {
 		return nil, ErrTokenMissing
 	}
-
-	// Parse JWT header without verifying signature yet.
-	parsed, err := jwt.ParseSigned(rawToken, v.algorithms)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidSignature, err)
-	}
-
-	// Validate headers.
-	if len(parsed.Headers) == 0 {
-		return nil, fmt.Errorf("%w: missing JOSE headers", ErrInvalidClaims)
-	}
-	header := parsed.Headers[0]
-
-	// Check typ header (RFC 9068 section 2.1).
-	typ, _ := header.ExtraHeaders[jose.HeaderType].(string)
-	if typ != "at+jwt" {
-		return nil, fmt.Errorf("%w: invalid typ %q, expected \"at+jwt\"", ErrInvalidClaims, typ)
-	}
-
-	// Check algorithm is in our allowlist (before doing any crypto).
-	if !slices.Contains(v.algorithms, jose.SignatureAlgorithm(header.Algorithm)) {
-		return nil, fmt.Errorf("%w: algorithm %q not allowed", ErrInvalidClaims, header.Algorithm)
-	}
-
-	// JWKS lookup by kid.
-	kid := header.KeyID
-	key, err := v.jwks.GetKey(ctx, kid, jose.SignatureAlgorithm(header.Algorithm))
+	parsed, header, explicitlyTyped, err := v.parseHeader(rawToken)
 	if err != nil {
 		return nil, err
 	}
+	claims, err := v.verifySignature(ctx, parsed, header)
+	if err != nil {
+		return nil, err
+	}
+	// The order below is the contract: no check sees claims the signature does not cover, and
+	// revocation, which may cost a network call, runs only for an otherwise valid request.
+	for _, check := range []func() error{
+		func() error { return v.checkShape(claims, explicitlyTyped) },
+		func() error { return v.checkTime(claims) },
+		func() error { return v.checkIdentity(claims) },
+		func() error { return v.checkBinding(claims, rawToken, dpop) },
+		func() error { return v.checkRevocation(ctx, claims, rawToken) },
+	} {
+		if err := check(); err != nil {
+			return nil, err
+		}
+	}
+	return claims, nil
+}
 
-	// Verify signature and extract claims.
+// parseHeader parses the token and applies the checks that need no key.
+func (v *TokenVerifier) parseHeader(rawToken string) (parsed *jwt.JSONWebToken, header jose.Header, explicitlyTyped bool, err error) {
+	parsed, err = jwt.ParseSigned(rawToken, v.algorithms)
+	if err != nil {
+		return nil, header, false, fmt.Errorf("%w: %v", ErrInvalidSignature, err)
+	}
+	if len(parsed.Headers) == 0 {
+		return nil, header, false, fmt.Errorf("%w: missing JOSE headers", ErrInvalidClaims)
+	}
+	header = parsed.Headers[0]
+	// RFC 9068 sections 2.1 and 4.
+	explicitlyTyped, err = v.checkTokenType(header)
+	if err != nil {
+		return nil, header, false, err
+	}
+	if !slices.Contains(v.algorithms, jose.SignatureAlgorithm(header.Algorithm)) {
+		return nil, header, false, fmt.Errorf("%w: algorithm %q not allowed", ErrInvalidClaims, header.Algorithm)
+	}
+	if header.KeyID == "" {
+		return nil, header, false, fmt.Errorf("%w: missing \"kid\" header", ErrInvalidClaims)
+	}
+	return parsed, header, explicitlyTyped, nil
+}
+
+// verifySignature finds the key by kid, checks the signature and reads the claims.
+func (v *TokenVerifier) verifySignature(ctx context.Context, parsed *jwt.JSONWebToken, header jose.Header) (*VerifiedClaims, error) {
+	key, err := v.jwks.GetKey(ctx, header.KeyID, jose.SignatureAlgorithm(header.Algorithm))
+	if err != nil {
+		return nil, err
+	}
 	var rawClaims map[string]any
 	if err := parsed.Claims(key.Key, &rawClaims); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidSignature, err)
 	}
-
-	claims := ParseClaims(rawClaims, kid)
-
-	// Validate required claims (RFC 9068 section 2.2).
-	if claims.Issuer() == "" {
-		return nil, fmt.Errorf("%w: missing required claim \"iss\"", ErrInvalidClaims)
+	claims := parseClaims(rawClaims, header.KeyID)
+	claims.implies = v.scopeImplication
+	if err := v.applyClaimPolicy(claims); err != nil {
+		return nil, err
 	}
-	if claims.Sub() == "" {
-		return nil, fmt.Errorf("%w: missing required claim \"sub\"", ErrInvalidClaims)
-	}
-	if len(claims.Audience()) == 0 {
-		return nil, fmt.Errorf("%w: missing required claim \"aud\"", ErrInvalidClaims)
-	}
-	if claims.ExpiresAt() == 0 {
-		return nil, fmt.Errorf("%w: missing required claim \"exp\"", ErrInvalidClaims)
-	}
-	if claims.IssuedAt() == 0 {
-		return nil, fmt.Errorf("%w: missing required claim \"iat\"", ErrInvalidClaims)
-	}
-	if claims.JTI() == "" {
-		return nil, fmt.Errorf("%w: missing required claim \"jti\"", ErrInvalidClaims)
-	}
-	if claims.ClientID() == "" {
-		return nil, fmt.Errorf("%w: missing required claim \"client_id\"", ErrInvalidClaims)
-	}
-
-	// Validate expiry with clock skew.
-	now := time.Now().Unix()
-	skew := int64(v.clockSkew.Seconds())
-	if now > claims.ExpiresAt()+skew {
-		return nil, ErrTokenExpired
-	}
-
-	// Validate iat not in future.
-	if claims.IssuedAt() > now+skew {
-		return nil, fmt.Errorf("%w: \"iat\" claim is in the future", ErrInvalidClaims)
-	}
-
-	// Validate nbf (not-before) when present (RFC 7519 §4.1.5).
-	if claims.NotBefore() > 0 && claims.NotBefore() > now+skew {
-		return nil, fmt.Errorf("%w: token not yet valid (nbf)", ErrInvalidClaims)
-	}
-
-	// Validate issuer.
-	if claims.Issuer() != v.issuer {
-		return nil, fmt.Errorf("%w: expected %q, got %q", ErrIssuerMismatch, v.issuer, claims.Issuer())
-	}
-
-	// Validate audience.
-	if !slices.Contains(claims.Audience(), v.audience) {
-		return nil, fmt.Errorf("%w: expected %q", ErrAudienceMismatch, v.audience)
-	}
-
-	// Revocation check.
-	if v.revChecker != nil {
-		revoked, err := v.revChecker(ctx, claims, rawToken)
-		if err != nil {
-			if v.failClosed {
-				return nil, fmt.Errorf("%w: revocation check failed: %v", ErrTokenRevoked, err)
-			}
-			// fail-open: accept the token. Say so — a silently failing
-			// checker is indistinguishable from a passing one otherwise.
-			slog.WarnContext(ctx, "verifier: revocation check failed; accepting token (fail-open)",
-				"jti", claims.JTI(), "error", err)
-		} else if revoked {
-			return nil, ErrTokenRevoked
-		}
-	}
-
-	// Reject tokens with cnf present but no jkt — malformed (RFC 9449 §6).
-	if claims.cnf != nil && !claims.IsDPoPBound() {
-		return nil, fmt.Errorf("%w: token has 'cnf' claim but missing 'cnf.jkt'", ErrInvalidClaims)
-	}
-
-	// DPoP policy switch (RFC 9449 §7.1).
-	boundToToken := claims.IsDPoPBound()
-	switch {
-	case v.inboundDPoP == nil && boundToToken:
-		// Resource not configured for DPoP, but token is sender-bound.
-		// Reject to prevent silent loss of sender-binding.
-		return nil, ErrDPoPNotSupported
-
-	case v.inboundDPoP == nil && !boundToToken:
-		// Bearer-only resource, bearer token: no DPoP enforcement.
-
-	case v.inboundDPoP != nil && boundToToken:
-		if dpop == nil || dpop.Proof() == "" {
-			return nil, ErrDPoPRequired
-		}
-		proof, err := v.validateDPoPProof(dpop, rawToken)
-		if err != nil {
-			return nil, err
-		}
-		if proof.KeyThumbprint != claims.DPoPThumbprint() {
-			return nil, ErrDPoPKeyMismatch
-		}
-		claims.dpopProof = proof
-
-	case v.inboundDPoP != nil && !boundToToken:
-		if v.inboundDPoP.required {
-			return nil, ErrDPoPRequired
-		}
-		// Supported mode, bearer token. Reject if a proof is attached: the proof's
-		// ath claim has nothing to bind to (RFC 9449 §7). Accepting it silently
-		// would let a misconfigured client believe its proof was honored.
-		if dpop != nil && dpop.Proof() != "" {
-			return nil, fmt.Errorf("%w: DPoP proof presented with a bearer-only access token (no cnf.jkt to bind to)", ErrDPoPBindingMismatch)
-		}
-	}
-
 	return claims, nil
 }
 
+// checkShape refuses a token that is not an access token or lacks a required claim
+// (RFC 9068 section 2.2).
+func (v *TokenVerifier) checkShape(claims *VerifiedClaims, explicitlyTyped bool) error {
+	// Without explicit typing, an ID token could stand in for an access token.
+	if !explicitlyTyped {
+		if err := v.checkNotIDToken(claims); err != nil {
+			return err
+		}
+	}
+	return v.checkRequiredClaims(claims)
+}
+
+// checkTime applies exp, iat and nbf (RFC 7519 section 4.1), with clock skew.
+func (v *TokenVerifier) checkTime(claims *VerifiedClaims) error {
+	now := time.Now().Unix()
+	skew := int64(v.clockSkew.Seconds())
+	if now > claims.ExpiresAt()+skew {
+		return ErrTokenExpired
+	}
+	if claims.IssuedAt() > now+skew {
+		return fmt.Errorf("%w: \"iat\" claim is in the future", ErrInvalidClaims)
+	}
+	if claims.NotBefore() > 0 && claims.NotBefore() > now+skew {
+		return fmt.Errorf("%w: token not yet valid (nbf)", ErrInvalidClaims)
+	}
+	return nil
+}
+
+// checkIdentity applies iss and aud.
+func (v *TokenVerifier) checkIdentity(claims *VerifiedClaims) error {
+	if claims.Issuer() != v.issuer {
+		return fmt.Errorf("%w: expected %q, got %q", ErrIssuerMismatch, v.issuer, claims.Issuer())
+	}
+	audience := v.audience
+	if v.expectedAudience != "" {
+		audience = v.expectedAudience
+	}
+	if !slices.Contains(claims.Audience(), audience) {
+		return fmt.Errorf("%w: expected %q", ErrAudienceMismatch, audience)
+	}
+	return nil
+}
+
+// checkBinding applies the resource's DPoP policy (RFC 9449 section 7.1).
+func (v *TokenVerifier) checkBinding(claims *VerifiedClaims, rawToken string, dpop *DPoPContext) error {
+	// Reject tokens with cnf present but no jkt — malformed (RFC 9449 §6). A cnf that is
+	// not an object must not read as an unbound bearer token.
+	if _, present := claims.raw["cnf"]; present && claims.DPoPThumbprint() == "" {
+		return fmt.Errorf("%w: token has 'cnf' claim but no usable 'cnf.jkt'", ErrInvalidClaims)
+	}
+
+	// After the check above, a bound token has a usable cnf.jkt.
+	proof, err := v.VerifyDPoPBinding(rawToken, TokenBinding{
+		JKT:      claims.DPoPThumbprint(),
+		ClientID: claims.ClientID(),
+		Subject:  claims.Sub(),
+	}, dpop)
+	if err != nil {
+		return err
+	}
+	claims.dpopProof = proof
+	return nil
+}
+
+// checkRevocation runs the revocation checker, if any.
+func (v *TokenVerifier) checkRevocation(ctx context.Context, claims *VerifiedClaims, rawToken string) error {
+	if v.revChecker == nil {
+		return nil
+	}
+	revoked, err := v.revChecker(ctx, claims, rawToken)
+	if err != nil {
+		// A caller who left says nothing about the checker, so this is neither an
+		// outage to report nor a token to accept.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if v.failClosed {
+			return fmt.Errorf("%w: %v", ErrRevocationUnavailable, err)
+		}
+		// fail-open: accept the token. Say so — a silently failing
+		// checker is indistinguishable from a passing one otherwise.
+		if !errors.Is(err, ErrRevocationNotSupported) {
+			v.log().WarnContext(ctx, "verifier: revocation check failed; accepting token (fail-open)",
+				"jti", claims.JTI(), "error", err)
+		}
+	} else if revoked {
+		return ErrTokenRevoked
+	}
+	return nil
+}
+
+// log returns the logger to use: the one given to WithLogger, or slog's default at the time.
+func (v *TokenVerifier) log() *slog.Logger {
+	if v.logger != nil {
+		return v.logger
+	}
+	return slog.Default()
+}
+
 // ValidateIssuer enforces the shape RFC 8414 requires of an issuer identifier.
-//
-// §2 forbids both a query and a fragment component, and the identifier must be
-// an absolute URL with a scheme and host: it anchors the byte-for-byte `iss`
-// comparison above and the well-known derivation in internal/metadata, neither
-// of which is meaningful for a relative reference. url.ParseRequestURI alone is
-// not enough on either count — it accepts "/tenant" (no scheme, no host), and
-// it does not split a fragment, so "https://as.example.com/t#frag" parses
-// cleanly with the fragment folded into Path.
-//
-// It is exported so every construction boundary applies one rule rather than a
-// copy of it: NewTokenVerifier below, resource.New (which calls it), and
-// authplane.NewClient, whose discovery path needs its own gate because a client
-// used only for token, introspection and revocation calls never constructs a
-// TokenVerifier.
-//
-// Every error it returns wraps ErrInvalidIssuer and carries a redacted form of
-// the identifier — see redactIssuer.
 func ValidateIssuer(issuer string) error {
 	if strings.ContainsAny(issuer, "?#") {
 		return fmt.Errorf("%w: must not contain a query or fragment (RFC 8414 §2), got %s", ErrInvalidIssuer, redactIssuer(issuer))
@@ -293,13 +297,6 @@ func ValidateIssuer(issuer string) error {
 
 // redactIssuer renders an issuer identifier for an error message without
 // echoing anything credential-shaped.
-//
-// The branches above fire precisely for malformed identifiers, and the
-// query/fragment branch fires for exactly the shape that carries a secret —
-// "https://as.example.com?token=…". Echoing the raw value there would put it in
-// whatever log the construction error lands in. Only the scheme and host
-// survive: url.URL keeps userinfo in User, the query in RawQuery and the
-// fragment in Fragment, so Host alone is safe to print.
 func redactIssuer(issuer string) string {
 	parsed, err := url.Parse(issuer)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {

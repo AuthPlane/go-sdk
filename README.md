@@ -5,7 +5,19 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/authplane/go-sdk?style=flat-square)](https://goreportcard.com/report/github.com/authplane/go-sdk)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)](LICENSE)
 
-The Authplane Go SDK is a production-grade library for protecting MCP servers and OAuth 2.1 resource servers with tokens issued by an [Authplane authorization server](https://github.com/AuthPlane/authserver).
+The Authplane Go SDK is a library, in beta before 1.0, for protecting MCP servers and OAuth 2.1 resource servers with tokens issued by an [Authplane authorization server](https://github.com/AuthPlane/authserver).
+
+It is built to work with other standard authorization servers too. It is tested against tokens shaped like those of Keycloak, Microsoft Entra ID, Okta and Auth0, built from each vendor's documentation, not against live servers: see [Using another authorization server](core/docs/user-guide.md#using-another-authorization-server).
+
+## Compatibility
+
+| | Supported |
+|---|---|
+| Go | 1.26 and later, the two most recent Go releases |
+| MCP protocol | 2026-07-28 through `Stateless` handlers in `mcp`, and through `mark3labs`; 2025-11-25 and earlier for stateful `mcp` handlers |
+| Authorization servers | Authplane authserver, tested live. Others: tokens shaped like Keycloak, Entra ID, Okta and Auth0, tested with fixtures |
+
+See the [threat model](docs/threat-model.md) for what the SDK does and does not defend against, and the [release policy](RELEASE_POLICY.md) for how APIs are deprecated.
 
 ## Why Authplane
 
@@ -42,10 +54,13 @@ func main() {
     defer adapter.Close() // stops JWKS refresh goroutines, closes the client
 
     server := mcp.NewServer(&mcp.Implementation{Name: "My Server", Version: "1.0.0"}, nil)
+    server.AddReceivingMiddleware(adapter.ReceivingMiddleware())
 
-    handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server }, nil)
+    // Stateless is what speaks protocol 2026-07-28.
+    handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server { return server },
+        &mcp.StreamableHTTPOptions{Stateless: true})
 
-    http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+    http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
     http.Handle("/mcp", adapter.AuthMiddleware(handler))
 
     http.ListenAndServe(":8080", nil)
@@ -71,7 +86,7 @@ Each package has its own quickstart and user guide; start at the package README 
 
 ## Requirements
 
-- Go 1.24+ (`core`, `http`) / Go 1.25+ (`mcp`, forced by `github.com/modelcontextprotocol/go-sdk`; `mark3labs`, forced by `github.com/mark3labs/mcp-go`)
+- Go 1.26+
 
 ## Compatibility
 

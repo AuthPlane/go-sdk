@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `core/authplane`: `OAuthError` gives a server error's code, description, status and retry delay; `ErrSSRFBlocked`, `ErrDNSResolution`, `ErrNoIntrospectionEndpoint`, `ErrMetadataUnavailable`, `ErrCredentialsNotConfigured` and `ErrClientClosed` are exported.
+- `core/authplane`: `FetchSettings` gains `Proxy`, `UserAgent` and `Observe`; `WithLogger`, `WithoutTokenVerification` and `NewClientAndResource` are new.
+- `core/resource`: `Resource.PRMHandler`, `Resource.AuthErrorResponse`, `SanitizeChallengeValue` and `ToolScopeGuardConfig.RefuseUnlisted`; `RefuseUnlistedTools` in `mcp` and `mark3labs`.
+- `core/resource/verifier/verifiertest`: `NewClaims` gives tests real claims by signing and verifying a token.
+- `core/authplane`: `ClientAuthPrivateKeyJWT` authenticates with a signed assertion (RFC 7523), and `JWTBearer` performs the JWT-bearer grant, which also redeems an ID-JAG.
+- `core`: RFC 9396 `authorization_details` on token requests through `TokenExchangeInput`, `JWTBearerInput` and `ClientCredentialsInput`, token responses, introspection and verified claims.
+- `core/authplane`: `FetchSettings.RootCAs` trusts a private CA on every fetch.
+- `core/authplane`: `Client.Metadata` returns the discovered metadata, including members with no typed field, and `WithJWKSMaxStale` limits how long cached keys are trusted in an outage.
+- `core/resource/verifier`: `ErrRevocationNotSupported` lets a checker say the server cannot check, and `WithScopeImplication` lets a broader scope satisfy a narrower one (MCP authorization).
+- `mcp`, `mark3labs`: `RequireToolScopes`, built on `resource.ToolScopeGuard`, answers a missing tool scope with 403 and an `insufficient_scope` challenge before the tool runs.
+- `mcp`: `ReceivingMiddleware` and `ClaimsFromRequest` give each call its own request's claims.
+- `mark3labs`: `SessionManager` mints session IDs bound to the caller, with `Options.AllowUnboundSessions` and `Options.SessionKey`.
+- `http`: `WithPRMHandler` sets the handler `Middleware` uses for the metadata path.
+- `core/resource/verifier`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience` let the verifier accept tokens from other standard servers; the defaults are unchanged.
+- `core/resource/verifier`: `TokenVerifier.VerifyDPoPBinding` and `TokenBinding` apply the resource's DPoP policy to a token validated by introspection; `Resource.VerifyDPoPBinding` takes the proof through `WithDPoP`.
+
+### Fixed
+- `core/authplane`: connections are reused per host, the next validated address is tried when a connection fails, and concurrent client credentials callers share one request.
+- `core/authplane`: a cache hit returns the whole response with `ExpiresIn` counting down, `expires_in` may be a string, and `NewDPoPSignerWithKey` accepts HSM and KMS signers.
+- `core/authplane`: an unsafe consent URL is dropped on every grant, not only token exchange.
+- `core/authplane`: secrets and keys are redacted when formatted or logged, client secrets when marshaled to JSON, and server text in errors is cleaned and shortened.
+- `mark3labs`: a session binds to client and subject together, so two clients of one user cannot use each other's sessions.
+- `core/internal/ssrf`: an address with an IPv4 address inside it no longer skips the private-range check on the outer address.
+- `core/internal/oauth`: only one exact `active: true` member makes an introspection answer active, so a badly typed field or a case-variant key no longer leads to an acceptance.
+- `core/authplane`: `Revoke` evicts entries holding the token as access or refresh token and those exchanged from it at any depth, and a cached exchange result ends no later than its source JWT's `exp`.
+- `core/resource/verifier`: `typ: application/at+jwt` is accepted, and `typ` ignores case (RFC 9068 section 4).
+- `core/resource/verifier`: a JWKS key with no `alg` matches when its key type fits the token's algorithm (RFC 7517 section 4.4).
+- `mcp`: application-written `WWW-Authenticate` challenges pass through unchanged.
+- `core/resource/verifier`: a proof with the wrong key no longer enters the replay store, replay entries are scoped by key, and EdDSA proofs verify.
+- `core/authplane`: token exchange accepts `token_type: N_A` (RFC 8693) and does not cache that result; a cache hit keeps `issued_token_type`.
+- `core/authplane`: the token cache is bounded and its keys hold no tokens; different requests can no longer share a key.
+- `core/internal/metadata`: discovery also tries the OpenID form with the well-known path inserted.
+- `core/resource/verifier`: an unknown `kid` while the JWKS is unreachable is `ErrJWKSUnavailable`, not `ErrInvalidClaims`.
+- `core`: background refresh keeps retrying after an outage. Fetches are shared and run apart from callers: a caller leaves at its own deadline, and cannot abort a fetch or reopen a refresh floor. Keys are installed once per fetch, so a removed key cannot return.
+- `core`: a metadata document or JWKS that fails validation no longer replaces a good one, and a JWKS key of an unsupported type no longer discards the others.
+- `core/authplane`: the circuit breaker recovers after a half-open probe that gets a policy answer, is blocked, or is cancelled; it used to stay open until restart.
+- `core/authplane`: introspection has its own circuit breaker, so token endpoint failures no longer stop revocation checks.
+
+### Removed
+- **BREAKING** `core/authplane`: `AUTHPLANE_DEV_MODE`. **Migration:** pass `WithFetchSettings(DevModeFetchSettings())`.
+- **BREAKING** `core/resource/verifier`: `ErrSSRFBlocked`, `ErrProtocolError`, `Algorithms` and `StringOrSlice`, which nothing returned or used, and `authplane.StringOrSlice`. **Migration:** use `authplane.ErrSSRFBlocked` and `authplane.ErrProtocolError`; there is no replacement for the others, and `Audience` fields are `[]string`.
+- **BREAKING** `core/resource`: `AuthErrorResponseWithMetadata`, `AuthErrorResponseVerbose` and the realm argument of `AuthErrorResponse`. **Migration:** `AuthErrorResponse` with `WithChallengeMetadata`, `WithVerboseDescription` and `WithRealm`.
+- **BREAKING** `core/resource/verifier`: `ParseClaims`, which built `VerifiedClaims` with no verification. **Migration:** in tests, use `verifiertest.NewClaims`.
+- **BREAKING** `core/authplane`: `DoTokenRequestForTesting` and `NewDPoPProviderForTesting`. **Migration:** use `Client` with `WithDPoP`.
+- **BREAKING** `core/testutil`: `ParseSignedToken` is renamed `UnverifiedClaims`, which says what it does. **Migration:** rename the call.
+- **BREAKING** `core/resource/verifier`: `VerifiedClaims.MayAct`, deprecated in 0.4.0. **Migration:** read the claim with `Claim("may_act")` if you still need it.
+
+### Changed
+- `mcp`, `mark3labs`: indirect dependencies are at their latest versions compatible with Go 1.26.
+- **BREAKING** all modules: Go 1.26 is the floor. **Migration:** build with Go 1.26 or later.
+- **BREAKING** `core/resource`: a bad, replayed or wrong-key proof answers `invalid_dpop_proof`, DPoP challenges list `algs`, a resource requiring DPoP answers a request with no token with the `DPoP` scheme, and challenge parameters are separated by commas. **Migration:** match `invalid_dpop_proof` where you match `invalid_token` for DPoP.
+- **BREAKING** `http`: the DPoP scheme with an unbound token is refused, and `New` returns an error. **Migration:** send such a token as `Bearer`, and handle the error.
+- **BREAKING** `mcp`, `mark3labs`: `ProtectedResourceMetadataHandler` is `PRMHandler`. **Migration:** rename the call.
+- **BREAKING** `mark3labs`: `Adapter` no longer embeds the http adapter, `NewAdapterFromClientAndResource` takes `SessionOptions`, and existing sessions must restart because a session now binds to the client too. **Migration:** use the methods on `Adapter`, and pass `SessionOptions{}`.
+- **BREAKING** `core/authplane`: `ClientCredentials` takes `ClientCredentialsInput`, and `FetchSettings`, `ClientAuthentication`, `TokenResponse`, `IntrospectionResponse` and `ASMetadata` are their own types. **Migration:** pass the input struct; `IntrospectionResponse.Audience` is now `[]string`.
+- **BREAKING** `core/authplane`: `NewClient` refuses a non-positive breaker and a negative cache buffer, and a metadata failure is `ErrMetadataUnavailable`. **Migration:** fix those options, and match the sentinel.
+- **BREAKING** `core/resource/verifier`: `MaxProofAge` over an hour fails construction, and a nil JWKS cache is an error. **Migration:** lower the value, and pass a cache.
+- **BREAKING** `core/authplane`: `NewDPoPKeyMaterialFromKey` refuses a nil key or one that does not fit the algorithm. **Migration:** pass a matching key.
+- **BREAKING** `core/resource/verifier`: `VerifyToken` returns `context.Canceled` or `context.DeadlineExceeded` when the caller's context ends during a JWKS wait or a revocation check, with status 503, including in fail-open mode. **Migration:** check for them where you check `ErrJWKSUnavailable`.
+- **BREAKING** `core/authplane`: `FetchSettings.SSRFProtection` is replaced by `DisableSSRFProtection`, so a partly filled value no longer turns the guard off. **Migration:** drop `SSRFProtection: true`, and replace `SSRFProtection: false` with `DisableSSRFProtection: true`; a value that left it unset now protects, so add `AllowLocalhost` or `AllowPrivateNets` where you need them.
+- **BREAKING** `core/resource`: a 5xx from token verification carries no `error` in its challenge, a `temporarily_unavailable` body and `Retry-After`, in place of `invalid_token`. **Migration:** treat it as retryable, and keep the token.
+- **BREAKING** `core/resource/verifier`: a failed DPoP check now wins over revocation, so a revoked token with a bad proof gets the DPoP error. **Migration:** do not rely on `ErrTokenRevoked` for a request whose proof failed.
+- **BREAKING** `core/authplane`: a JWKS holding only unreadable keys fails `NewClient`. **Migration:** check that the authorization server publishes at least one key this SDK can read.
+- **BREAKING** `mcp`: moved to MCP go-sdk v1.8.0. A handler with `Stateless: true` speaks protocol 2026-07-28; a stateful one stays on 2025-11-25. **Migration:** upgrade your own go-sdk requirement and set `Stateless: true` to use 2026-07-28.
+- **BREAKING** `mark3labs`: moved to mcp-go v1.5.0, which speaks protocol 2026-07-28. **Migration:** upgrade your own mcp-go requirement.
+- **BREAKING** `mcp`: `ClaimsFromContext` and `TokenFromContext` no longer return an earlier request's values in a session, so a later call reads nil unless the server has `ReceivingMiddleware`; nil claims hold no scopes and their accessors return zero values. **Migration:** add `server.AddReceivingMiddleware(adapter.ReceivingMiddleware())`.
+- **BREAKING** `mark3labs`: `AuthMiddleware` and `Middleware` answer 404 for a session not bound to the caller. **Migration:** add `server.WithSessionIdManagerResolver(adapter.SessionManager())`, or set `Options.AllowUnboundSessions`.
+- `mcp`: a rejection body holds fixed text, an outage answers 503, and a token within core's clock skew is accepted, where the MCP SDK used to refuse it.
+- `http`: a 5xx rejection logs at Error, and `PRMHandler` serves HEAD and OPTIONS and names the allowed methods.
+- `core`: go-jose moves to v4.1.9.
+- `core/resource`: `offline_access` no longer appears in `scopes_supported` or a challenge's `scope` (MCP authorization).
+- **BREAKING** `core/resource/verifier`: a custom replay store receives an owner hash, the key thumbprint and a hash of the `jti`, a proof `jti` over 256 bytes is refused, one client and subject may hold 10,000 entries in the in-memory store, and a full or failing store gives `ErrDPoPReplayStoreUnavailable` with status 503. **Migration:** a custom store limits by the first segment of its key, the owner, and otherwise treats the key as opaque.
+- **BREAKING** `core/resource/verifier`: `WithInboundDPoP` checks replay by default with an in-memory store. **Migration:** pass a distributed `ReplayStore` for several replicas, or `DisableReplayCheck: true` to opt out.
+- **BREAKING** `core/resource/verifier`: a token whose `cnf` is not an object, or whose `cnf.jkt` is not a non-empty string, is refused. **Migration:** fix the issuer.
+- **BREAKING** `core/resource/verifier`: a fail-closed revocation failure is `ErrRevocationUnavailable` with status 503, not `ErrTokenRevoked`. **Migration:** match the new error.
+- **BREAKING** `core/resource/verifier`: `HasClaimValue` compares by JSON type, so `true` no longer matches `"true"`. **Migration:** pass the claim's own type.
+- **BREAKING** `core/authplane`: more address ranges are refused on fetches, including `fd00:ec2::254`, `fd20:ce::254`, `168.63.129.16`, `fc00::/7`, NAT64, Teredo and `198.18.0.0/15`. **Migration:** set `AllowPrivateNets` for `fc00::/7`; the rest cannot be allowed.
+- **BREAKING** `core/authplane`: with no `introspection_endpoint`, a fail-open verifier logs one warning and accepts, and a fail-closed one refuses every token. **Migration:** disable the check with `NullRevocationChecker` if that server cannot offer it.
+- **BREAKING** `core/authplane`: an unsafe consent URL, such as a `javascript:` link, is dropped from `ConsentRequiredError`. **Migration:** have the server issue `https` consent URLs.
+- **BREAKING** `core/authplane`: an `http` issuer is refused unless the fetch settings allow HTTP, and a loopback one also needs `AllowLocalhost`. **Migration:** use `https`, or `DevModeFetchSettings` in development.
+- **BREAKING** `core/authplane`: `NewClient` fails if the JWKS endpoint answers something that is not a JWKS. **Migration:** fix the endpoint.
+- **BREAKING** `core/resource/verifier`: a token with no `kid` is refused before any key lookup, even against a key with no `kid`. **Migration:** issue tokens with a `kid`.
+- **BREAKING** `http`, `mark3labs`: `Middleware` answers the metadata path itself and never calls the next handler there; other methods get 405. **Migration:** serve nothing else on that path.
+- **BREAKING** `core/resource`: `WithVerifierOptions` accumulates instead of replacing, so unrelated options keep auto-wired introspection. **Migration:** to turn it off, pass `WithRevocationChecker(NullRevocationChecker)`.
+- **BREAKING** `core`: a DNS failure no longer matches the internal SSRF block error, and caller errors no longer count against the circuit breaker. **Migration:** none, unless you matched the error text.
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

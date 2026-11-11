@@ -14,17 +14,6 @@ import (
 // NormalizeHost returns u.Host with an explicit default port removed
 // (`:80` for `http`, `:443` for `https`), per RFC 9110 §7.2. IPv6 literals
 // stay bracketed. Non-default ports and other schemes are returned as-is.
-//
-// The signer side calls this to mirror the outbound Host header (where an
-// explicit default port is omitted); the verifier side calls it on both
-// the proof's htu and the reconstructed request URL before comparing them.
-//
-// Precondition: when used to compare two URLs (verifier side), the caller
-// must have already verified scheme equality between them. The strip rule
-// is scheme-conditional — `:80` is "default" only when scheme is `http` —
-// so applying NormalizeHost across two URLs with different schemes can
-// erase a port on one side but not the other, producing a spurious match.
-// `validateHTU` enforces the scheme check above its NormalizeHost call.
 func NormalizeHost(u *url.URL) string {
 	port := u.Port()
 	if port == "" {
@@ -42,23 +31,6 @@ func NormalizeHost(u *url.URL) string {
 
 // NormalizePath collapses an empty path to "/" and upper-cases the hex
 // digits of percent-encoded triplets per RFC 3986 §6.2.2.1.
-//
-// Empty-path collapse: the Go net/http server hands every request a
-// path of at least "/", so the asymmetry only bites when an htu is
-// built from a bare-origin URL — a proof signed for `https://host`
-// would otherwise fail against a request the server sees as
-// `https://host/`.
-//
-// Hex upper-casing: RFC 3986 §6.2.2.1 treats `%2f` and `%2F` as
-// equivalent and recommends upper-case as the canonical form. The
-// verifier (`core/resource/verifier/dpop.go`) routes both the proof's
-// htu and the reconstructed request URL through `NormalizePath` before
-// comparing, so canonicalizing hex casing on both sides lets a proof
-// signed with `%2f` match a request whose framework emits `%2F` (or
-// vice versa) without requiring identical raw casing across frameworks.
-// Note: neither Go's `net/url.EscapedPath()` nor WHATWG `URL.pathname`
-// rewrites the case of existing `%XX` triplets — the byte-for-byte
-// equality at the comparison site is produced *here*, not by the parser.
 func NormalizePath(p string) string {
 	if p == "" {
 		return "/"

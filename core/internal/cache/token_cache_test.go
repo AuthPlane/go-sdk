@@ -90,15 +90,6 @@ func TestTokenCache_ZeroExpiresIn_RefusesToStore(t *testing.T) {
 	}
 }
 
-func TestTokenCache_Delete(t *testing.T) {
-	tc := NewTokenCache(30*time.Second, 3600*time.Second)
-	tc.Set("del", "token", "Bearer", int64Ptr(3600), "", nil, "")
-	tc.Delete("del")
-	if tc.Get("del") != nil {
-		t.Error("expected nil after delete")
-	}
-}
-
 func TestTokenCache_Get_Missing(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
 	if tc.Get("nonexistent") != nil {
@@ -106,52 +97,13 @@ func TestTokenCache_Get_Missing(t *testing.T) {
 	}
 }
 
-func TestCacheKey_SortedScopes(t *testing.T) {
-	key1 := CacheKey("write read", "")
-	key2 := CacheKey("read write", "")
-	if key1 != key2 {
-		t.Errorf("keys should be equal regardless of scope order: %q vs %q", key1, key2)
-	}
-	if key1 != "read write" {
-		t.Errorf("expected 'read write', got %q", key1)
-	}
-}
-
-func TestCacheKey_WithResource(t *testing.T) {
-	key := CacheKey("read", "https://api.example.com")
-	if key != "read|https://api.example.com" {
-		t.Errorf("expected 'read|https://api.example.com', got %q", key)
-	}
-}
-
-func TestCacheKey_ResourceOnly(t *testing.T) {
-	key := CacheKey("", "https://api.example.com")
-	if key != "|https://api.example.com" {
-		t.Errorf("expected '|https://api.example.com', got %q", key)
-	}
-}
-
-func TestCacheKey_Default(t *testing.T) {
-	key := CacheKey("", "")
-	if key != "_default" {
-		t.Errorf("expected '_default', got %q", key)
-	}
-}
-
-func TestCacheKey_ScopeOnly(t *testing.T) {
-	key := CacheKey("admin", "")
-	if key != "admin" {
-		t.Errorf("expected 'admin', got %q", key)
-	}
-}
-
-func TestTokenCache_DeleteByAccessToken(t *testing.T) {
+func TestTokenCache_Revoke(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
 	tc.Set("key1", "token-A", "Bearer", int64Ptr(3600), "read", nil, "")
 	tc.Set("key2", "token-B", "Bearer", int64Ptr(3600), "write", nil, "")
 	tc.Set("key3", "token-A", "Bearer", int64Ptr(3600), "admin", nil, "") // same token, different key
 
-	tc.DeleteByAccessToken("token-A")
+	tc.Revoke("token-A")
 
 	if tc.Get("key1") != nil {
 		t.Error("key1 should be deleted (token-A)")
@@ -164,11 +116,11 @@ func TestTokenCache_DeleteByAccessToken(t *testing.T) {
 	}
 }
 
-func TestTokenCache_DeleteByAccessToken_NoMatch(t *testing.T) {
+func TestTokenCache_Revoke_NoMatch(t *testing.T) {
 	tc := NewTokenCache(30*time.Second, 3600*time.Second)
 	tc.Set("key1", "token-X", "Bearer", int64Ptr(3600), "read", nil, "")
 
-	tc.DeleteByAccessToken("no-such-token")
+	tc.Revoke("no-such-token")
 
 	if tc.Get("key1") == nil {
 		t.Error("key1 should still exist")
@@ -213,5 +165,81 @@ func TestTokenCache_BearerTokenDefaultsCnfToZero(t *testing.T) {
 	}
 	if entry.CnfJkt != "" {
 		t.Errorf("CnfJkt: expected empty, got %q", entry.CnfJkt)
+	}
+}
+
+func TestTokenCache_Bounded_A48(t *testing.T) {
+	tc := NewTokenCache(0, time.Hour)
+	tc.maxEntries = 2
+	tc.Set("a", "ta", "Bearer", nil, "", nil, "")
+	tc.Set("b", "tb", "Bearer", nil, "", nil, "")
+	tc.Get("a") // "b" is now the oldest
+	tc.Set("c", "tc", "Bearer", nil, "", nil, "")
+
+	if tc.Get("b") != nil {
+		t.Error("the least recently used entry should be gone")
+	}
+	if tc.Get("a") == nil || tc.Get("c") == nil {
+		t.Error("recent entries should stay")
+	}
+	if tc.lru.Len() != 2 || len(tc.entries) != 2 {
+		t.Errorf("size = %d/%d, want 2", tc.lru.Len(), len(tc.entries))
+	}
+}
+
+func TestTokenCache_KeepsIssuedTokenType(t *testing.T) {
+	tc := NewTokenCache(0, time.Hour)
+	tc.SetExchanged("k", "t", "Bearer", nil, "", nil, "", Exchanged{IssuedTokenType: "urn:ietf:params:oauth:token-type:access_token"})
+	if e := tc.Get("k"); e == nil || e.IssuedTokenType == "" {
+		t.Errorf("entry = %+v", e)
+	}
+}
+
+// An exchanged token must not outlive what it came from.
+func TestTokenCache_ExchangedEntryFollowsItsSource_A90(t *testing.T) {
+	tc := NewTokenCache(0, time.Hour)
+	lifetime := int64(3600)
+	tc.SetExchanged("k", "t", "Bearer", &lifetime, "", nil, "", Exchanged{Sources: []string{"subject", ""}})
+	tc.Revoke("other")
+	if tc.Get("k") == nil {
+		t.Fatal("another token's revocation evicted the entry")
+	}
+	tc.Revoke("subject")
+	if tc.Get("k") != nil {
+		t.Error("entry survived its subject's revocation")
+	}
+
+	soon := time.Now().Add(time.Minute)
+	tc.SetExchanged("k", "fresh", "Bearer", &lifetime, "", nil, "", Exchanged{NotAfter: soon})
+	if e := tc.Get("k"); e == nil || e.ExpiresAt.After(soon) {
+		t.Errorf("entry not capped at the source's expiry: %+v", e)
+	}
+	tc.SetExchanged("gone", "fresh2", "Bearer", &lifetime, "", nil, "", Exchanged{NotAfter: time.Now().Add(-time.Minute)})
+	if tc.Get("gone") != nil {
+		t.Error("stored a result whose source has expired")
+	}
+}
+
+func TestTokenCache_RevokeReachesEveryHolderAndExchangesInFlight_A105(t *testing.T) {
+	tc := NewTokenCache(0, time.Hour)
+	lifetime := int64(3600)
+	tc.SetExchanged("b", "B", "Bearer", &lifetime, "", nil, "", Exchanged{Sources: []string{"A"}})
+	tc.SetExchanged("c", "C", "Bearer", &lifetime, "", nil, "", Exchanged{Sources: []string{"B"}})
+	tc.SetExchanged("r", "R", "Bearer", &lifetime, "", nil, "", Exchanged{RefreshToken: "refresh"})
+	tc.Revoke("A")
+	if tc.Get("b") != nil || tc.Get("c") != nil {
+		t.Error("an entry exchanged from A, directly or not, survived")
+	}
+	tc.Revoke("refresh")
+	if tc.Get("r") != nil {
+		t.Error("an entry holding the revoked refresh token survived")
+	}
+	tc.SetExchanged("late", "L", "Bearer", &lifetime, "", nil, "", Exchanged{Sources: []string{"A"}})
+	if tc.Get("late") != nil {
+		t.Error("a result from an exchange in flight during Revoke was stored")
+	}
+	tc.SetExchanged("same", "A", "Bearer", &lifetime, "", nil, "", Exchanged{})
+	if tc.Get("same") != nil {
+		t.Error("a result that is itself the revoked token was stored")
 	}
 }

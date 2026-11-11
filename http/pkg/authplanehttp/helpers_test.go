@@ -94,7 +94,10 @@ func newTestEnvWith(t *testing.T, scopes []string, extra ...resource.Option) *te
 	if err != nil {
 		t.Fatalf("client.Resource: %v", err)
 	}
-	adapter := authplanehttp.New(res)
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &testEnv{adapter: adapter, key: key, issuer: srv.URL, kid: kid}
 }
 
@@ -207,7 +210,10 @@ func newECTestEnv(t *testing.T) *ecTestEnv {
 	if err != nil {
 		t.Fatalf("client.Resource: %v", err)
 	}
-	adapter := authplanehttp.New(res)
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &ecTestEnv{adapter: adapter, key: key, issuer: srv.URL, kid: kid}
 }
 
@@ -312,7 +318,10 @@ func newTestEnvForResource(t *testing.T, resourceURI string) *httpsTestEnv {
 	if err != nil {
 		t.Fatalf("client.Resource: %v", err)
 	}
-	adapter := authplanehttp.New(res)
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &httpsTestEnv{adapter: adapter, key: key, issuer: srv.URL, kid: kid, resourceURI: resourceURI}
 }
 

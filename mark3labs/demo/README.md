@@ -13,7 +13,7 @@ A token with only `tools/add` can call `add` but not `multiply`.
 
 ## Prerequisites
 
-- Go 1.25.5+
+- Go 1.26+
 - The **Authplane authserver** running locally — from a checkout of the `authserver` repo, run:
 
   ```bash

@@ -25,7 +25,7 @@ func TestRFC6750ErrorResponseRealmShouldBeIncluded(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, headers, _ := resource.AuthErrorResponse(tt.err, realm)
+			_, headers, _ := resource.AuthErrorResponse(tt.err, resource.WithRealm(realm))
 			wwwAuth := headers["WWW-Authenticate"]
 
 			// Must start with the expected scheme.
@@ -58,19 +58,14 @@ func TestRFC6750ErrorResponseMustMapErrorCodes(t *testing.T) {
 		{"issuer_mismatch → invalid_token Bearer", verifier.ErrIssuerMismatch, "Bearer", "invalid_token", 401},
 		{"audience_mismatch → invalid_token Bearer", verifier.ErrAudienceMismatch, "Bearer", "invalid_token", 401},
 		{"insufficient_scope → insufficient_scope Bearer", verifier.ErrInsufficientScope, "Bearer", "insufficient_scope", 403},
-		{"dpop_invalid → invalid_token DPoP", verifier.ErrDPoPInvalid, "DPoP", "invalid_token", 401},
-		{"dpop_replay → invalid_token DPoP", verifier.ErrDPoPReplayDetected, "DPoP", "invalid_token", 401},
-		{"dpop_key_mismatch → invalid_token DPoP", verifier.ErrDPoPKeyMismatch, "DPoP", "invalid_token", 401},
+		{"dpop_invalid → invalid_dpop_proof DPoP", verifier.ErrDPoPInvalid, "DPoP", "invalid_dpop_proof", 401},
+		{"dpop_replay → invalid_dpop_proof DPoP", verifier.ErrDPoPReplayDetected, "DPoP", "invalid_dpop_proof", 401},
+		{"dpop_key_mismatch → invalid_dpop_proof DPoP", verifier.ErrDPoPKeyMismatch, "DPoP", "invalid_dpop_proof", 401},
 		{"dpop_required → invalid_token DPoP", verifier.ErrDPoPRequired, "DPoP", "invalid_token", 401},
-		// NOTE: `ErrMultipleDpopProofs → invalid_dpop_proof / DPoP / 401`
-		// is intentionally NOT in this catalog-aligned table. The
-		// shared `rfc6750-error-response-must-map-error-codes` catalog
-		// entry only enumerates `dpop_error → invalid_token / DPoP`, so
-		// adding a row with a different `error_code` here would diverge
-		// from the catalog. The mapping is covered at the package level
-		// in `core/resource/auth_error_response_test.go` until the
-		// catalog gains a `rfc9449-verifier-must-reject-multiple-dpop-headers`
-		// row (catalog ID does not exist yet).
+		// The catalog's dpop_error row still says invalid_token for every DPoP error. RFC 9449
+		// section 7.1 and this case's own summary say invalid_dpop_proof for a proof deemed
+		// invalid, so those rows follow the RFC; a missing proof stays invalid_token.
+		{"dpop_multi_header → invalid_dpop_proof DPoP", verifier.ErrMultipleDpopProofs, "DPoP", "invalid_dpop_proof", 401},
 	}
 
 	for _, tt := range tests {
