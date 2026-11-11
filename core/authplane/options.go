@@ -1,6 +1,7 @@
 package authplane
 
 import (
+	"log/slog"
 	"time"
 
 	"github.com/authplane/go-sdk/core/internal/oauth"
@@ -13,6 +14,9 @@ type clientConfig struct {
 	auth            *oauth.ClientAuthentication
 	fetchSettings   *FetchSettings
 	jwksCacheTTL    time.Duration
+	jwksMaxStale    time.Duration
+	logger          *slog.Logger
+	noVerification  bool
 	cbThreshold     int
 	cbCooldown      time.Duration
 	ttlBuffer       time.Duration
@@ -33,8 +37,8 @@ func WithClientCredentials(clientID, clientSecret string) Option {
 // WithClientAuthentication configures OAuth 2.0 client authentication for token operations.
 func WithClientAuthentication(auth ClientAuthentication) Option {
 	return func(cfg *clientConfig) {
-		authCopy := auth
-		cfg.auth = &authCopy
+		internal := auth.internal()
+		cfg.auth = &internal
 	}
 }
 
@@ -47,7 +51,7 @@ func WithClientAuthentication(auth ClientAuthentication) Option {
 //
 //	authplane.WithFetchSettings(authplane.DevModeFetchSettings())
 //
-// Precedence: WithFetchSettings (explicit) > AUTHPLANE_DEV_MODE env >
+// Precedence: WithFetchSettings (explicit) >
 // DefaultFetchSettings.
 func WithFetchSettings(settings FetchSettings) Option {
 	return func(cfg *clientConfig) {
@@ -60,6 +64,33 @@ func WithFetchSettings(settings FetchSettings) Option {
 func WithJWKSCacheTTL(ttl time.Duration) Option {
 	return func(cfg *clientConfig) {
 		cfg.jwksCacheTTL = ttl
+	}
+}
+
+// WithJWKSMaxStale refuses tokens with ErrJWKSUnavailable once the keys have not been
+// refreshed for d, so a retired key cannot stay trusted through a long outage. The cost
+// is that an outage longer than d refuses every token. Off by default. A value below 1s
+// is treated as 1s, and a negative one fails NewClient. Below the JWKS TTL, requests drive
+// the refreshes, at most one per d/2.
+func WithJWKSMaxStale(d time.Duration) Option {
+	return func(cfg *clientConfig) {
+		cfg.jwksMaxStale = d
+	}
+}
+
+// WithLogger sends this client's logs, and those of the verifiers it builds, to logger in place
+// of slog's default.
+func WithLogger(logger *slog.Logger) Option {
+	return func(cfg *clientConfig) {
+		cfg.logger = logger
+	}
+}
+
+// WithoutTokenVerification builds a client only for token calls. jwks_uri becomes optional in
+// the metadata, as RFC 8414 allows, no keys are fetched, and Client.Resource returns an error.
+func WithoutTokenVerification() Option {
+	return func(cfg *clientConfig) {
+		cfg.noVerification = true
 	}
 }
 

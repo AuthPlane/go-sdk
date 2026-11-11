@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"sync"
@@ -13,6 +15,9 @@ import (
 
 // ErrCacheClosed is returned by Get when the cache has been closed.
 var ErrCacheClosed = errors.New("cache: closed")
+
+// errFetchAbandoned is the result of a fetch that ended without returning, by runtime.Goexit.
+var errFetchAbandoned = errors.New("cache: fetch ended without a result")
 
 const (
 	// DefaultFailureBackoff is the default minimum interval between fetch attempts
@@ -24,6 +29,12 @@ const (
 	// effective floor is min(DefaultTTL, this), so a deployment that wants fresher
 	// documents than a minute still gets them.
 	DefaultForcedRefreshFloor = 1 * time.Minute
+
+	// defaultFetchTimeout bounds one fetch from start to finish, including DNS.
+	defaultFetchTimeout = 30 * time.Second
+
+	// minRefreshDelay keeps the background loop from spinning as a document nears expiry.
+	minRefreshDelay = 100 * time.Millisecond
 )
 
 // FetchFunc fetches the document. Returns the raw bytes and response headers (or an error).
@@ -38,6 +49,13 @@ type Config struct {
 	FetchFn    FetchFunc
 	DefaultTTL time.Duration
 	OnChange   OnChangeFunc
+	// OnFetched is called with each document a fetch accepts, before any caller waiting
+	// on that fetch resumes. Fetches never overlap, so calls arrive in fetch order. Use it
+	// to install what is derived from the document.
+	OnFetched func(data []byte)
+	// FetchTimeout bounds one fetch from start to finish, including DNS. Zero or less
+	// means defaultFetchTimeout.
+	FetchTimeout time.Duration
 	// FailureBackoff is the minimum interval between fetch attempts after a failed
 	// one. Zero or less means DefaultFailureBackoff; the value is capped at
 	// DefaultTTL.
@@ -53,26 +71,36 @@ type Config struct {
 type DocumentCache struct {
 	fetchFn        FetchFunc
 	onChange       OnChangeFunc
+	onFetched      func(data []byte)
 	defaultTTL     time.Duration
 	failureBackoff time.Duration
 	forcedFloor    time.Duration
+	fetchTimeout   time.Duration
 
 	mu            sync.RWMutex
+	lastSuccessAt time.Time
 	data          []byte
 	expiry        time.Time
 	lastErr       error
 	lastFailureAt time.Time
 	lastForcedAt  time.Time
+	lastStaleAt   time.Time
+	inflight      *fetchCall
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	closed atomic.Int32
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	closeCtx    context.Context
+	closeCancel context.CancelFunc
+	closed      atomic.Int32
 }
 
 // New creates a new DocumentCache and starts the background refresh goroutine.
 func New(cfg Config) *DocumentCache {
 	if cfg.DefaultTTL <= 0 {
 		cfg.DefaultTTL = 5 * time.Minute
+	}
+	if cfg.FetchTimeout <= 0 {
+		cfg.FetchTimeout = defaultFetchTimeout
 	}
 	if cfg.FailureBackoff <= 0 {
 		cfg.FailureBackoff = DefaultFailureBackoff
@@ -81,9 +109,11 @@ func New(cfg Config) *DocumentCache {
 		cfg.ForcedRefreshFloor = DefaultForcedRefreshFloor
 	}
 	c := &DocumentCache{
-		fetchFn:    cfg.FetchFn,
-		onChange:   cfg.OnChange,
-		defaultTTL: cfg.DefaultTTL,
+		fetchFn:      cfg.FetchFn,
+		onChange:     cfg.OnChange,
+		onFetched:    cfg.OnFetched,
+		fetchTimeout: cfg.FetchTimeout,
+		defaultTTL:   cfg.DefaultTTL,
 		// Both floors are capped at the refresh interval: a cache configured to
 		// re-read every few seconds must not be held back by a floor measured in
 		// tens of seconds. The one-second lower clamp keeps that cap from
@@ -95,6 +125,7 @@ func New(cfg Config) *DocumentCache {
 		forcedFloor:    max(time.Second, min(cfg.ForcedRefreshFloor, cfg.DefaultTTL)),
 		stopCh:         make(chan struct{}),
 	}
+	c.closeCtx, c.closeCancel = context.WithCancel(context.Background())
 	c.wg.Add(1)
 	go c.backgroundRefresh()
 	return c
@@ -117,14 +148,6 @@ func (c *DocumentCache) Get(ctx context.Context) ([]byte, error) {
 		return data, nil
 	}
 
-	// Slow path: write lock, double-check, then fetch.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if data, ok := c.cachedData(); ok {
-		return data, nil
-	}
-
 	return c.refresh(ctx)
 }
 
@@ -137,16 +160,114 @@ func (c *DocumentCache) cachedData() ([]byte, bool) {
 	return nil, false
 }
 
-// refresh fetches fresh data and updates the cache. Must be called under the write lock.
-// While the failure floor holds it reaches nothing upstream and returns what a
-// suppressed attempt would have produced. On fetch failure with stale data it returns
-// the stale data. On fetch failure with no data it returns the error.
+// fetchCall is the one fetch in flight. Everyone who wants a fetch shares it.
+type fetchCall struct {
+	done chan struct{}
+	data []byte
+	err  error
+}
+
+// refresh gets a fresh document from the fetch in flight, starting one if there is none.
+// While the failure floor holds it reaches nothing upstream and returns what a suppressed
+// attempt would have produced. On fetch failure with stale data it returns the stale data.
+// On fetch failure with no data it returns the error. It must be called without mu held.
 func (c *DocumentCache) refresh(ctx context.Context) ([]byte, error) {
-	if c.withinFailureFloor(time.Now()) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.inflight == nil && c.withinFailureFloor(time.Now()) {
+		defer c.mu.Unlock()
 		return c.lastKnown()
 	}
+	return c.fetchAndUnlock(ctx)
+}
 
-	data, rawHeaders, err := c.fetchFn(ctx)
+func (c *DocumentCache) wait(ctx context.Context, call *fetchCall) ([]byte, error) {
+	select {
+	case <-call.done:
+		return call.data, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// startFetch joins the fetch in flight or starts one. Must be called with mu held.
+func (c *DocumentCache) startFetch(ctx context.Context) (*fetchCall, error) {
+	if c.inflight != nil {
+		return c.inflight, nil
+	}
+	if c.closed.Load() != 0 {
+		return nil, ErrCacheClosed
+	}
+	call := &fetchCall{done: make(chan struct{})}
+	c.inflight = call
+	c.wg.Add(1)
+	go c.runFetch(context.WithoutCancel(ctx), call)
+	return call, nil
+}
+
+// runFetch runs one fetch, with its own timeout that also covers DNS, and publishes the
+// result. Because fetches never overlap, an older document cannot overwrite a newer one.
+func (c *DocumentCache) runFetch(ctx context.Context, call *fetchCall) {
+	defer c.wg.Done()
+	ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancel()
+	stop := context.AfterFunc(c.closeCtx, cancel)
+	defer stop()
+
+	// In a defer, so that a fetch ending in runtime.Goexit, which recover does not see, still
+	// wakes the callers waiting on it.
+	published := false
+	defer func() {
+		if !published {
+			c.publish(nil, nil, errFetchAbandoned, call)
+		}
+		c.mu.Lock()
+		c.inflight = nil
+		c.mu.Unlock()
+		close(call.done)
+	}()
+
+	data, rawHeaders, err := c.safeFetch(ctx)
+	old, changed := c.publish(data, rawHeaders, err, call)
+	published = true
+	if err == nil {
+		c.runHooks(old, data, changed)
+	}
+}
+
+// safeFetch keeps a panic in a fetch from ending the process, since this goroutine has no
+// net/http recover above it.
+func (c *DocumentCache) safeFetch(ctx context.Context) (data []byte, headers map[string][]string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			data, headers, err = nil, nil, fmt.Errorf("cache: fetch panicked: %v", r)
+		}
+	}()
+	return c.fetchFn(ctx)
+}
+
+// runHooks calls the hooks. They must not call back into the cache: they run inside the
+// fetch, so a refresh from a hook would wait on itself.
+func (c *DocumentCache) runHooks(old, data []byte, changed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("cache: hook panicked", "panic", r)
+		}
+	}()
+	if c.onFetched != nil {
+		c.onFetched(data)
+	}
+	if changed && c.onChange != nil {
+		c.onChange(old, data)
+	}
+}
+
+// publish records a fetch's result and fills in what waiting callers get.
+func (c *DocumentCache) publish(data []byte, rawHeaders map[string][]string, err error, call *fetchCall) (old []byte, changed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err != nil {
 		// Stamp the floor after the attempt, not before it: a fetch that ran into
 		// its own timeout has already spaced the next one by that much.
@@ -157,20 +278,14 @@ func (c *DocumentCache) refresh(ctx context.Context) ([]byte, error) {
 			// An expiry that a failure never moves puts every subsequent read back
 			// on the synchronous fetch path, so an unreachable authorization server
 			// turns into one outbound attempt per request, indefinitely.
-			//
-			// Extend only. A background refresh that fails at 80% of a still-valid
-			// document must not shorten its life: overwriting unconditionally would
-			// expire it early and send every read down the blocking fetch path for
-			// the rest of the window the document was still good for. The floor's
-			// own job is done without touching expiry — refresh returns lastKnown
-			// without reaching the network — so the write is only needed when
-			// expiry has already passed.
 			if e := c.lastFailureAt.Add(c.failureBackoff); e.After(c.expiry) {
 				c.expiry = e
 			}
-			return c.data, nil
+			call.data = c.data
+			return nil, false
 		}
-		return nil, err
+		call.err = err
+		return nil, false
 	}
 
 	headers := toHTTPHeaders(rawHeaders)
@@ -182,27 +297,71 @@ func (c *DocumentCache) refresh(ctx context.Context) ([]byte, error) {
 	// read takes the synchronous fetch path for as long as the header stays
 	// stale. Treat it as no preference and let the configured interval govern.
 	// The zero time ParseCacheExpiry returns for "no cache headers" lands here too.
-	//
-	// A server expiry *longer* than the configured interval is rejected for the
-	// opposite reason: it would make the effective TTL server-controlled, so an
-	// AS answering `max-age=86400` would pin a cache configured for five minutes
-	// to a day and keep a retired key trusted for that long. The configured
-	// interval is an upper bound; the server can only ask for less.
 	if !expiry.After(cachedAt) || expiry.After(cachedAt.Add(c.defaultTTL)) {
 		expiry = cachedAt.Add(c.defaultTTL)
 	}
 
-	old := c.data
-	if c.onChange != nil && old != nil && !bytes.Equal(old, data) {
-		c.onChange(old, data)
-	}
-
+	old = c.data
+	changed = old != nil && !bytes.Equal(old, data)
 	c.data = data
 	c.expiry = expiry
+	c.lastSuccessAt = cachedAt
 	// Any successful attempt closes the failure floor: the upstream answered.
 	c.lastFailureAt = time.Time{}
 	c.lastErr = nil
-	return c.data, nil
+	call.data = data
+	return old, changed
+}
+
+// RefreshStale asks for a fetch for a caller enforcing a maximum document age. That caller
+// runs before anything is authenticated, so it gets its own floor: at most one attempt per
+// floor, shared with any fetch in flight, and the failure floor still applies. The floor
+// never refuses a healthy upstream as long as it is below the caller's age limit.
+func (c *DocumentCache) RefreshStale(ctx context.Context, floor time.Duration) ([]byte, error) {
+	if c.closed.Load() != 0 {
+		return nil, ErrCacheClosed
+	}
+	// Checked before the floor is spent: a caller already gone must not cost others a fetch.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	now := time.Now()
+	if c.inflight == nil {
+		if c.withinFailureFloor(now) || now.Sub(c.lastStaleAt) < floor {
+			defer c.mu.Unlock()
+			return c.lastKnown()
+		}
+		c.lastStaleAt = now
+	}
+	return c.fetchAndUnlock(ctx)
+}
+
+// fetchAndUnlock joins or starts a fetch, releases mu, and waits. A caller admitted past a
+// floor comes here with the lock still held and no further check of its context, so a floor
+// it spent always buys a fetch, even if the caller then leaves.
+func (c *DocumentCache) fetchAndUnlock(ctx context.Context) ([]byte, error) {
+	call, err := c.startFetch(ctx)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return c.wait(ctx, call)
+}
+
+// LastError returns the error from the most recent failed fetch, or nil when the most
+// recent attempt succeeded.
+func (c *DocumentCache) LastError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastErr
+}
+
+// LastSuccess returns when a fetch last succeeded, or the zero time if none has.
+func (c *DocumentCache) LastSuccess() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastSuccessAt
 }
 
 // withinFailureFloor reports whether the retry floor opened by the last failed fetch
@@ -234,50 +393,48 @@ func (c *DocumentCache) lastKnown() ([]byte, error) {
 // ForceRefresh bypasses the cache TTL and fetches fresh data immediately, subject to
 // the refresh floors. The cache is updated on success. On failure, stale data is
 // returned if available.
-//
-// The caller that reaches it is a JWKS kid miss, and nothing upstream of that has
-// authenticated anything — only the token header has been decoded — so a well-formed
-// header carrying an attacker-chosen kid would otherwise cost the authorization server
-// one fetch per request, unthrottled. The floor caps that at one forced fetch per
-// interval while still following a real rotation promptly: the first miss after it
-// elapses fetches immediately, and a refused one degrades to an ordinary read.
-//
-// "Ordinary read" is literal: a refusal serves the cached document only while it
-// is still within its TTL, exactly as Get would. Returning an expired document
-// would be worse than the pre-floor behavior — after a transient upstream
-// failure the forced window stays spent for the rest of the floor, and every
-// legitimate token carrying a rotated kid would be rejected against a key set
-// that an ordinary read would have re-fetched.
 func (c *DocumentCache) ForceRefresh(ctx context.Context) ([]byte, error) {
 	if c.closed.Load() != 0 {
 		return nil, ErrCacheClosed
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Checked before the window is spent: a caller already gone must not hide a rotation.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// The failure floor is consulted first so a forced refresh that it is going to
 	// refuse anyway does not spend the forced window: burning it on a refusal would
 	// downgrade the first miss after the floor elapses, which is exactly the one
 	// that follows a key rotation.
 	now := time.Now()
-	if !c.withinFailureFloor(now) && !c.admitForcedRefresh(now) {
-		if data, ok := c.cachedData(); ok {
-			return data, nil
+	c.mu.Lock()
+	if c.inflight == nil {
+		if c.withinFailureFloor(now) {
+			defer c.mu.Unlock()
+			return c.lastKnown()
+		}
+		if !c.admitForcedRefresh(now) {
+			if data, ok := c.cachedData(); ok {
+				c.mu.Unlock()
+				return data, nil
+			}
 		}
 	}
-	// refresh handles the within-floor and no-data cases via lastKnown.
-	return c.refresh(ctx)
+	return c.fetchAndUnlock(ctx)
 }
 
 // Close stops the background refresh goroutine and waits for it to finish.
 // Subsequent calls to Get will return ErrCacheClosed.
 // Close is idempotent.
 func (c *DocumentCache) Close() {
-	if c.closed.Swap(1) != 0 {
+	c.mu.Lock()
+	already := c.closed.Swap(1) != 0
+	c.mu.Unlock()
+	if already {
 		return
 	}
 	close(c.stopCh)
+	c.closeCancel()
 	c.wg.Wait()
 }
 
@@ -295,9 +452,7 @@ func (c *DocumentCache) backgroundRefresh() {
 				return
 			}
 
-			c.mu.Lock()
-			_, _ = c.refresh(context.Background())
-			c.mu.Unlock()
+			_, _ = c.refresh(c.closeCtx)
 		} else {
 			// Cache is still cold; poll briefly.
 			select {
@@ -310,23 +465,25 @@ func (c *DocumentCache) backgroundRefresh() {
 }
 
 // nextRefreshIn returns the duration to wait before the next background refresh,
-// calculated as 80% of the remaining TTL. Returns 0 if the cache is cold.
+// calculated as 80% of the remaining TTL, or 0 while the cache is cold. An expired
+// document waits out what is left of the failure floor and then retries: reads may
+// never come back to restart it, because JWKS lookups use parsed keys.
 func (c *DocumentCache) nextRefreshIn() time.Duration {
 	c.mu.RLock()
 	expiry := c.expiry
 	hasData := c.data != nil
+	lastFailure := c.lastFailureAt
 	c.mu.RUnlock()
 
 	if !hasData || expiry.IsZero() {
 		return 0
 	}
 
-	remaining := time.Until(expiry)
-	if remaining <= 0 {
-		return 0
+	wait := time.Duration(float64(time.Until(expiry)) * 0.8)
+	if !lastFailure.IsZero() {
+		wait = max(wait, c.failureBackoff-time.Since(lastFailure))
 	}
-
-	return time.Duration(float64(remaining) * 0.8)
+	return max(wait, minRefreshDelay)
 }
 
 // toHTTPHeaders converts map[string][]string (as returned by FetchFunc) to http.Header.

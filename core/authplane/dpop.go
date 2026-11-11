@@ -3,18 +3,23 @@ package authplane
 import (
 	stdcrypto "crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"time"
 
 	"github.com/authplane/go-sdk/core/internal/dpop"
+	"github.com/authplane/go-sdk/core/internal/oauth"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/cryptosigner"
 )
 
 // DPoPKeyMaterial holds the key pair used for DPoP proof generation.
@@ -30,19 +35,9 @@ type DPoPKeyMaterial struct {
 // Suitable for testing and ephemeral single-instance processes.
 // For production: load key material from a secrets manager or vault.
 func NewDPoPKeyMaterial(alg jose.SignatureAlgorithm) (*DPoPKeyMaterial, error) {
-	var key stdcrypto.Signer
-	var err error
-
-	switch alg {
-	case jose.ES256:
-		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	case jose.RS256:
-		key, err = rsa.GenerateKey(rand.Reader, 2048)
-	default:
-		return nil, fmt.Errorf("unsupported DPoP algorithm: %s", alg)
-	}
+	key, err := generateDPoPKey(alg)
 	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
+		return nil, err
 	}
 
 	return NewDPoPKeyMaterialFromKey(key, alg)
@@ -50,9 +45,16 @@ func NewDPoPKeyMaterial(alg jose.SignatureAlgorithm) (*DPoPKeyMaterial, error) {
 
 // NewDPoPKeyMaterialFromKey creates DPoPKeyMaterial from an existing private key.
 func NewDPoPKeyMaterialFromKey(key stdcrypto.Signer, alg jose.SignatureAlgorithm) (*DPoPKeyMaterial, error) {
+	if key == nil {
+		return nil, errors.New("authplane: DPoP key must not be nil")
+	}
 	jwk := jose.JSONWebKey{
 		Key:       key.Public(),
 		Algorithm: string(alg),
+	}
+	// Refuse now a key and algorithm that could never sign a proof.
+	if _, err := newProofSigner(key, alg, jwk); err != nil {
+		return nil, fmt.Errorf("authplane: DPoP key does not fit algorithm %s: %w", alg, err)
 	}
 	return &DPoPKeyMaterial{key: key, alg: alg, jwk: jwk}, nil
 }
@@ -82,11 +84,20 @@ type DPoPProofOptions struct {
 	AccessToken string
 }
 
-// NewDPoPSigner creates a DPoPSigner with a freshly generated key pair.
-func NewDPoPSigner(alg jose.SignatureAlgorithm) (*DPoPSigner, error) {
+// String keeps the access token out of logs.
+func (o DPoPProofOptions) String() string {
+	return fmt.Sprintf("{Nonce:%s AccessToken:%s}", o.Nonce, oauth.Redact(o.AccessToken))
+}
+
+// GoString keeps the access token out of %#v.
+func (o DPoPProofOptions) GoString() string { return o.String() }
+
+// LogValue keeps the access token out of structured logs.
+func (o DPoPProofOptions) LogValue() slog.Value { return slog.StringValue(o.String()) }
+
+func generateDPoPKey(alg jose.SignatureAlgorithm) (stdcrypto.Signer, error) {
 	var key stdcrypto.Signer
 	var err error
-
 	switch alg {
 	case jose.ES256:
 		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -97,6 +108,33 @@ func NewDPoPSigner(alg jose.SignatureAlgorithm) (*DPoPSigner, error) {
 	}
 	if err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
+	}
+	return key, nil
+}
+
+// String keeps the private key out of logs and %v.
+func (km *DPoPKeyMaterial) String() string { return "DPoPKeyMaterial{alg:" + string(km.alg) + "}" }
+
+// GoString keeps the private key out of %#v.
+func (km *DPoPKeyMaterial) GoString() string { return km.String() }
+
+// LogValue keeps the private key out of structured logs.
+func (km *DPoPKeyMaterial) LogValue() slog.Value { return slog.StringValue(km.String()) }
+
+// String keeps the private key out of logs and %v.
+func (d *DPoPSigner) String() string { return "DPoPSigner{jkt:" + d.jkt + "}" }
+
+// GoString keeps the private key out of %#v.
+func (d *DPoPSigner) GoString() string { return d.String() }
+
+// LogValue keeps the private key out of structured logs.
+func (d *DPoPSigner) LogValue() slog.Value { return slog.StringValue(d.String()) }
+
+// NewDPoPSigner creates a DPoPSigner with a freshly generated key pair.
+func NewDPoPSigner(alg jose.SignatureAlgorithm) (*DPoPSigner, error) {
+	key, err := generateDPoPKey(alg)
+	if err != nil {
+		return nil, err
 	}
 
 	return NewDPoPSignerWithKey(key, alg)
@@ -121,10 +159,7 @@ func NewDPoPSignerWithKey(key stdcrypto.Signer, alg jose.SignatureAlgorithm) (*D
 	}
 	jkt := base64.RawURLEncoding.EncodeToString(thumbprint)
 
-	signerOpts := jose.SigningKey{Algorithm: alg, Key: key}
-	signer, err := jose.NewSigner(signerOpts, (&jose.SignerOptions{}).
-		WithType("dpop+jwt").
-		WithHeader("jwk", publicJWK))
+	signer, err := newProofSigner(key, alg, publicJWK)
 	if err != nil {
 		return nil, fmt.Errorf("create signer: %w", err)
 	}
@@ -136,6 +171,20 @@ func NewDPoPSignerWithKey(key stdcrypto.Signer, alg jose.SignatureAlgorithm) (*D
 		signer:     signer,
 		jkt:        jkt,
 	}, nil
+}
+
+// newProofSigner builds the proof signer. A key that is not one of the standard library's
+// types, such as an HSM or KMS key, signs through cryptosigner.
+func newProofSigner(key stdcrypto.Signer, alg jose.SignatureAlgorithm, publicJWK jose.JSONWebKey) (jose.Signer, error) {
+	var signingKey any = key
+	switch key.(type) {
+	case *ecdsa.PrivateKey, *rsa.PrivateKey, ed25519.PrivateKey:
+	default:
+		signingKey = cryptosigner.Opaque(key)
+	}
+	return jose.NewSigner(jose.SigningKey{Algorithm: alg, Key: signingKey}, (&jose.SignerOptions{}).
+		WithType("dpop+jwt").
+		WithHeader("jwk", publicJWK))
 }
 
 // GenerateProof generates a DPoP proof JWT for the given HTTP method and URL.

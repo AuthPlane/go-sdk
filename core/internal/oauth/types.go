@@ -1,8 +1,15 @@
 package oauth
 
 import (
+	"crypto"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-jose/go-jose/v4"
 )
 
 // ClientAuthMethod identifies the OAuth client authentication method.
@@ -12,13 +19,50 @@ type ClientAuthMethod string
 const (
 	ClientAuthClientSecretBasic ClientAuthMethod = "client_secret_basic"
 	ClientAuthClientSecretPost  ClientAuthMethod = "client_secret_post"
+	ClientAuthPrivateKeyJWT     ClientAuthMethod = "private_key_jwt"
 )
+
+// flexibleInt64 reads a JSON number, or a number in a string, which some servers send for
+// expires_in.
+type flexibleInt64 int64
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (f *flexibleInt64) UnmarshalJSON(data []byte) error {
+	text := strings.Trim(string(data), `"`)
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return fmt.Errorf("expires_in is not a number: %w", err)
+	}
+	*f = flexibleInt64(value)
+	return nil
+}
 
 // ClientAuthentication holds client-credentials style authentication settings.
 type ClientAuthentication struct {
 	Method       ClientAuthMethod
 	ClientID     string
 	ClientSecret string
+
+	// SigningKey, SigningAlg and KeyID sign the assertion for ClientAuthPrivateKeyJWT.
+	// SigningAlg must be asymmetric.
+	SigningKey crypto.Signer
+	SigningAlg jose.SignatureAlgorithm
+	KeyID      string
+
+	// AssertionAudienceTokenEndpoint uses the token endpoint as the assertion's aud,
+	// for servers that demand it, such as Microsoft Entra ID, in place of the issuer. Only assertions sent to the
+	// token endpoint use it: one sent elsewhere could be replayed there by whoever
+	// receives it (draft-ietf-oauth-rfc7523bis).
+	AssertionAudienceTokenEndpoint bool
+
+	issuer string // the assertion's default aud; see BindIssuer
+}
+
+// BindIssuer returns auth with the issuer its assertions name by default. The client
+// facade calls it, so callers never set this themselves.
+func BindIssuer(auth ClientAuthentication, issuer string) ClientAuthentication {
+	auth.issuer = issuer
+	return auth
 }
 
 // StringOrSlice handles JSON fields that can be either a string or []string.
@@ -68,6 +112,9 @@ type TokenResponse struct {
 	// disagreeing with its own `cnf.jkt` cannot mint a mismatched
 	// thumbprint.
 	CnfJkt string `json:"cnf_jkt,omitempty"`
+
+	// AuthorizationDetails is the RFC 9396 authorization_details the server granted.
+	AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty"`
 }
 
 // IntrospectionResponse represents an RFC 7662 introspection response.
@@ -102,8 +149,31 @@ type IntrospectionResponse struct {
 	// Same derivation semantics as TokenResponse.CnfJkt.
 	CnfJkt string `json:"cnf_jkt,omitempty"`
 
+	// AuthorizationDetails is the token's RFC 9396 authorization_details.
+	AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty"`
+
 	// Extra captures unknown claims from the introspection response.
 	Extra map[string]any `json:"-"`
+}
+
+// ClientCredentialsInput configures a client_credentials grant.
+type ClientCredentialsInput struct {
+	Scopes    []string
+	Resources []string
+
+	// AuthorizationDetails is a JSON array sent as RFC 9396 authorization_details.
+	AuthorizationDetails json.RawMessage
+}
+
+// JWTBearerInput configures an RFC 7523 section 2.1 JWT-bearer grant, which also
+// redeems an Identity Assertion JWT Authorization Grant (ID-JAG).
+type JWTBearerInput struct {
+	Assertion string
+	Scopes    []string
+	Resources []string
+
+	// AuthorizationDetails is a JSON array sent as RFC 9396 authorization_details.
+	AuthorizationDetails json.RawMessage
 }
 
 // TokenExchangeInput configures an RFC 8693 token exchange request.
@@ -115,6 +185,9 @@ type TokenExchangeInput struct {
 	Scopes           []string
 	Resources        []string
 	Audiences        []string
+
+	// AuthorizationDetails is a JSON array sent as RFC 9396 authorization_details.
+	AuthorizationDetails json.RawMessage
 }
 
 // ConsentRequiredError is returned from token exchange when the authorization
@@ -144,6 +217,37 @@ func (e *ConsentRequiredError) Unwrap() error {
 	return e.Cause
 }
 
+// ResponseError is an error answer from the authorization server. It wraps the matching
+// sentinel, so errors.Is still works, and errors.As gives the server's code and status.
+type ResponseError struct {
+	// Code is the RFC 6749 error code, or empty if the body held none.
+	Code string
+	// Description is the server's error_description, cleaned and shortened.
+	Description string
+	// Status is the HTTP status of the answer.
+	Status int
+	// RetryAfter is the delay the Retry-After header asked for in seconds form, or zero.
+	RetryAfter time.Duration
+
+	cause error
+}
+
+func (e *ResponseError) Error() string {
+	switch {
+	case e.cause != nil && e.Description != "":
+		return e.cause.Error() + ": " + e.Description
+	case e.cause != nil:
+		return e.cause.Error()
+	case e.Description != "":
+		return fmt.Sprintf("HTTP %d: %s", e.Status, e.Description)
+	default:
+		return fmt.Sprintf("HTTP %d", e.Status)
+	}
+}
+
+// Unwrap returns the sentinel for Code.
+func (e *ResponseError) Unwrap() error { return e.cause }
+
 // OAuth 2.0 error sentinels.
 var (
 	ErrInvalidGrant         = errors.New("auth: invalid_grant")
@@ -155,9 +259,11 @@ var (
 	ErrServerError          = errors.New("auth: server_error")
 	ErrProtocolError        = errors.New("auth: protocol_error")
 	ErrCircuitOpen          = errors.New("auth: circuit open")
-	ErrUseDPoPNonce         = errors.New("auth: use_dpop_nonce")
-	ErrConsentRequired      = errors.New("auth: consent_required")
-	ErrInteractionRequired  = errors.New("auth: interaction_required")
+	// ErrNoIntrospectionEndpoint: the server's metadata has no introspection_endpoint.
+	ErrNoIntrospectionEndpoint = fmt.Errorf("%w: introspection endpoint not configured", ErrInvalidRequest)
+	ErrUseDPoPNonce            = errors.New("auth: use_dpop_nonce")
+	ErrConsentRequired         = errors.New("auth: consent_required")
+	ErrInteractionRequired     = errors.New("auth: interaction_required")
 	// ErrAccessDenied is returned when the AS refuses a cross-client token
 	// exchange (HTTP 403): the exchanging client is not allowlisted on the
 	// target resource. Operator-fixable, not user-fixable — re-prompting the
@@ -196,6 +302,6 @@ func mapOAuthError(errorCode string) error {
 	case "invalid_target":
 		return ErrInvalidTarget
 	default:
-		return errors.New("auth: " + errorCode)
+		return errors.New("auth: " + cleanServerText([]byte(errorCode)))
 	}
 }

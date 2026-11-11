@@ -63,9 +63,7 @@ in each module for full integration walkthroughs.
 
 ## Go Version Floor
 
-- `core/`, `http/`: Go 1.24+.
-- `mcp/`: Go 1.25+ (forced by `github.com/modelcontextprotocol/go-sdk`).
-- `mark3labs/`: Go 1.25+ (forced by `github.com/mark3labs/mcp-go`).
+- All modules: Go 1.26+.
 
 ## API Examples
 
@@ -105,7 +103,7 @@ _ = claims
 
 For local development (HTTP issuer, localhost, private nets), pass
 `authplane.WithFetchSettings(authplane.DevModeFetchSettings())` to
-`NewClient`, or set `AUTHPLANE_DEV_MODE=1` in the environment.
+`NewClient`.
 
 ### 2) HTTP middleware (`http/`)
 
@@ -120,7 +118,10 @@ import (
 res, _ := client.Resource(resourceURL,
     resource.WithScopes("tools/add", "tools/multiply"),
 )
-adapter := authplanehttp.New(res)
+adapter, err := authplanehttp.New(res)
+if err != nil {
+    panic(err)
+}
 
 mux := http.NewServeMux()
 mux.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
@@ -147,7 +148,7 @@ adapter, _ := authplanemcp.NewAdapter(ctx, authplanemcp.Options{
 })
 defer adapter.Close()
 
-http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 http.Handle("/mcp", adapter.AuthMiddleware(handler))
 ```
 
@@ -195,12 +196,12 @@ Top-level public types under `github.com/authplane/go-sdk/core/...`:
 |---|---|---|
 | `Client`, `NewClient`, `Close` | `authplane` | Top-level facade — AS metadata + JWKS caches, token cache, circuit breaker |
 | `Option`, `WithClientCredentials`, `WithClientAuthentication`, `WithDPoP`, `WithDPoPNonceStore`, `WithFetchSettings`, `WithJWKSCacheTTL`, `WithCircuitBreaker`, `WithTokenCacheTTLBuffer` | `authplane` | Client configuration |
-| `FetchSettings`, `DefaultFetchSettings`, `DevModeFetchSettings` | `authplane` | SSRF / HTTP transport tuning (timeout, HTTPS enforcement, localhost / private-net allowlists) |
+| `FetchSettings`, `FetchEvent`, `DefaultFetchSettings`, `DevModeFetchSettings`, `WithLogger`, `WithoutTokenVerification`, `NewClientAndResource`, `OAuthError` | `authplane` | SSRF / HTTP transport tuning (timeout, HTTPS enforcement, localhost / private-net allowlists) |
 | `DPoPKeyMaterial`, `DPoPSigner`, `NewDPoPSigner`, `DPoPNonceStore`, `NewInMemoryDPoPNonceStore` | `authplane` | Outbound DPoP proof generation and nonce caching |
 | `TokenResponse`, `IntrospectionResponse`, `TokenExchangeInput`, `ConsentRequiredError`, OAuth error sentinels (`ErrInvalidGrant`, `ErrConsentRequired`, etc.) | `authplane` | Token-operation results and OAuth error types |
 | `Resource`, `Option`, `WithScopes`, `WithVerifierOptions` | `resource` | Protected-resource facade (verify + RFC 9728 PRM) |
 | `VerifyOption`, `WithDPoP` | `resource` | Per-call options for `Resource.VerifyToken` (e.g. attach a `DPoPContext`) |
-| `HTTPStatus`, `AuthErrorResponse`, `AuthErrorResponseVerbose`, `ScopeError` | `resource` | Error → HTTP status / WWW-Authenticate helpers (RFC 6750). The JSON body's `error_description` is a fixed sentence per error code; the `Verbose` variant restores the error's own message and is a development aid only |
+| `HTTPStatus`, `AuthErrorResponse`, `ErrorOption`, `WithRealm`, `WithChallengeMetadata`, `WithVerboseDescription`, `WithDPoPPolicy`, `SanitizeChallengeValue`, `ScopeError` | `resource` | Error → HTTP status / WWW-Authenticate helpers (RFC 6750). The JSON body's `error_description` is a fixed sentence per error code; the `Verbose` variant restores the error's own message and is a development aid only |
 | `TokenVerifier`, `NewTokenVerifier`, `JWKSCache`, `NewJWKSCache` | `verifier` | Lower-level JWT verification + JWKS cache (used by `Resource`) |
 | `VerifiedClaims` (with `DPoPProof()` accessor) | `verifier` | Validated JWT claims; DPoP-bound tokens expose validated proof via `DPoPProof() *VerifiedDPoPProof` |
 | `VerifiedDPoPProof` | `verifier` | JTI, HTM, HTU, IAT, KeyThumbprint, Nonce of a validated DPoP proof |
@@ -215,3 +216,11 @@ Top-level public types under `github.com/authplane/go-sdk/core/...`:
 - Authplane authorization server: https://github.com/AuthPlane/authserver
 - Conformance catalog: https://github.com/AuthPlane/conformance
 - License: Apache-2.0 (`LICENSE`)
+
+## Other servers, MCP 2026-07-28 and 0.5 changes
+
+- Verifier options for other authorization servers: `WithAcceptedTokenTypes`, `TokenTypeNone`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers`, `WithExpectedAudience`, `WithScopeImplication`. See `core/docs/user-guide.md`.
+- `Client.Metadata` returns discovered metadata. `ClientAuthPrivateKeyJWT`, `Client.JWTBearer` and `authorization_details` are supported. `WithJWKSMaxStale` limits trust in stale keys. `FetchSettings.RootCAs` trusts a private CA.
+- `mcp`: a handler needs `&mcp.StreamableHTTPOptions{Stateless: true}` to speak protocol 2026-07-28. Add `server.AddReceivingMiddleware(adapter.ReceivingMiddleware())`, or `ClaimsFromContext` reads nil on later calls in a legacy session. `RequireToolScopes` gives a 403 step-up.
+- `mark3labs`: add `server.WithSessionIdManagerResolver(adapter.SessionManager())`, or sessions answer 404.
+- `http` issuers need settings that allow HTTP. `WithVerifierOptions` accumulates. `WithInboundDPoP` checks replay by default.

@@ -7,16 +7,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/authplane/go-sdk/core/internal/ssrf"
 )
 
 func testFetchSettings() ssrf.FetchSettings {
 	return ssrf.FetchSettings{
-		SSRFProtection: false,
-		AllowHTTP:      true,
-		Timeout:        ssrf.DefaultTimeout,
+		DisableSSRFProtection: true,
+		AllowHTTP:             true,
+		Timeout:               ssrf.DefaultTimeout,
 	}
 }
 
@@ -730,5 +732,70 @@ func TestPostForm_BuildHeadersErrorAbortsRequest(t *testing.T) {
 	}
 	if callCount != 0 {
 		t.Fatalf("HTTP calls = %d, want 0 (BuildHeaders error should abort)", callCount)
+	}
+}
+
+// An inactive answer is final, whatever else it holds; only active itself can be malformed.
+func TestIntrospect_InactiveIsFinal_A88(t *testing.T) {
+	for _, tt := range []struct {
+		body       string
+		wantActive bool
+		wantErr    bool
+	}{
+		{body: `{"active":false}`},
+		{body: `{"active":false,"iat":1.5}`},
+		{body: `{"active":false,"sub":12}`},
+		{body: `{}`},
+		{body: `{"active":"true"}`},
+		{body: `{"active":1}`},
+		{body: `{"active":false,"Active":true}`},
+		{body: `{"Active":true}`},
+		{body: `{"ACTIVE":true}`},
+		{body: `{"active":true,"active":false}`},
+		{body: `{"active":false,"active":true}`},
+		{body: `{"active":true,"active":true}`},
+		{body: `not json`, wantErr: true},
+		{body: `[1]`},
+		{body: `null`},
+		{body: `{"active":true,"Active":"yes"}`},
+		{body: `{"active":true,"sub":12}`, wantErr: true},
+		{body: `{"active":true,"sub":"u"}`, wantActive: true},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(tt.body))
+		}))
+		resp, err := Introspect(context.Background(), srv.URL, testClientAuth(), testFetchSettings(), "t", nil)
+		srv.Close()
+		if (err != nil) != tt.wantErr {
+			t.Errorf("%s: err = %v", tt.body, err)
+			continue
+		}
+		if err == nil && resp.Active != tt.wantActive {
+			t.Errorf("%s: active = %v", tt.body, resp.Active)
+		}
+	}
+}
+
+func TestParseErrorResponse_TypedAndCleaned_A94(t *testing.T) {
+	headers := http.Header{"Retry-After": {"12"}}
+	err := parseErrorResponse(&ssrf.HTTPResponse{Status: 400, Headers: headers, Body: []byte(`{"error":"invalid_grant","error_description":"line\nbreak"}`)})
+	var oauthErr *ResponseError
+	if !errors.As(err, &oauthErr) || !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("err = %#v", err)
+	}
+	if oauthErr.Code != "invalid_grant" || oauthErr.Status != 400 || oauthErr.RetryAfter != 12*time.Second || oauthErr.Description != "line break" {
+		t.Errorf("%+v", oauthErr)
+	}
+
+	err = parseErrorResponse(&ssrf.HTTPResponse{Status: 502, Body: []byte(strings.Repeat("x\n", 100_000))})
+	if got := err.Error(); len(got) > 300 || strings.Contains(got, "\n") {
+		t.Errorf("raw body reached the error: %d bytes", len(got))
+	}
+
+	err = parseErrorResponse(&ssrf.HTTPResponse{Status: 400, Body: []byte(`{"error":"consent_required","consent_url":"https://c.example"}`)})
+	var consent *ConsentRequiredError
+	if !errors.As(err, &consent) || !errors.As(err, &oauthErr) || !errors.Is(err, ErrConsentRequired) || consent.ConsentURL == "" {
+		t.Errorf("consent: %#v", err)
 	}
 }

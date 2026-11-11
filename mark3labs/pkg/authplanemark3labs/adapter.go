@@ -14,7 +14,7 @@
 //
 // Bearer/DPoP parsing, the RFC 6750 WWW-Authenticate challenge (including the
 // RFC 9728 resource_metadata advertisement), context keys, and scope-enforcing
-// middleware all come from the embedded *authplanehttp.Adapter. PRM is served
+// middleware all come from the wrapped *authplanehttp.Adapter. PRM is served
 // via mark3labs/mcp-go's server.NewProtectedResourceMetadataHandler so the
 // HTTP framing (CORS, Cache-Control: no-store, allowed methods) matches the
 // MCP authorization spec, while core remains the source of the field values.
@@ -22,10 +22,10 @@ package authplanemark3labs
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/authplane/go-sdk/core/authplane"
@@ -41,7 +41,9 @@ type Options struct {
 	// Required
 	Issuer   string
 	Resource string
-	Scopes   []string
+
+	// Scopes are the scopes this resource advertises. Optional.
+	Scopes []string
 
 	// ResourceMetadataURL overrides the URL advertised in the RFC 9728 §5.1
 	// resource_metadata parameter of the WWW-Authenticate challenge. Leave it
@@ -51,105 +53,115 @@ type Options struct {
 	// construction if it is not an absolute http(s) URL.
 	ResourceMetadataURL string
 
+	// Logger receives this adapter's logs. Nil means slog's default. Pass authplane.WithLogger
+	// in ClientOptions for the client's own logs.
+	Logger *slog.Logger
+
 	// DevMode relaxes SSRF protection to allow HTTP and localhost — required when
 	// the issuer runs on a local development server. Remove before deploying to production.
-	// The SDK also checks the AUTHPLANE_DEV_MODE=1 env var as a fallback.
 	DevMode bool
 
 	// ClientOptions are SDK-level options: WithClientCredentials, WithClientAuthentication,
 	// WithJWKSCacheTTL, WithCircuitBreaker, WithDPoP, etc.
-	//
-	// When WithClientCredentials or WithClientAuthentication is present, RFC 7662
-	// introspection is automatically wired as the default revocation checker.
-	// To disable it, pass verifier.WithRevocationChecker(verifier.NullRevocationChecker)
-	// in VerifierOptions.
 	ClientOptions []authplane.Option
 
 	// VerifierOptions are verifier-level options: WithAlgorithms, WithClockSkew,
 	// WithRevocationChecker (overrides auto-wired introspection), etc.
 	VerifierOptions []verifier.Option
+
+	// AllowUnboundSessions lets a session be used by any authenticated caller, as it
+	// was before sessions were bound to users. Prefer SessionManager.
+	AllowUnboundSessions bool
+
+	// SessionKey signs session IDs, and must be shared by replicas. At least 32 bytes.
+	// Empty uses a random per-process key, which suits one instance.
+	SessionKey []byte `json:"-"`
 }
 
+// SessionOptions configures session binding for NewAdapterFromClientAndResource. The fields
+// mean what Options.AllowUnboundSessions and Options.SessionKey mean.
+type SessionOptions struct {
+	AllowUnbound bool
+	Key          []byte `json:"-"`
+}
+
+// String keeps the session key out of logs and %v.
+func (o Options) String() string {
+	return fmt.Sprintf("{Issuer:%s Resource:%s DevMode:%v AllowUnboundSessions:%v}", o.Issuer, o.Resource, o.DevMode, o.AllowUnboundSessions)
+}
+
+// GoString keeps the session key out of %#v.
+func (o Options) GoString() string { return o.String() }
+
+// LogValue keeps the session key out of structured logs.
+func (o Options) LogValue() slog.Value { return slog.StringValue(o.String()) }
+
+// String keeps the session key out of logs and %v.
+func (o SessionOptions) String() string { return fmt.Sprintf("{AllowUnbound:%v}", o.AllowUnbound) }
+
+// GoString keeps the session key out of %#v.
+func (o SessionOptions) GoString() string { return o.String() }
+
+// LogValue keeps the session key out of structured logs.
+func (o SessionOptions) LogValue() slog.Value { return slog.StringValue(o.String()) }
+
 // Adapter integrates the Authplane core SDK with mark3labs/mcp-go.
-//
-// It embeds *authplanehttp.Adapter so the standard HTTP surface — Middleware
-// (Bearer + DPoP), RequireScopes, and the context helpers — is available
-// directly. The mark3labs-specific additions live on Adapter itself:
-// HTTPContextFunc (claims bridge), ProtectedResourceMetadataHandler (uses
-// mark3labs/mcp-go's PRM handler with values from core), and TokenExchange
-// with URL-elicitation mapping.
-//
-// Always call Close() when the adapter is no longer needed to stop background
-// refresh goroutines and release HTTP connections.
 type Adapter struct {
-	*authplanehttp.Adapter
+	http *authplanehttp.Adapter
 
 	client     *authplane.Client
 	prmHandler http.Handler // mark3labs PRM handler, built once at construction
-	ownsClient bool         // true when this Adapter constructed the client and must close it
+	sessions   *sessionBinder
+	ownsClient bool // true when this Adapter constructed the client and must close it
 }
 
 // ClaimsFromContext returns the VerifiedClaims injected by Middleware (and
 // forwarded by HTTPContextFunc) into the per-tool-call context. Returns nil
 // when called outside an authenticated request.
-//
-// Thin wrapper around authplanehttp.ClaimsFromContext — the two packages share
-// a single context-key namespace so claims flow from Middleware through
-// HTTPContextFunc into tool handlers without translation.
 func ClaimsFromContext(ctx context.Context) *verifier.VerifiedClaims {
 	return authplanehttp.ClaimsFromContext(ctx)
 }
 
 // TokenFromContext returns the raw bearer token injected by Middleware (and
 // forwarded by HTTPContextFunc). Returns "" outside an authenticated request.
-// Thin wrapper around authplanehttp.TokenFromContext for the same reason as
-// ClaimsFromContext.
+// A thin wrapper around authplanehttp.TokenFromContext.
 func TokenFromContext(ctx context.Context) string {
 	return authplanehttp.TokenFromContext(ctx)
 }
 
 // NewAdapter creates and initializes an Adapter. It calls authplane.NewClient,
 // which performs RFC 8414 AS metadata discovery and warms the JWKS cache.
-//
-// When ClientOptions includes WithClientCredentials or WithClientAuthentication,
-// RFC 7662 introspection is automatically wired as the default revocation checker,
-// and TokenExchange becomes operational.
-//
-// The provided ctx is used only for initial discovery; background refresh
-// goroutines use their own context. Call Close() when the adapter is no longer needed.
 func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
-	clientOpts := make([]authplane.Option, 0, 1+len(options.ClientOptions))
-	if options.DevMode {
-		clientOpts = append(clientOpts, authplane.WithFetchSettings(authplane.DevModeFetchSettings()))
-	}
-	clientOpts = append(clientOpts, options.ClientOptions...)
-
-	client, err := authplane.NewClient(ctx, options.Issuer, clientOpts...)
+	client, res, err := authplane.NewClientAndResource(ctx, authplane.Setup{
+		Issuer:              options.Issuer,
+		Resource:            options.Resource,
+		Scopes:              options.Scopes,
+		ResourceMetadataURL: options.ResourceMetadataURL,
+		DevMode:             options.DevMode,
+		ClientOptions:       options.ClientOptions,
+		VerifierOptions:     options.VerifierOptions,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	resourceOpts := []resource.Option{resource.WithScopes(options.Scopes...)}
-	if options.ResourceMetadataURL != "" {
-		resourceOpts = append(resourceOpts, resource.WithResourceMetadataURL(options.ResourceMetadataURL))
-	}
-	if len(options.VerifierOptions) > 0 {
-		// Only pass WithVerifierOptions when non-empty: WithVerifierOptions replaces
-		// (not appends) the verifier option list, so passing an empty slice would
-		// overwrite any options already auto-wired by client.Resource (e.g. the
-		// RFC 7662 introspection revocation checker).
-		resourceOpts = append(resourceOpts, resource.WithVerifierOptions(options.VerifierOptions...))
-	}
-	res, err := client.Resource(options.Resource, resourceOpts...)
+	sessions, err := newSessionBinder(options.SessionKey, options.AllowUnboundSessions)
 	if err != nil {
 		_ = client.Close()
 		return nil, err
 	}
-
+	sessions.logger = options.Logger
+	prm := withPRMAllow(server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)))
+	httpAdapter, err := authplanehttp.New(res, authplanehttp.WithPRMHandler(prm), authplanehttp.WithLogger(options.Logger))
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
 	return &Adapter{
-		Adapter:    authplanehttp.New(res),
+		http:       httpAdapter,
 		client:     client,
-		prmHandler: server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)),
+		prmHandler: prm,
+		sessions:   sessions,
 		ownsClient: true,
 	}, nil
 }
@@ -159,29 +171,37 @@ func NewAdapter(ctx context.Context, options Options) (*Adapter, error) {
 // client — adapter.Close() is a no-op for adapters created this way, so a
 // client shared across multiple adapters keeps running even after one of them
 // is closed.
-//
-// Returns an error if client or res is nil. The signature matches the sibling
-// mcp adapter — neither constructor panics, and both surface programming
-// errors as a typed return value.
-func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource) (*Adapter, error) {
+func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Resource, session SessionOptions) (*Adapter, error) {
 	if client == nil {
 		return nil, errors.New("authplanemark3labs: client must not be nil")
 	}
 	if res == nil {
 		return nil, errors.New("authplanemark3labs: res must not be nil")
 	}
+	sessions, err := newSessionBinder(session.Key, session.AllowUnbound)
+	if err != nil {
+		return nil, err
+	}
+	prm := withPRMAllow(server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)))
+	httpAdapter, err := authplanehttp.New(res, authplanehttp.WithPRMHandler(prm))
+	if err != nil {
+		return nil, err
+	}
 	return &Adapter{
-		Adapter:    authplanehttp.New(res),
+		http:       httpAdapter,
 		client:     client,
-		prmHandler: server.NewProtectedResourceMetadataHandler(prmConfigFromResource(res)),
+		prmHandler: prm,
+		sessions:   sessions,
 		ownsClient: false,
 	}, nil
 }
 
 // AuthMiddleware returns an HTTP handler that enforces Bearer (and DPoP) token
-// authentication in front of a mark3labs/mcp-go *server.StreamableHTTPServer.
+// authentication in front of a mark3labs/mcp-go *server.StreamableHTTPServer. It also
+// binds legacy sessions to the user, which needs SessionManager on the server, or
+// Options.AllowUnboundSessions. server.SSEServer is not supported behind it.
 //
-// It is a thin wrapper over the embedded *authplanehttp.Adapter's Middleware,
+// It is a thin wrapper over the wrapped *authplanehttp.Adapter's Middleware,
 // preserving the mark3labs-style call shape used throughout the docs and demo:
 //
 //	http.Handle("/mcp", adapter.AuthMiddleware(streamable))
@@ -194,6 +214,54 @@ func NewAdapterFromClientAndResource(client *authplane.Client, res *resource.Res
 // call ClaimsFromContext(ctx).RequireScope(...).
 func (a *Adapter) AuthMiddleware(handler http.Handler) http.Handler {
 	return a.Middleware()(handler)
+}
+
+// Middleware is the wrapped http adapter's middleware plus the session binding, so a
+// server using this name directly is protected the same way as with AuthMiddleware.
+func (a *Adapter) Middleware() func(http.Handler) http.Handler {
+	inner := a.http.Middleware()
+	return func(next http.Handler) http.Handler {
+		return inner(a.sessions.guard(next))
+	}
+}
+
+// ToolScopeOption adjusts RequireToolScopes.
+type ToolScopeOption func(*toolScopeConfig)
+
+type toolScopeConfig struct {
+	refuseUnlisted bool
+}
+
+// RefuseUnlistedTools answers 403 for a tool not in the map, so a newly added tool has no access
+// until someone decides its scopes. List a tool with no scopes to allow it for any token.
+func RefuseUnlistedTools() ToolScopeOption {
+	return func(c *toolScopeConfig) { c.refuseUnlisted = true }
+}
+
+// RequireToolScopes returns HTTP middleware, for use inside AuthMiddleware, that answers a
+// tools/call missing a required scope with 403 and an insufficient_scope challenge before
+// the tool runs, so the client can step up. See resource.ToolScopeGuard.
+func (a *Adapter) RequireToolScopes(toolScopes map[string][]string, opts ...ToolScopeOption) func(http.Handler) http.Handler {
+	var cfg toolScopeConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return resource.ToolScopeGuard(resource.ToolScopeGuardConfig{
+		Claims:              func(r *http.Request) *verifier.VerifiedClaims { return ClaimsFromContext(r.Context()) },
+		ResourceMetadataURL: a.Resource().ResourceMetadataURL(),
+		ToolScopes:          toolScopes,
+		RefuseUnlisted:      cfg.refuseUnlisted,
+	})
+}
+
+// SessionManager returns the resolver that mints session IDs bound to the caller's client and sub.
+// Pass it when constructing the streamable server:
+//
+//	server.NewStreamableHTTPServer(mcpServer,
+//	    server.WithSessionIdManagerResolver(adapter.SessionManager()),
+//	)
+func (a *Adapter) SessionManager() server.SessionIdManagerResolver {
+	return a.sessions
 }
 
 // HTTPContextOption configures HTTPContextFunc. See WithForwardedContextKeys
@@ -210,11 +278,6 @@ type httpContextConfig struct {
 // verified claims and bearer token. Use this for upstream middleware that
 // exposes its context key publicly (request IDs, feature flags, tenant
 // resolvers).
-//
-// Keys with no value on the upstream context are skipped silently. For
-// libraries whose context key is unexported (OpenTelemetry's span context,
-// for example), use WithContextForwarding instead and copy via the library's
-// own accessor.
 func WithForwardedContextKeys(keys ...any) HTTPContextOption {
 	return func(c *httpContextConfig) {
 		c.keys = append(c.keys, keys...)
@@ -226,13 +289,6 @@ func WithForwardedContextKeys(keys ...any) HTTPContextOption {
 // (parent) and the new MCP context already populated with claims, bearer
 // token, and any WithForwardedContextKeys values (mcp), and must return a
 // context derived from mcp.
-//
-// Multiple WithContextForwarding options compose in registration order: the
-// returned context of each call is passed as mcp to the next.
-//
-// Use this for libraries whose context key is unexported — propagate values
-// via the library's accessor (e.g. trace.ContextWithSpanContext(mcp,
-// trace.SpanContextFromContext(parent))). A nil function is ignored.
 func WithContextForwarding(fn func(parent, mcp context.Context) context.Context) HTTPContextOption {
 	return func(c *httpContextConfig) {
 		if fn != nil {
@@ -243,7 +299,7 @@ func WithContextForwarding(fn func(parent, mcp context.Context) context.Context)
 
 // HTTPContextFunc returns a server.HTTPContextFunc that forwards the verified
 // claims and raw bearer token from the HTTP request context (where the
-// embedded http adapter's Middleware stored them) into the per-tool-call MCP
+// wrapped http adapter's Middleware stored them) into the per-tool-call MCP
 // context.
 //
 // Pass it to mark3labs/mcp-go when constructing the streamable HTTP server:
@@ -286,45 +342,40 @@ func (a *Adapter) HTTPContextFunc(opts ...HTTPContextOption) server.HTTPContextF
 	}
 }
 
-// ProtectedResourceMetadataHandler returns mark3labs/mcp-go's
-// server.NewProtectedResourceMetadataHandler configured with the values from
-// core's resource.PRMResponse(). The mark3labs handler handles the HTTP framing
-// per the MCP authorization spec (RFC 9728): GET/HEAD/OPTIONS allowed, CORS
-// headers for browser-based clients, and Cache-Control: no-store to avoid stale
-// metadata during AS rotation.
-//
-// core remains the source of truth for the field *values* of the document, so
-// they stay aligned with what other Authplane adapters advertise.
-//
-// The handler is built once at adapter construction and reused across calls;
-// callers can safely wire it into a mux at startup without paying for repeated
-// PRM config building.
-//
-// PRMHandler on this adapter is overridden to return the same handler, so MCP
-// consumers get the right framing whether they use the mark3labs-style name
-// (ProtectedResourceMetadataHandler) or the inherited authplanehttp name
-// (PRMHandler). The plain-HTTP framing from authplanehttp (max-age=3600, no
-// CORS) is reachable via a.Adapter.PRMHandler() if specifically needed.
-func (a *Adapter) ProtectedResourceMetadataHandler() http.Handler {
+// PRMHandler serves the Protected Resource Metadata document with mark3labs/mcp-go's framing:
+// permissive CORS and Cache-Control: no-store.
+func (a *Adapter) PRMHandler() http.Handler {
 	return a.prmHandler
 }
 
-// PRMHandler is overridden on the outer Adapter so callers using the inherited
-// name from authplanehttp still get the mark3labs framing (CORS, no-store,
-// HEAD/OPTIONS) appropriate for MCP clients. The original authplanehttp
-// PRMHandler remains accessible via a.Adapter.PRMHandler() for callers that
-// specifically want the plain-HTTP framing.
-func (a *Adapter) PRMHandler() http.Handler {
-	return a.prmHandler
+// Resource returns the wrapped resource.Resource.
+func (a *Adapter) Resource() *resource.Resource {
+	return a.http.Resource()
+}
+
+// WellKnownPRMPath returns the RFC 9728 well-known path for this resource.
+func (a *Adapter) WellKnownPRMPath() string {
+	return a.http.WellKnownPRMPath()
+}
+
+// RequireScopes returns middleware that refuses a request without the given scopes.
+func (a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler {
+	return a.http.RequireScopes(scopes...)
+}
+
+// withPRMAllow names the allowed methods on the OPTIONS answer.
+func withPRMAllow(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // prmConfigFromResource maps the typed PRM config from core into mark3labs/mcp-go's
 // ProtectedResourceMetadataConfig so the JSON document can be served by
 // server.NewProtectedResourceMetadataHandler.
-//
-// Field-by-field mapping against resource.PRMConfig: when buildPRM gains a
-// new RFC 9728 field, core.PRMConfig grows with it and this mapper must be
-// updated explicitly — no silent drops via dynamic-map lookups.
 func prmConfigFromResource(res *resource.Resource) server.ProtectedResourceMetadataConfig {
 	src := res.PRMConfig()
 	return server.ProtectedResourceMetadataConfig{
@@ -339,22 +390,12 @@ func prmConfigFromResource(res *resource.Resource) server.ProtectedResourceMetad
 
 // Client returns the underlying authplane.Client, providing access to all SDK
 // operations: TokenExchange, Revoke, Introspect, ClientCredentials, DPoPSigner, etc.
-//
-// For adapters built with NewAdapter, do not call Close() on the returned client
-// directly — call adapter.Close() instead, as the adapter owns the client lifecycle.
-// For adapters built with NewAdapterFromClientAndResource, the caller owns the
-// client and is responsible for closing it.
 func (a *Adapter) Client() *authplane.Client {
 	return a.client
 }
 
 // Close stops all background goroutines and releases resources held by the
 // underlying client. It is safe to call multiple times.
-//
-// For adapters built with NewAdapter, Close closes the underlying client.
-// For adapters built with NewAdapterFromClientAndResource, the caller owns the
-// client; Close is a no-op so a client shared across multiple adapters keeps
-// running even after one of them is closed.
 func (a *Adapter) Close() error {
 	if !a.ownsClient {
 		return nil
@@ -368,15 +409,6 @@ const defaultConsentMessage = "Consent is required to proceed"
 // URLElicitationError carries the data for an MCP URL elicitation
 // (JSON-RPC error code -32042). It is what ConsentElicitationError returns
 // when it detects a consent-required error with a non-empty consent URL.
-//
-// mark3labs/mcp-go's tool-call error path coerces every returned error to
-// JSON-RPC code -32603 (INTERNAL_ERROR), so returning a URLElicitationError
-// directly from a tool handler will not propagate code -32042 to the client.
-// Tool authors who need the elicitation behavior should instead return a
-// CallToolResult with IsError=true and serialize the elicitation params into
-// the content (see the demo). Use Code() and Params to construct that
-// response. The error type is also a stable handle for errors.As inspection
-// in code that calls adapter.TokenExchange directly.
 type URLElicitationError struct {
 	Params mcp.ElicitationParams
 	Cause  error
@@ -407,9 +439,6 @@ func (e *URLElicitationError) MarshalData() ([]byte, error) {
 // with a non-empty ConsentURL. If so, it returns a *URLElicitationError carrying
 // the URL, the AS-provided description (falling back to a default), and a freshly
 // minted elicitation ID. Otherwise the original error is returned unchanged.
-//
-// See the URLElicitationError doc comment for the mark3labs/mcp-go propagation
-// caveat.
 func ConsentElicitationError(err error) error {
 	if err == nil {
 		return nil
@@ -427,7 +456,7 @@ func ConsentElicitationError(err error) error {
 			Mode:          "url",
 			URL:           consentErr.ConsentURL,
 			Message:       msg,
-			ElicitationID: newUUID(),
+			ElicitationID: authplane.NewElicitationID(),
 		},
 		Cause: err,
 	}
@@ -445,14 +474,4 @@ func (a *Adapter) TokenExchange(ctx context.Context, input authplane.TokenExchan
 		return nil, ConsentElicitationError(err)
 	}
 	return resp, nil
-}
-
-// newUUID generates a random v4 UUID string without external dependencies.
-// Matches the pattern in the sibling mcp adapter (mcp/pkg/authplanemcp/adapter.go).
-func newUUID() string {
-	var u [16]byte
-	_, _ = rand.Read(u[:])      // crypto/rand.Read never returns an error on supported platforms
-	u[6] = (u[6] & 0x0f) | 0x40 // version 4
-	u[8] = (u[8] & 0x3f) | 0x80 // variant 10
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }

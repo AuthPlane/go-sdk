@@ -71,7 +71,7 @@ func TestSignToken_ES256_RoundTrip(t *testing.T) {
 	}
 
 	// Parse and verify claims
-	parsed, err := ParseSignedToken(token)
+	parsed, err := UnverifiedClaims(token)
 	if err != nil {
 		t.Fatalf("failed to parse token: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestSignToken_RS256_RoundTrip(t *testing.T) {
 		t.Fatal("expected non-empty token")
 	}
 
-	parsed, err := ParseSignedToken(token)
+	parsed, err := UnverifiedClaims(token)
 	if err != nil {
 		t.Fatalf("failed to parse token: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestSignTokenWithClaims_ExtraClaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed: %v", err)
 	}
-	parsed, err := ParseSignedToken(token)
+	parsed, err := UnverifiedClaims(token)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}

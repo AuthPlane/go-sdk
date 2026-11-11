@@ -69,6 +69,16 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	cb.probeInFlight = false
 }
 
+// Release ends an in-flight half-open probe without recording an outcome, for an
+// attempt that says nothing about the upstream's health. The next Allow may probe
+// again. Without this, such an attempt would hold the probe slot forever.
+func (cb *CircuitBreaker) Release() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.probeInFlight = false
+}
+
 // RecordFailure records a failed operation. May open the circuit.
 func (cb *CircuitBreaker) RecordFailure() {
 	cb.mu.Lock()

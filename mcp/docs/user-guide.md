@@ -10,7 +10,7 @@ This guide is the thorough reference. The [README](../README.md) holds the hero 
 go get github.com/authplane/go-sdk/mcp
 ```
 
-Requires Go 1.25+. Also pulls in `github.com/authplane/go-sdk/core` and `github.com/modelcontextprotocol/go-sdk`.
+Requires Go 1.26+. Also pulls in `github.com/authplane/go-sdk/core` and `github.com/modelcontextprotocol/go-sdk`.
 
 ## 2. Quickstart
 
@@ -39,12 +39,14 @@ func main() {
     defer adapter.Close()
 
     server := mcp.NewServer(&mcp.Implementation{Name: "My Server", Version: "1.0.0"}, nil)
+    server.AddReceivingMiddleware(adapter.ReceivingMiddleware())
 
     handler := mcp.NewStreamableHTTPHandler(
-        func(_ *http.Request) *mcp.Server { return server }, nil,
+        func(_ *http.Request) *mcp.Server { return server },
+        &mcp.StreamableHTTPOptions{Stateless: true}, // speaks protocol 2026-07-28
     )
 
-    http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+    http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
     http.Handle("/mcp", adapter.AuthMiddleware(handler))
 
     http.ListenAndServe(":8080", nil)
@@ -80,7 +82,7 @@ All three fields are required. The `Scopes` slice is advertised in the PRM docum
 ### 4.2 Mount the handlers
 
 ```go
-http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 http.Handle("/mcp", adapter.AuthMiddleware(mcpHandler))
 ```
 
@@ -118,19 +120,20 @@ mcp.AddTool(server, &mcp.Tool{Name: "add", Description: "Add two numbers"},
 |---|---|---|---|
 | `Issuer` | `string` | yes | Authorization server issuer URL. |
 | `Resource` | `string` | yes | Protected resource URL (also used to derive the PRM path). |
-| `Scopes` | `[]string` | yes | Scopes advertised in the PRM document. |
-| `DevMode` | `bool` | no | Relaxes SSRF to allow HTTP, localhost, private networks. Also enabled if `AUTHPLANE_DEV_MODE=1`. Remove before production. |
+| `Scopes` | `[]string` | no | Scopes advertised in the PRM document. |
+| `Logger` | `*slog.Logger` | no | Receives this adapter's logs. Nil means `slog.Default()`. |
+| `DevMode` | `bool` | no | Relaxes SSRF to allow HTTP, localhost, private networks. |
 | `ClientOptions` | `[]authplane.Option` | no | SDK-level options: `WithClientCredentials`, `WithClientAuthentication`, `WithJWKSCacheTTL`, `WithCircuitBreaker`, `WithDPoP`, etc. |
 | `VerifierOptions` | `[]verifier.Option` | no | Verifier-level options: `WithAlgorithms`, `WithClockSkew`, `WithRevocationChecker`, `WithFailClosed`. |
 | `ResourceMetadataURL` | `string` | no | Overrides the URL advertised in `resource_metadata`. Empty advertises the document this adapter serves. See §5.1. |
 
-`VerifierOptions` **replaces** the verifier option list set by `client.Resource`. When `ClientOptions` supplies credentials, the SDK auto-wires an introspection-backed revocation checker — if you also pass `VerifierOptions`, include `verifier.WithRevocationChecker(...)` (or `NullRevocationChecker`) explicitly if you want to keep, replace, or disable it.
+`VerifierOptions` adds to the options set by `client.Resource`, so unrelated options keep auto-wired introspection. To turn it off, pass `verifier.WithRevocationChecker(verifier.NullRevocationChecker)`.
 
 ### 5.1 Where the PRM document lives
 
 RFC 9728 admits two topologies, and the adapter serves both.
 
-**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from `Options.Resource`, `ProtectedResourceMetadataHandler()` serves the document, and the 401 challenge advertises that URL. Nothing to configure.
+**(a) Resource-hosted — the default.** The SDK derives `/.well-known/oauth-protected-resource[/path]` from `Options.Resource`, `PRMHandler()` serves the document, and the 401 challenge advertises that URL. Nothing to configure.
 
 **(b) AS-hosted.** authserver 0.2.0 and later publishes a document for every registered Resource at `<issuer>/.well-known/oauth-protected-resource/{ref}`, where `{ref}` is the RFC 9728 §3.1 path suffix of the Resource URI (or its slug). Point the challenge there when the resource server cannot host well-known paths — a platform that owns `/.well-known`, a proxy that will not forward it:
 
@@ -143,7 +146,7 @@ adapter, err := authplanemcp.NewAdapter(ctx, authplanemcp.Options{
 })
 ```
 
-Only the advertisement moves. `WellKnownPRMPath()` and `ProtectedResourceMetadataHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
+Only the advertisement moves. `WellKnownPRMPath()` and `PRMHandler()` keep serving the derived route, so you can switch the pointer first and retire the local endpoint afterwards. The URL is validated at construction: absolute, `https` or `http`, no fragment, no userinfo.
 
 Whichever topology you use, RFC 9728 §3.3 pins the same constraint: the `resource` member inside the document must equal the URL clients call, byte for byte — a client must discard a document whose `resource` differs from the identifier it derived the request from. So the Resource URI registered at the authorization server, the identifier you configure here, and the public URL your server is reached on must be one and the same string, trailing slash and port included.
 
@@ -157,7 +160,7 @@ Constructs an adapter. Performs AS metadata discovery and warms the JWKS cache u
 
 Constructs an adapter from an already-built client and resource. Use this when sharing a single client across multiple adapters or when you need full control over construction.
 
-> **Lifecycle note.** `adapter.Close()` calls `client.Close()` regardless of which constructor you used. If you share a client across multiple adapters, do *not* defer `adapter.Close()` on every one — manage `client.Close()` yourself and let the adapters go out of scope.
+> **Lifecycle note.** `adapter.Close()` closes the client only for an adapter built with `NewAdapter`. For one built with `NewAdapterFromClientAndResource` it does nothing, and you close the client yourself.
 
 ### `(a *Adapter) AuthMiddleware(handler http.Handler) http.Handler`
 
@@ -169,9 +172,13 @@ Wraps an HTTP handler with bearer-token authentication.
 
 Scopes are not checked at this layer; tools enforce their own scope (see §4.3).
 
-### `(a *Adapter) ProtectedResourceMetadataHandler() http.Handler`
+### `(a *Adapter) PRMHandler() http.Handler`
 
-Serves the RFC 9728 PRM JSON. `GET` only; other methods return 405. Sets `Content-Type: application/json` and `Cache-Control: max-age=3600`.
+Serves the RFC 9728 PRM JSON. `GET` and `HEAD` get the document, `OPTIONS` gets 204, and any other method gets 405, each naming the allowed methods. Sets `Content-Type: application/json`, `Cache-Control: max-age=3600` and `Access-Control-Allow-Origin: *`.
+
+### `(a *Adapter) Middleware() func(http.Handler) http.Handler`
+
+`AuthMiddleware` in the shape net/http middleware chains use.
 
 ### `(a *Adapter) WellKnownPRMPath() string`
 
@@ -197,7 +204,21 @@ Returns the underlying resource. Useful for calling `VerifyToken` directly with 
 
 ### `(a *Adapter) Close() error`
 
-Stops background refresh goroutines and closes idle HTTP connections. Safe to call more than once.
+Stops background refresh goroutines of a client this adapter owns. Safe to call more than once.
+
+### `ReceivingMiddleware() mcp.Middleware`
+
+Gives each MCP call the claims and token of its own HTTP request. Add it with `server.AddReceivingMiddleware(adapter.ReceivingMiddleware())`. Without it, a later call in a legacy session reads nil from `ClaimsFromContext`, because its context comes from the session's first request.
+
+### `RequireToolScopes(map[string][]string, ...ToolScopeOption) func(http.Handler) http.Handler`
+
+Pass `RefuseUnlistedTools()` to answer 403 for a tool not in the map, so a newly added tool has no access until someone decides its scopes. List a tool with no scopes to allow it for any token.
+
+Use it inside `AuthMiddleware`. It answers a `tools/call` missing a required scope with 403 and an `insufficient_scope` challenge before the tool runs, so a client can step up. A batch, or a body with duplicate or case-variant keys, is refused.
+
+### `ClaimsFromRequest(req mcp.Request) *verifier.VerifiedClaims`
+
+The claims verified for this request, read from `req.Extra.TokenInfo`.
 
 ### `ClaimsFromContext(ctx context.Context) *verifier.VerifiedClaims`
 
@@ -356,13 +377,10 @@ resB, _ := client.Resource("https://mcp.example.com/mcp-b", resource.WithScopes(
 
 adapterA, _ := authplanemcp.NewAdapterFromClientAndResource(client, resA)
 adapterB, _ := authplanemcp.NewAdapterFromClientAndResource(client, resB)
-// Do NOT defer adapterA.Close() or adapterB.Close() — they would both call client.Close().
+// adapterA.Close() and adapterB.Close() do not close the shared client: close it yourself.
 ```
 
-One `*authplane.Client` can back many resources and adapters. When you use `NewAdapterFromClientAndResource`, the adapter still calls `client.Close()` on its own `Close()`, so either:
-
-- Use `adapter.Close()` on exactly one adapter per client, or
-- Call `client.Close()` yourself and let adapters go out of scope.
+One `*authplane.Client` can back many resources and adapters. An adapter built with `NewAdapterFromClientAndResource` does not own the client, so call `client.Close()` yourself once every adapter is finished.
 
 ## 11. Development mode
 
@@ -375,13 +393,13 @@ adapter, err := authplanemcp.NewAdapter(ctx, authplanemcp.Options{
 })
 ```
 
-`DevMode: true` relaxes the SDK's SSRF defenses: HTTP (non-TLS) issuers, `localhost`, private networks, and link-local addresses are allowed. It is also honored via the `AUTHPLANE_DEV_MODE=1` environment variable as a fallback.
+`DevMode: true` relaxes the SDK's SSRF defenses: HTTP (non-TLS) issuers, `localhost`, private networks, and link-local addresses are allowed.
 
 Do not enable `DevMode` in production. Metadata discovery and JWKS fetching are the primary attack surface the setting loosens.
 
 ## 12. Error handling
 
-Errors returned from tool handlers become MCP `isError=true` responses. Errors returned from verification become 401/403/503/500 responses written by the MCP Go SDK's auth middleware (wrapped with `auth.ErrInvalidToken` internally so the status code is right).
+Errors returned from tool handlers become MCP `isError=true` responses. Errors returned from verification become 401 responses written by the MCP Go SDK's auth middleware, or 503 responses written by this adapter during an outage (wrapped with `auth.ErrInvalidToken` internally so the status code is right).
 
 When calling `adapter.Client()` operations directly (e.g. `Revoke`, `Introspect`, `ClientCredentials`), you may see any of the OAuth sentinels re-exported from `authplane`:
 
@@ -414,10 +432,14 @@ if err != nil {
 defer adapter.Close() // stops JWKS/metadata refresh goroutines, closes the client
 ```
 
-`Close()` is safe to call multiple times and always calls `client.Close()`. See §10 for the shared-client nuance.
+`Close()` is safe to call multiple times. It closes the client only for an adapter built with `NewAdapter`. See §10.
 
 ## 14. See also
 
 - [Core user guide](../../core/docs/user-guide.md) — client, resource, verifier, outbound DPoP, token exchange semantics, full error reference.
 - [HTTP adapter user guide](../../http/docs/user-guide.md) — parallel middleware for plain HTTP resource servers, including DPoP inbound verification.
 - [`demo/`](../demo/) — runnable Calculator Service with introspection-backed revocation and per-tool scope enforcement.
+
+## Other authorization servers
+
+This adapter takes the server-neutral options of `core` through `resource.WithVerifierOptions`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience`. See [Using another authorization server](../../core/docs/user-guide.md#using-another-authorization-server).

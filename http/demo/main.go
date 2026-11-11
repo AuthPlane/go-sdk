@@ -58,7 +58,10 @@ func run() error {
 		return fmt.Errorf("create resource: %w", err)
 	}
 
-	adapter := authplanehttp.New(res)
+	adapter, err := authplanehttp.New(res)
+	if err != nil {
+		return fmt.Errorf("create adapter: %w", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())

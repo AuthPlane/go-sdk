@@ -857,13 +857,13 @@ func TestAuthErrorResponse_ScopeError_WithScopes(t *testing.T) {
 }
 
 func TestAuthErrorResponse_RealmIncludedWhenProvided(t *testing.T) {
-	status, headers, _ := resource.AuthErrorResponse(verifier.ErrTokenExpired, "https://api.example.com")
+	status, headers, _ := resource.AuthErrorResponse(verifier.ErrTokenExpired, resource.WithRealm("https://api.example.com"))
 
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", status)
 	}
 	wwwAuth := headers["WWW-Authenticate"]
-	want := `Bearer realm="https://api.example.com" error="invalid_token"`
+	want := `Bearer realm="https://api.example.com", error="invalid_token"`
 	if wwwAuth != want {
 		t.Errorf("WWW-Authenticate = %q, want %q", wwwAuth, want)
 	}
@@ -879,9 +879,9 @@ func TestAuthErrorResponse_RealmOmittedWhenEmpty(t *testing.T) {
 }
 
 func TestAuthErrorResponse_DPoPWithRealm(t *testing.T) {
-	_, headers, _ := resource.AuthErrorResponse(verifier.ErrDPoPInvalid, "https://api.example.com")
+	_, headers, _ := resource.AuthErrorResponse(verifier.ErrDPoPInvalid, resource.WithRealm("https://api.example.com"))
 	wwwAuth := headers["WWW-Authenticate"]
-	want := `DPoP realm="https://api.example.com" error="invalid_token"`
+	want := `DPoP realm="https://api.example.com", error="invalid_dpop_proof"`
 	if wwwAuth != want {
 		t.Errorf("WWW-Authenticate = %q, want %q", wwwAuth, want)
 	}
@@ -1900,5 +1900,75 @@ func TestResourceMetadataURL_ErrorRedactsCredentials(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "s3cr3t") {
 		t.Errorf("error = %q, want the credential redacted", err)
+	}
+}
+
+// The expected audience changes only the token check: the resource URI still
+// identifies the resource in its metadata (RFC 9728 section 3.3).
+func TestNew_ExpectedAudienceKeepsPRMResource_A12(t *testing.T) {
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(context.Context) ([]byte, map[string][]string, error) {
+			return []byte(`{"keys":[]}`), nil, nil
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+	const uri = "https://api.example.com/mcp"
+	r, err := resource.New(uri, "https://as.example.com", jc,
+		resource.WithVerifierOptions(verifier.WithExpectedAudience("6e74172b-be56-4843-9ff4-e66a39bb12e3")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := r.PRMConfig().Resource; got != uri {
+		t.Errorf("PRM resource = %q, want %q", got, uri)
+	}
+}
+
+func TestOfflineAccessNotAdvertised_A61_A62(t *testing.T) {
+	jc := verifier.NewJWKSCache(verifier.JWKSCacheConfig{
+		FetchFn: func(context.Context) ([]byte, map[string][]string, error) {
+			return []byte(`{"keys":[]}`), nil, nil
+		},
+		DefaultTTL: time.Hour,
+	})
+	t.Cleanup(jc.Close)
+	r, err := resource.New("https://api.example.com/mcp", "https://as.example.com", jc, resource.WithScopes("a", "offline_access"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := r.PRMConfig().ScopesSupported; len(got) != 1 || got[0] != "a" {
+		t.Errorf("scopes_supported = %v", got)
+	}
+	_, headers, _ := resource.AuthErrorResponse(&resource.ScopeError{
+		RequiredScopes: []string{"a", "offline_access"},
+		Err:            verifier.ErrInsufficientScope,
+	})
+	if strings.Contains(headers["WWW-Authenticate"], "offline_access") {
+		t.Errorf("challenge = %q", headers["WWW-Authenticate"])
+	}
+	plain, err := resource.New("https://api.example.com/mcp", "https://as.example.com", jc, resource.WithScopes("a", "b"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := plain.PRMConfig().ScopesSupported; len(got) != 2 {
+		t.Errorf("scopes_supported = %v", got)
+	}
+}
+
+// Resource.VerifyDPoPBinding passes the WithDPoP context to the verifier's DPoP policy.
+func TestVerifyDPoPBinding_UsesResourcePolicy_A9(t *testing.T) {
+	res, _ := makeResource(t,
+		resource.WithVerifierOptions(verifier.WithInboundDPoP(verifier.InboundDPoPOptions{})),
+	)
+	noProof, err := verifier.NewDPoPContext("GET", testResource, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := verifier.TokenBinding{JKT: "jkt", ClientID: testClientID, Subject: testSubject}
+	if _, err := res.VerifyDPoPBinding("opaque", bound, resource.WithDPoP(noProof)); !errors.Is(err, verifier.ErrDPoPRequired) {
+		t.Fatalf("bound without proof: err = %v, want ErrDPoPRequired", err)
+	}
+	if got, err := res.VerifyDPoPBinding("opaque", verifier.TokenBinding{}); err != nil || got != nil {
+		t.Fatalf("unbound: got %+v, %v; want nil, nil", got, err)
 	}
 }

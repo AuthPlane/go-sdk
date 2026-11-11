@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/authplane/go-sdk/core/authplane"
+	"github.com/authplane/go-sdk/core/internal/oauth"
+	"github.com/authplane/go-sdk/core/internal/ssrf"
 	"github.com/authplane/go-sdk/core/resource/verifier"
 	"github.com/authplane/go-sdk/core/testutil"
 	"github.com/go-jose/go-jose/v4"
@@ -223,10 +225,10 @@ func TestRFC9449DPoPNonceChallengeMustTriggerSingleRetry(t *testing.T) {
 		t.Fatalf("new signer: %v", err)
 	}
 	store := authplane.NewInMemoryDPoPNonceStore()
-	provider := authplane.NewDPoPProviderForTesting(signer, store)
+	provider := newNonceProvider(signer, store)
 
 	ctx := context.Background()
-	resp, err := authplane.DoTokenRequestForTesting(ctx, srv.URL, provider)
+	resp, err := doTokenRequest(ctx, srv.URL, provider)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -254,10 +256,10 @@ func TestRFC9449DPoPNonceOnSuccessResponseShouldBeStored(t *testing.T) {
 		t.Fatalf("new signer: %v", err)
 	}
 	store := authplane.NewInMemoryDPoPNonceStore()
-	provider := authplane.NewDPoPProviderForTesting(signer, store)
+	provider := newNonceProvider(signer, store)
 
 	ctx := context.Background()
-	_, err = authplane.DoTokenRequestForTesting(ctx, srv.URL, provider)
+	_, err = doTokenRequest(ctx, srv.URL, provider)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -303,10 +305,10 @@ func TestRFC9110RFC9449DPoPNonceHeaderMustBeTreatedCaseInsensitively(t *testing.
 		t.Fatalf("new signer: %v", err)
 	}
 	store := authplane.NewInMemoryDPoPNonceStore()
-	provider := authplane.NewDPoPProviderForTesting(signer, store)
+	provider := newNonceProvider(signer, store)
 
 	ctx := context.Background()
-	_, err = authplane.DoTokenRequestForTesting(ctx, srv.URL, provider)
+	_, err = doTokenRequest(ctx, srv.URL, provider)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -1094,7 +1096,7 @@ func TestRFC9449GeneratedDPoPProofShouldIncludeExp(t *testing.T) {
 		t.Fatalf("generate proof: %v", err)
 	}
 
-	claims, err := testutil.ParseSignedToken(proof)
+	claims, err := testutil.UnverifiedClaims(proof)
 	if err != nil {
 		t.Fatalf("parse proof claims: %v", err)
 	}
@@ -1133,9 +1135,9 @@ func TestRFC9449DPoPGrantTokenTypeMustBeDPoP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new signer: %v", err)
 	}
-	dp := authplane.NewDPoPProviderForTesting(signer, authplane.NewInMemoryDPoPNonceStore())
+	dp := newNonceProvider(signer, authplane.NewInMemoryDPoPNonceStore())
 
-	_, err = authplane.DoTokenRequestForTesting(context.Background(), ts.URL, dp)
+	_, err = doTokenRequest(context.Background(), ts.URL, dp)
 	if err == nil {
 		t.Fatal("expected error when DPoP grant returns token_type Bearer, got nil")
 	}
@@ -1170,7 +1172,7 @@ func TestRFC9449DPoPProofHTUMustStripQueryAndFragment(t *testing.T) {
 				t.Fatalf("generate proof: %v", err)
 			}
 
-			claims, err := testutil.ParseSignedToken(proof)
+			claims, err := testutil.UnverifiedClaims(proof)
 			if err != nil {
 				t.Fatalf("parse proof: %v", err)
 			}
@@ -1277,4 +1279,24 @@ func TestRFC9449VerifierMustRejectDPoPProofWhenAccessTokenIsNotDPoPBound(t *test
 	if !errors.Is(err, verifier.ErrDPoPBindingMismatch) {
 		t.Errorf("expected ErrDPoPBindingMismatch, got %v", err)
 	}
+}
+
+// newNonceProvider builds the provider a client would, for tests that drive the token request directly.
+func newNonceProvider(signer *authplane.DPoPSigner, store authplane.DPoPNonceStore) *oauth.NonceDPoPProvider {
+	return oauth.NewNonceDPoPProvider(func(method, rawURL, nonce string) (string, error) {
+		var opts *authplane.DPoPProofOptions
+		if nonce != "" {
+			opts = &authplane.DPoPProofOptions{Nonce: nonce}
+		}
+		return signer.GenerateProof(method, rawURL, opts)
+	}, store)
+}
+
+func doTokenRequest(ctx context.Context, endpoint string, dpop oauth.DPoPProvider) (*oauth.TokenResponse, error) {
+	auth := oauth.ClientAuthentication{
+		Method:       oauth.ClientAuthClientSecretBasic,
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+	}
+	return oauth.ClientCredentials(ctx, endpoint, auth, ssrf.DevModeFetchSettings(), nil, nil, dpop)
 }

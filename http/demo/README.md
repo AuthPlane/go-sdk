@@ -13,7 +13,7 @@ Tokens must carry the scope for the specific route being called. A token with on
 
 ## Prerequisites
 
-- Go 1.24+
+- Go 1.26+
 - The **Authplane authserver** running locally — from a checkout of the `authserver` repo, run:
 
   ```bash

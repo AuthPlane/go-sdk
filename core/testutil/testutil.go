@@ -133,9 +133,9 @@ func SignTokenWithClaims(key crypto.Signer, alg jose.SignatureAlgorithm, kid, is
 	return SignToken(claims, key, alg, kid)
 }
 
-// ParseSignedToken parses a compact-serialized JWS token and returns the claims.
+// UnverifiedClaims parses a compact-serialized JWS token and returns the claims.
 // This is for test verification only — it does NOT validate the signature.
-func ParseSignedToken(token string) (map[string]any, error) {
+func UnverifiedClaims(token string) (map[string]any, error) {
 	parsed, err := jwt.ParseSigned(token, []jose.SignatureAlgorithm{jose.ES256, jose.RS256})
 	if err != nil {
 		return nil, err

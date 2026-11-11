@@ -90,9 +90,10 @@ func run() error {
 	// each tool handler's context.
 	streamable := server.NewStreamableHTTPServer(mcpServer,
 		server.WithHTTPContextFunc(adapter.HTTPContextFunc()),
+		server.WithSessionIdManagerResolver(adapter.SessionManager()),
 	)
 
-	http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+	http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 	http.Handle("/mcp", adapter.AuthMiddleware(streamable))
 
 	slog.Info("Calculator MCP server listening", "url", "http://localhost:"+port)

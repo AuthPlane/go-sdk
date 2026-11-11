@@ -1,10 +1,12 @@
 package authplanemark3labs_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/authplane/go-sdk/mark3labs/pkg/authplanemark3labs"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // TestAuthMiddlewareNoToken verifies that unauthenticated requests receive a
@@ -241,7 +244,7 @@ func TestAuthMiddlewareNonBearerScheme(t *testing.T) {
 // TestProtectedResourceMetadataHandler verifies the PRM handler.
 func TestProtectedResourceMetadataHandler(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	t.Run("GET returns JSON", func(t *testing.T) {
 		rec := httptest.NewRecorder()
@@ -275,7 +278,7 @@ func TestProtectedResourceMetadataHandler(t *testing.T) {
 // metadata during AS rotation).
 func TestProtectedResourceMetadataHandlerCacheControl(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/.well-known/oauth-protected-resource", nil))
@@ -292,7 +295,7 @@ func TestProtectedResourceMetadataHandlerCacheControl(t *testing.T) {
 // cross-origin.
 func TestProtectedResourceMetadataHandlerCORS(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/.well-known/oauth-protected-resource", nil))
@@ -310,7 +313,7 @@ func TestProtectedResourceMetadataHandlerCORS(t *testing.T) {
 // scopes_supported).
 func TestProtectedResourceMetadataHandlerFieldsFromCore(t *testing.T) {
 	e := newTestEnv(t)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/.well-known/oauth-protected-resource", nil))
@@ -584,7 +587,7 @@ func TestAuthMiddlewareDPoPMissingProof(t *testing.T) {
 // dpop_bound_access_tokens_required, per RFC 9728 §2 / RFC 9449.
 func TestProtectedResourceMetadataAdvertisesDPoPFields(t *testing.T) {
 	e := newDPoPTestEnv(t, true)
-	handler := e.adapter.ProtectedResourceMetadataHandler()
+	handler := e.adapter.PRMHandler()
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/.well-known/oauth-protected-resource", nil))
@@ -826,5 +829,296 @@ func TestAuthMiddlewareResourceMetadataDefault(t *testing.T) {
 	want := `Bearer resource_metadata="` + e.adapter.Resource().PRMURL() + `", scope="tools/add tools/multiply"`
 	if got != want {
 		t.Errorf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
+// With the middleware as the root handler, the streamable server ignores the
+// path, so the metadata path must not reach it: a tool call there has no token.
+func TestAuthMiddlewareRootHandlerRefusesToolCallOnPRMPath_A33(t *testing.T) {
+	e := newTestEnv(t)
+	ran := false
+	mcpServer := server.NewMCPServer("test", "1.0.0")
+	mcpServer.AddTool(mcp.NewTool("add"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ran = true
+		return mcp.NewToolResultText("ok"), nil
+	})
+	handler := e.adapter.AuthMiddleware(server.NewStreamableHTTPServer(mcpServer))
+
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, e.adapter.WellKnownPRMPath(), strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := post(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{}}}`)
+	if ran {
+		t.Fatal("tool ran with no token")
+	}
+	if rec.Code == http.StatusOK {
+		t.Errorf("status = %d, want a refusal", rec.Code)
+	}
+}
+
+// The adapter keeps its CORS framing on the metadata path behind the middleware.
+func TestAuthMiddlewareKeepsPRMFraming(t *testing.T) {
+	e := newTestEnv(t)
+	handler := e.adapter.AuthMiddleware(okHandler())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, e.adapter.WellKnownPRMPath(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Error("want CORS headers from the mark3labs handler")
+	}
+}
+
+const mark3InitBody = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+const mark3ToolCall = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{}}}`
+
+func mark3Server(wire *testEnv, opts ...server.StreamableHTTPOption) (http.Handler, *int) {
+	calls := new(int)
+	mcpServer := server.NewMCPServer("test", "1.0.0")
+	mcpServer.AddTool(mcp.NewTool("add"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		*calls++
+		return mcp.NewToolResultText("ok"), nil
+	})
+	return wire.adapter.AuthMiddleware(server.NewStreamableHTTPServer(mcpServer, opts...)), calls
+}
+
+func mark3Do(t *testing.T, h http.Handler, method, token, session, body string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), method, "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+token)
+	if session != "" {
+		req.Header.Set("Mcp-Session-Id", session)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestSessionBinding_A67_A68(t *testing.T) {
+	e := newTestEnv(t)
+	h, calls := mark3Server(e, server.WithSessionIdManagerResolver(e.adapter.SessionManager()))
+	alice := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	mallory := e.makeTokenFor(t, "mallory", []string{"read"}, time.Now().Add(time.Hour))
+
+	rec := mark3Do(t, h, http.MethodPost, alice, "", mark3InitBody, nil)
+	session := rec.Header().Get("Mcp-Session-Id")
+	if session == "" {
+		t.Fatalf("no session: %d %s", rec.Code, rec.Body.String())
+	}
+
+	if rec := mark3Do(t, h, http.MethodPost, alice, session, mark3ToolCall, nil); rec.Code != http.StatusOK || *calls != 1 {
+		t.Errorf("owner: %d, calls=%d: %s", rec.Code, *calls, rec.Body.String())
+	}
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		if rec := mark3Do(t, h, method, mallory, session, mark3ToolCall, nil); rec.Code != http.StatusNotFound {
+			t.Errorf("%s from another user: %d", method, rec.Code)
+		}
+	}
+	if rec := mark3Do(t, h, http.MethodPost, alice, "mcp-session-guessed", mark3ToolCall, nil); rec.Code != http.StatusNotFound {
+		t.Errorf("unminted ID: %d", rec.Code)
+	}
+	if *calls != 1 {
+		t.Errorf("calls = %d, a refused request ran the tool", *calls)
+	}
+}
+
+func TestSessionBinding_UnwiredServerIsRefusedWithLog_A81(t *testing.T) {
+	e := newTestEnv(t)
+	h, _ := mark3Server(e)
+	token := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(old)
+
+	rec := mark3Do(t, h, http.MethodPost, token, "", mark3InitBody, nil)
+	session := rec.Header().Get("Mcp-Session-Id")
+	if rec.Code != http.StatusOK || session == "" {
+		t.Fatalf("initialize: %d", rec.Code)
+	}
+	if rec := mark3Do(t, h, http.MethodPost, token, session, mark3ToolCall, nil); rec.Code != http.StatusNotFound {
+		t.Errorf("next call: %d, want refused", rec.Code)
+	}
+	if !strings.Contains(logs.String(), "SessionManager") {
+		t.Errorf("log does not name the fix: %s", logs.String())
+	}
+}
+
+func TestSessionBinding_OptOutAndSharedKey_A81_A82(t *testing.T) {
+	key := bytes.Repeat([]byte("k"), 32)
+	t.Run("opt out", func(t *testing.T) {
+		e := newTestEnvWithOptions(t, func(o *authplanemark3labs.Options) { o.AllowUnboundSessions = true })
+		h, calls := mark3Server(e)
+		token := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+		session := mark3Do(t, h, http.MethodPost, token, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+		other := e.makeTokenFor(t, "other", []string{"read"}, time.Now().Add(time.Hour))
+		if rec := mark3Do(t, h, http.MethodPost, other, session, mark3ToolCall, nil); rec.Code != http.StatusOK || *calls != 1 {
+			t.Errorf("%d, calls=%d", rec.Code, *calls)
+		}
+	})
+	t.Run("short key refused", func(t *testing.T) {
+		if err := newAdapterErr(t, func(o *authplanemark3labs.Options) { o.SessionKey = []byte("short") }); err == nil {
+			t.Error("want an error")
+		}
+	})
+	t.Run("replicas share the key", func(t *testing.T) {
+		setKey := func(o *authplanemark3labs.Options) { o.SessionKey = key }
+		a := newTestEnvWithOptions(t, setKey)
+		b := a.sibling(t, setKey)
+		token := a.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+		ha, _ := mark3Server(a, server.WithSessionIdManagerResolver(a.adapter.SessionManager()))
+		session := mark3Do(t, ha, http.MethodPost, token, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+		guard := b.adapter.AuthMiddleware(okHandler())
+		if rec := mark3Do(t, guard, http.MethodPost, token, session, mark3ToolCall, nil); rec.Code != http.StatusOK {
+			t.Errorf("other replica: %d", rec.Code)
+		}
+	})
+	t.Run("protocol 2026-07-28 never reaches the victim's session", func(t *testing.T) {
+		e := newTestEnv(t)
+		h, _ := mark3Server(e, server.WithSessionIdManagerResolver(e.adapter.SessionManager()))
+		alice := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+		session := mark3Do(t, h, http.MethodPost, alice, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+		mallory := e.makeTokenFor(t, "mallory", []string{"read"}, time.Now().Add(time.Hour))
+		rec := mark3Do(t, h, http.MethodPost, mallory, session, modernDiscover, map[string]string{
+			"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "server/discover",
+		})
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want the session header ignored: %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Mcp-Session-Id"); got == session {
+			t.Error("the response names the victim's session")
+		}
+	})
+}
+
+func TestMark3RequireToolScopes_A63_A64_A78(t *testing.T) {
+	e := newTestEnv(t)
+	ran := false
+	h := e.adapter.AuthMiddleware(e.adapter.RequireToolScopes(map[string][]string{"add": {"admin"}})(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { ran = true })))
+	token := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	rec := mark3Do(t, h, http.MethodPost, token, "", mark3ToolCall, map[string]string{"Mcp-Name": "open"})
+	if rec.Code != http.StatusForbidden || ran || !strings.Contains(rec.Header().Get("WWW-Authenticate"), `error="insufficient_scope"`) {
+		t.Errorf("%d, ran=%v, %q", rec.Code, ran, rec.Header().Get("WWW-Authenticate"))
+	}
+	if rec := mark3Do(t, h, http.MethodPost, token, "", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","Name":"add"}}`, nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("case variant: %d", rec.Code)
+	}
+	admin := e.makeTokenFor(t, "alice", []string{"admin"}, time.Now().Add(time.Hour))
+	ran = false
+	if rec := mark3Do(t, h, http.MethodPost, admin, "", mark3ToolCall, nil); rec.Code != http.StatusOK || !ran {
+		t.Errorf("with scope: %d, ran=%v", rec.Code, ran)
+	}
+}
+
+// The promoted Middleware name must carry the session binding too.
+func TestSessionBinding_MiddlewareNameAndTerminate_A67(t *testing.T) {
+	e := newTestEnv(t)
+	calls := 0
+	mcpServer := server.NewMCPServer("test", "1.0.0")
+	mcpServer.AddTool(mcp.NewTool("add"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		calls++
+		return mcp.NewToolResultText("ok"), nil
+	})
+	h := e.adapter.Middleware()(server.NewStreamableHTTPServer(mcpServer, server.WithSessionIdManagerResolver(e.adapter.SessionManager())))
+	alice := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	mallory := e.makeTokenFor(t, "mallory", []string{"read"}, time.Now().Add(time.Hour))
+
+	session := mark3Do(t, h, http.MethodPost, alice, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+	if session == "" {
+		t.Fatal("no session")
+	}
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		if rec := mark3Do(t, h, method, mallory, session, mark3ToolCall, nil); rec.Code != http.StatusNotFound {
+			t.Errorf("%s: %d", method, rec.Code)
+		}
+	}
+	if rec := mark3Do(t, h, http.MethodPost, alice, session, mark3ToolCall, nil); rec.Code != http.StatusOK || calls != 1 {
+		t.Errorf("owner after refused DELETE: %d, calls=%d", rec.Code, calls)
+	}
+}
+
+func TestProtocol20260728WithoutSession_A57(t *testing.T) {
+	e := newTestEnv(t)
+	h, _ := mark3Server(e, server.WithSessionIdManagerResolver(e.adapter.SessionManager()))
+	token := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	rec := mark3Do(t, h, http.MethodPost, token, "", modernDiscover, map[string]string{
+		"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "server/discover",
+	})
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSessionManager_NilRequest(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	h, _ := mark3Server(e, server.WithSessionIdManagerResolver(e.adapter.SessionManager()))
+	session := mark3Do(t, h, http.MethodPost, token, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+	m := e.adapter.SessionManager().ResolveSessionIdManager(nil)
+	if _, err := m.Validate(session); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+	if _, err := m.Validate("not-minted"); err == nil {
+		t.Error("an ID the manager did not mint should fail")
+	}
+	if notAllowed, err := m.Terminate(session); notAllowed || err != nil {
+		t.Errorf("Terminate: %v, %v", notAllowed, err)
+	}
+}
+
+const modernDiscover = `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"t","version":"1"}}}}`
+
+func TestSessionBinding_LegacyVersionHeaderStillBound_A67(t *testing.T) {
+	e := newTestEnv(t)
+	h, calls := mark3Server(e, server.WithSessionIdManagerResolver(e.adapter.SessionManager()))
+	alice := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	mallory := e.makeTokenFor(t, "mallory", []string{"read"}, time.Now().Add(time.Hour))
+	session := mark3Do(t, h, http.MethodPost, alice, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+	rec := mark3Do(t, h, http.MethodPost, mallory, session, mark3ToolCall, map[string]string{"MCP-Protocol-Version": "2025-06-18"})
+	if rec.Code != http.StatusNotFound || *calls != 0 {
+		t.Errorf("%d, calls=%d", rec.Code, *calls)
+	}
+}
+
+func TestFromClientAndResource_SessionOptions_A81(t *testing.T) {
+	e := newTestEnv(t)
+	res := e.adapter.Resource()
+	if _, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), res, authplanemark3labs.SessionOptions{Key: []byte("short")}); err == nil {
+		t.Error("short key: want an error")
+	}
+	a, err := authplanemark3labs.NewAdapterFromClientAndResource(e.adapter.Client(), res, authplanemark3labs.SessionOptions{AllowUnbound: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := *e
+	other.adapter = a
+	h, calls := mark3Server(&other)
+	alice := e.makeTokenFor(t, "alice", []string{"read"}, time.Now().Add(time.Hour))
+	session := mark3Do(t, h, http.MethodPost, alice, "", mark3InitBody, nil).Header().Get("Mcp-Session-Id")
+	if rec := mark3Do(t, h, http.MethodPost, alice, session, mark3ToolCall, nil); rec.Code != http.StatusOK || *calls != 1 {
+		t.Errorf("%d, calls=%d", rec.Code, *calls)
+	}
+}
+
+func TestPRMOptionsNamesAllowedMethods(t *testing.T) {
+	e := newTestEnv(t)
+	rec := httptest.NewRecorder()
+	e.adapter.AuthMiddleware(okHandler()).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodOptions, e.adapter.WellKnownPRMPath(), nil))
+	if rec.Header().Get("Allow") == "" {
+		t.Errorf("status %d, no Allow", rec.Code)
 	}
 }

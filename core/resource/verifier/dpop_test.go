@@ -170,7 +170,7 @@ func TestValidateDPoPProof_Valid(t *testing.T) {
 	})
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), rawToken, "", "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestValidateDPoPProof_HTMMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, "GET", htu, "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, "POST", htu, proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, "POST", htu, proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestValidateDPoPProof_HTUMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, "https://example.com/resource", "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/other", proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/other", proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestValidateDPoPProof_EncodedSlashIsNotPlainSlash(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, "https://example.com/foo%2Fbar", "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo/bar", proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo/bar", proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid for %%2F vs / mismatch, got: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestValidateDPoPProof_PercentEncodedHexFoldedToUpper(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, "https://example.com/foo%2fbar", "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo%2Fbar", proof), ""); err != nil {
+	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/foo%2Fbar", proof), "", "", ""); err != nil {
 		t.Fatalf("expected validation to succeed for %%2f vs %%2F (both fold to %%2F), got: %v", err)
 	}
 }
@@ -270,7 +270,7 @@ func TestValidateDPoPProof_EmptyPathEqualsSlash(t *testing.T) {
 
 	v := newDPoPTestVerifier(t, nil)
 	// Inbound request always carries at least `/`.
-	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/", proof), ""); err != nil {
+	if _, err := v.validateDPoPProof(mustCtx(t, method, "https://example.com/", proof), "", "", ""); err != nil {
 		t.Fatalf("expected empty-path htu to match request path `/`, got: %v", err)
 	}
 }
@@ -282,7 +282,7 @@ func TestValidateDPoPProof_MissingJTI(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", map[string]any{"jti": nil})
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestValidateDPoPProof_StaleProof(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", map[string]any{"iat": oldIAT})
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestValidateDPoPProof_ATHMismatch(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "token-A", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "token-B")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "token-B", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestValidateDPoPProof_WrongTyp(t *testing.T) {
 	proof := generateDPoPProofWithTyp(t, key, method, htu, "JWT")
 
 	v := newDPoPTestVerifier(t, nil)
-	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if !errors.Is(err, ErrDPoPInvalid) {
 		t.Fatalf("expected ErrDPoPInvalid, got: %v", err)
 	}
@@ -340,13 +340,13 @@ func TestValidateDPoPProof_ReplayDetection(t *testing.T) {
 
 	v := newDPoPTestVerifier(t, store)
 	// First use: should succeed.
-	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	_, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if err != nil {
 		t.Fatalf("first use: expected no error, got: %v", err)
 	}
 
 	// Second use of the same proof: replay detected.
-	_, err = v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	_, err = v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if !errors.Is(err, ErrDPoPReplayDetected) {
 		t.Fatalf("second use: expected ErrDPoPReplayDetected, got: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestValidateDPoPProof_ValidNoAccessToken(t *testing.T) {
 	proof := generateDPoPProof(t, key, method, htu, "", nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "")
+	result, err := v.validateDPoPProof(mustCtx(t, method, htu, proof), "", "", "")
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -466,13 +466,13 @@ func TestVerifyToken_DPoPBound_ValidProof(t *testing.T) {
 	now := time.Now().Unix()
 	rawClaims := buildDPoPBoundRawClaims(t, dpopKey, issuer, audience, "user123", "client1", now+3600, now)
 
-	claims := ParseClaims(rawClaims, "kid1")
+	claims := parseClaims(rawClaims, "kid1")
 
 	if !claims.IsDPoPBound() {
 		t.Fatal("claims should be DPoP-bound")
 	}
 
-	_ = accessKey // used conceptually; for this unit test we work directly with ParseClaims
+	_ = accessKey // used conceptually; for this unit test we work directly with parseClaims
 
 	// We test the DPoP binding check by computing what validateDPoPProof returns
 	// and checking it matches DPoPThumbprint().
@@ -480,7 +480,7 @@ func TestVerifyToken_DPoPBound_ValidProof(t *testing.T) {
 	proof := generateDPoPProof(t, dpopKey, method, reqURL, rawToken, nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken, "", "")
 	if err != nil {
 		t.Fatalf("validateDPoPProof: %v", err)
 	}
@@ -503,14 +503,14 @@ func TestVerifyToken_DPoPBound_WrongKey(t *testing.T) {
 
 	now := time.Now().Unix()
 	rawClaims := buildDPoPBoundRawClaims(t, dpopKey1, issuer, audience, "user123", "client1", now+3600, now)
-	claims := ParseClaims(rawClaims, "kid1")
+	claims := parseClaims(rawClaims, "kid1")
 
 	rawToken := "raw.access.token"
 	// Proof signed with key2, but token bound to key1.
 	proof := generateDPoPProof(t, dpopKey2, method, reqURL, rawToken, nil)
 
 	v := newDPoPTestVerifier(t, nil)
-	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken)
+	result, err := v.validateDPoPProof(mustCtx(t, method, reqURL, proof), rawToken, "", "")
 	if err != nil {
 		t.Fatalf("validateDPoPProof: %v", err)
 	}
@@ -530,7 +530,7 @@ func TestVerifyToken_DPoPRequired_WhenBoundButNoDPoP(t *testing.T) {
 		"user123", "client1",
 		now+3600, now,
 	)
-	claims := ParseClaims(rawClaims, "kid1")
+	claims := parseClaims(rawClaims, "kid1")
 
 	if !claims.IsDPoPBound() {
 		t.Fatal("claims should be DPoP-bound")

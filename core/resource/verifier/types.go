@@ -2,29 +2,19 @@ package verifier
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 )
 
 // DPoPContext provides per-request DPoP proof information for token verification.
-//
-// Resource-level DPoP policy (replay store, proof lifetime, clock skew,
-// allowed algorithms, required flag) lives in InboundDPoPOptions and is
-// configured on the verifier via WithInboundDPoP.
-//
-// The proof slice is unexported so RFC 9449 §4.3 #1 ("not more than one
-// DPoP HTTP request header field") has a single enforcement point:
-// NewDPoPContext. Callers outside this package cannot construct an
-// invalid DPoPContext — the only way to populate the proof is through
-// the constructor, which filters blanks, splits on "," defensively, and
-// returns ErrMultipleDpopProofs on > 1 non-blank value: invalid states are
-// unconstructable rather than guarded after the fact.
 type DPoPContext struct {
 	Method string
 	URL    string
-	proofs []string
+	// SchemeDPoP records that the request's Authorization header used the DPoP scheme. An
+	// unbound token presented that way is refused (RFC 9449 section 7.1).
+	SchemeDPoP bool
+	proofs     []string
 }
 
 // NewDPoPContext builds a DPoPContext from the raw DPoP header values the
@@ -95,17 +85,14 @@ type DPoPReplayStore interface {
 
 // InboundDPoPOptions bundles resource-level policy for inbound DPoP proof
 // verification (RFC 9449 §7.1, RFC 9728 §2). Apply via verifier.WithInboundDPoP.
-//
-// Configuring this bundle marks the resource as DPoP-capable. A resource
-// without InboundDPoPOptions rejects DPoP-bound access tokens (those carrying
-// cnf.jkt) with ErrDPoPNotSupported, since the binding cannot be validated
-// without the policy in this bundle.
 type InboundDPoPOptions struct {
-	// ReplayStore enables replay detection on proof JTI values.
-	// nil disables replay detection (proofs are accepted as long as they
-	// pass the other checks); set to NewInMemoryDPoPReplayStore() for
-	// single-instance deployments, or a distributed store for multi-replica.
+	// ReplayStore checks proof JTI values for replay. nil uses an in-memory
+	// store, which suits a single instance; use a distributed store for
+	// multi-replica deployments.
 	ReplayStore DPoPReplayStore
+
+	// DisableReplayCheck turns replay detection off, and overrides ReplayStore.
+	DisableReplayCheck bool
 
 	// MaxProofAge is the maximum age of a DPoP proof, measured from its iat.
 	// Zero applies the default DefaultDPoPProofLifetime (300s).
@@ -144,33 +131,4 @@ type RevocationChecker func(ctx context.Context, claims *VerifiedClaims, rawToke
 // checker (e.g. the introspection checker auto-wired by authplane.Client.Resource).
 var NullRevocationChecker RevocationChecker = func(_ context.Context, _ *VerifiedClaims, _ string) (bool, error) {
 	return false, nil
-}
-
-// StringOrSlice handles JSON fields that can be either a string or []string.
-// The JWT "aud" claim is the primary use case.
-type StringOrSlice []string
-
-// UnmarshalJSON implements json.Unmarshaler for StringOrSlice.
-func (s *StringOrSlice) UnmarshalJSON(data []byte) error {
-	// Try string first.
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		*s = StringOrSlice{str}
-		return nil
-	}
-	// Try []string.
-	var arr []string
-	if err := json.Unmarshal(data, &arr); err != nil {
-		return err
-	}
-	*s = StringOrSlice(arr)
-	return nil
-}
-
-// MarshalJSON implements json.Marshaler for StringOrSlice.
-func (s StringOrSlice) MarshalJSON() ([]byte, error) {
-	if len(s) == 1 {
-		return json.Marshal(s[0])
-	}
-	return json.Marshal([]string(s))
 }

@@ -42,7 +42,10 @@ func main() {
         panic(err)
     }
 
-    adapter := authplanehttp.New(res)
+    adapter, err := authplanehttp.New(res)
+    if err != nil {
+        panic(err)
+    }
 
     mux := http.NewServeMux()
     mux.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
@@ -57,3 +60,11 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 ```
 
 See the **[User Guide](docs/user-guide.md)** for the full API, DPoP, replay stores, per-route scope enforcement, error handling, and lifecycle details.
+
+## Security notes
+
+`Middleware` answers the Protected Resource Metadata path itself and never calls the next handler there. See the [user guide](docs/user-guide.md) for DPoP and replay stores, and [Using another authorization server](../core/docs/user-guide.md#using-another-authorization-server) for other servers.
+
+## Other authorization servers
+
+This adapter takes the server-neutral options of `core` through `resource.WithVerifierOptions`: `WithAcceptedTokenTypes`, `WithRequiredClaims`, `WithScopeClaims`, `WithClientClaims`, `WithAccessTokenMarkers` and `WithExpectedAudience`. See [Using another authorization server](../core/docs/user-guide.md#using-another-authorization-server).

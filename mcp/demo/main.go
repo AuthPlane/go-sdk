@@ -61,6 +61,9 @@ func run() error {
 		Version: "0.1.0",
 	}, nil)
 
+	// Gives each tool call the claims of its own HTTP request.
+	server.AddReceivingMiddleware(adapter.ReceivingMiddleware())
+
 	// add — requires scope "tools/add"
 	type AddArgs struct {
 		A float64 `json:"a"`
@@ -99,11 +102,12 @@ func run() error {
 		return textResult(fmt.Sprintf("%g", args.A*args.B)), nil, nil
 	})
 
+	// Stateless is what speaks protocol 2026-07-28, which has no sessions.
 	handler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return server
-	}, nil)
+	}, &mcp.StreamableHTTPOptions{Stateless: true})
 
-	http.Handle(adapter.WellKnownPRMPath(), adapter.ProtectedResourceMetadataHandler())
+	http.Handle(adapter.WellKnownPRMPath(), adapter.PRMHandler())
 	http.Handle("/mcp", adapter.AuthMiddleware(handler))
 
 	slog.Info("Calculator MCP server listening", "url", "http://localhost:"+port)

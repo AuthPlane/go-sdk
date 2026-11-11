@@ -50,3 +50,7 @@ func main() {
 ```
 
 See the **[User Guide](docs/user-guide.md)** for configuration, token operations, DPoP, revocation, PRM, error handling, and advanced usage.
+
+## Other authorization servers
+
+Options on the verifier accept tokens from other standard servers, and `Client.Metadata` shows what a server supports. See [Using another authorization server](docs/user-guide.md#using-another-authorization-server).

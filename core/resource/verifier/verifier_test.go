@@ -27,7 +27,7 @@ const (
 	testKID      = "test-kid"
 )
 
-func setupES256Verifier(t *testing.T, opts ...verifier.Option) (*verifier.TokenVerifier, *ecdsa.PrivateKey) {
+func setupES256Verifier(t testing.TB, opts ...verifier.Option) (*verifier.TokenVerifier, *ecdsa.PrivateKey) {
 	t.Helper()
 	key, err := testutil.GenerateES256Key()
 	if err != nil {
@@ -79,7 +79,7 @@ func setupRS256Verifier(t *testing.T) (*verifier.TokenVerifier, *rsa.PrivateKey)
 	return v, key
 }
 
-func signStandardToken(t *testing.T, key *ecdsa.PrivateKey) string {
+func signStandardToken(t testing.TB, key *ecdsa.PrivateKey) string {
 	t.Helper()
 	token, err := testutil.SignTokenWithClaims(key, jose.ES256, testKID, testIssuer, testAudience, testSubject, testClientID, nil)
 	if err != nil {
@@ -399,8 +399,8 @@ func TestVerifyToken_RevocationCheckerError_FailClosed(t *testing.T) {
 	token := signStandardToken(t, key)
 
 	_, err := v.VerifyToken(context.Background(), token, nil)
-	if !errors.Is(err, verifier.ErrTokenRevoked) {
-		t.Errorf("err = %v, want ErrTokenRevoked", err)
+	if !errors.Is(err, verifier.ErrRevocationUnavailable) {
+		t.Errorf("err = %v, want ErrRevocationUnavailable", err)
 	}
 }
 
@@ -637,27 +637,9 @@ func TestVerifyToken_WrongAlgorithmKey(t *testing.T) {
 	}
 }
 
-func TestTokenVerifier_Algorithms(t *testing.T) {
-	v, _ := setupES256Verifier(t)
-	algs := v.Algorithms()
-	if len(algs) != 2 {
-		t.Fatalf("expected 2 default algorithms, got %d", len(algs))
-	}
-	found := map[string]bool{}
-	for _, a := range algs {
-		found[a] = true
-	}
-	if !found["ES256"] {
-		t.Error("expected ES256 in default algorithms")
-	}
-	if !found["RS256"] {
-		t.Error("expected RS256 in default algorithms")
-	}
-}
-
 // signDPoPBoundToken builds a DPoP-bound JWT access token for the given
 // signer's thumbprint and signs it with the supplied JWT signing key.
-func signDPoPBoundToken(t *testing.T, jwtKey *ecdsa.PrivateKey, jkt string) string {
+func signDPoPBoundToken(t testing.TB, jwtKey *ecdsa.PrivateKey, jkt string) string {
 	t.Helper()
 	claims := testutil.StandardClaims(testIssuer, testAudience, testSubject, testClientID)
 	claims["cnf"] = map[string]any{"jkt": jkt}
@@ -793,5 +775,64 @@ func TestTokenVerifier_InboundDPoPView_ReflectsConfig(t *testing.T) {
 	}
 	if len(view.AllowedAlgorithmStrings) != 1 || view.AllowedAlgorithmStrings[0] != "ES256" {
 		t.Errorf("view.AllowedAlgorithmStrings = %v, want [ES256]", view.AllowedAlgorithmStrings)
+	}
+}
+
+// entryRecorder keeps what VerifyToken hands a replay store.
+type entryRecorder struct{ entries []string }
+
+func (r *entryRecorder) CheckAndStore(jti string, _ time.Time) (bool, error) {
+	r.entries = append(r.entries, jti)
+	return true, nil
+}
+
+// The owner comes from the token, so new keys under one client and subject share a limit.
+func TestVerifyToken_ReplayEntryNamesTheSignedOwner_A84(t *testing.T) {
+	store := &entryRecorder{}
+	v, key := setupES256Verifier(t, verifier.WithInboundDPoP(verifier.InboundDPoPOptions{ReplayStore: store}))
+	const url = "https://api.example.com/resource"
+	send := func(sub string) (owner, jkt string) {
+		t.Helper()
+		signer, err := authplane.NewDPoPSigner(jose.ES256)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claims := testutil.StandardClaims(testIssuer, testAudience, sub, testClientID)
+		claims["cnf"] = map[string]any{"jkt": signer.Thumbprint()}
+		token, err := testutil.SignToken(claims, key, jose.ES256, testKID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := signer.GenerateProof("GET", url, &authplane.DPoPProofOptions{AccessToken: token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dpopCtx, err := verifier.NewDPoPContext("GET", url, []string{proof})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := v.VerifyToken(context.Background(), token, dpopCtx); err != nil {
+			t.Fatal(err)
+		}
+		parts := strings.Split(store.entries[len(store.entries)-1], ":")
+		if len(parts) != 3 {
+			t.Fatalf("entry = %q, want owner:thumbprint:hash", store.entries[len(store.entries)-1])
+		}
+		if parts[1] != signer.Thumbprint() {
+			t.Errorf("thumbprint segment = %q, want %q", parts[1], signer.Thumbprint())
+		}
+		return parts[0], parts[1]
+	}
+	first, firstKey := send("alice")
+	second, secondKey := send("alice")
+	other, _ := send("bob")
+	if firstKey == secondKey {
+		t.Fatal("test needs two keys")
+	}
+	if first != second {
+		t.Errorf("one client and subject has two owners: %q, %q", first, second)
+	}
+	if first == other {
+		t.Error("two subjects share an owner")
 	}
 }

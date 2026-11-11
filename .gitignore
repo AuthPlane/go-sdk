@@ -13,3 +13,6 @@ docs/superpowers/
 
 # Local pre-launch audit — embeds legacy-name strings; stays out of the tree.
 scripts/preflip-audit.sh
+
+# Test reports.
+reports/

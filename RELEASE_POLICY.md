@@ -7,13 +7,18 @@ This repository follows a common release policy used across all Authplane SDK an
 - Use Semantic Versioning: `MAJOR.MINOR.PATCH`.
 - Do not modify or overwrite published versions.
 - Every release must be tied to an immutable Git tag.
-- Breaking changes require a major version bump.
+- Breaking changes require a major version bump. Before 1.0.0 they may ship in a minor (SemVer 0.x), each with a migration note in the changelog.
 
 ## Changelog and Documentation
 
 - Keep `CHANGELOG.md` updated using Keep a Changelog format.
 - Maintain consumer-facing README installation and usage examples.
 - Ensure release notes align with changelog entries.
+
+## Deprecation
+
+- Before 1.0.0, an API may change in a minor release, with a changelog line and a migration note.
+- From 1.0.0, a deprecated API is marked with a `Deprecated:` comment and stays for at least one minor release before removal in the next major.
 
 ## Packaging and Metadata
 

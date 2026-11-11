@@ -55,8 +55,10 @@ func QuoteWWWAuthenticateParams(header string) string {
 	}
 	var b strings.Builder
 	b.WriteString(scheme)
+	sep := " "
 	for part := range strings.SplitSeq(rest, ", ") {
-		b.WriteString(" ")
+		b.WriteString(sep)
+		sep = ", "
 		key, val, hasEq := strings.Cut(part, "=")
 		if !hasEq || strings.HasPrefix(val, `"`) {
 			// No value or already quoted — leave as-is.

@@ -1,12 +1,15 @@
+// Package authplanehttp is net/http middleware for resource servers built on core: it checks
+// Bearer and DPoP tokens, answers with RFC 6750 and RFC 9449 challenges, and serves RFC 9728
+// metadata.
 package authplanehttp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/authplane/go-sdk/core/resource"
@@ -16,10 +19,6 @@ import (
 // Adapter provides HTTP middleware for token verification, scope enforcement,
 // and Protected Resource Metadata serving. It wraps a resource.Resource without
 // owning its lifecycle — the caller manages client.Close().
-//
-// Inbound DPoP policy (replay store, proof age, allowed algorithms, required
-// flag) is configured on the wrapped Resource via verifier.WithInboundDPoP;
-// the adapter does not own DPoP policy.
 type Adapter struct {
 	resource *resource.Resource
 	// resourceMetadataURL is the full URL advertised in the WWW-Authenticate
@@ -27,18 +26,55 @@ type Adapter struct {
 	// override from resource.WithResourceMetadataURL when the document is
 	// hosted elsewhere (typically by the authorization server).
 	resourceMetadataURL string
-	scopeHint           string // space-joined resource scopes advertised in the 401 scope param (RFC 6750 §3); empty when none configured
-	resourceOrigin      string // scheme + "://" + authority from the configured resource URI; precomputed for DPoP htu binding
+	scopeHint           string       // space-joined resource scopes advertised in the 401 scope param (RFC 6750 §3); empty when none configured
+	resourceOrigin      string       // scheme + "://" + authority from the configured resource URI; precomputed for DPoP htu binding
+	prmServer           http.Handler // answers the PRM path inside Middleware
+	logger              *slog.Logger // nil means slog's default at the time
 }
 
-// New creates an Adapter wrapping the given resource.Resource.
-func New(res *resource.Resource) *Adapter {
-	return &Adapter{
+// Option configures an Adapter.
+type Option func(*Adapter)
+
+// WithPRMHandler replaces the handler Middleware uses for the PRM path, for an
+// adapter that frames the document differently (CORS, caching). It must answer
+// every method itself.
+func WithPRMHandler(h http.Handler) Option {
+	return func(a *Adapter) {
+		a.prmServer = h
+	}
+}
+
+// WithLogger sends this adapter's logs to logger in place of slog's default.
+func WithLogger(logger *slog.Logger) Option {
+	return func(a *Adapter) {
+		a.logger = logger
+	}
+}
+
+func (a *Adapter) log() *slog.Logger {
+	if a.logger != nil {
+		return a.logger
+	}
+	return slog.Default()
+}
+
+// New creates an Adapter wrapping the given resource.Resource. The caller keeps ownership of
+// res, so this adapter has nothing to close.
+func New(res *resource.Resource, opts ...Option) (*Adapter, error) {
+	if res == nil {
+		return nil, errors.New("authplanehttp: res must not be nil")
+	}
+	a := &Adapter{
 		resource:            res,
 		resourceMetadataURL: res.ResourceMetadataURL(),
 		scopeHint:           strings.Join(res.PRMConfig().ScopesSupported, " "),
 		resourceOrigin:      resourceOrigin(res.URI()),
 	}
+	a.prmServer = res.PRMHandler()
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a, nil
 }
 
 // resourceOrigin returns "scheme://host[:port]" of the configured resource
@@ -59,17 +95,10 @@ func (a *Adapter) Resource() *resource.Resource {
 }
 
 // PRMHandler returns an HTTP handler that serves the Protected Resource Metadata
-// document as JSON per RFC 9728. Only GET is allowed; other methods return 405.
+// document as JSON per RFC 9728. GET and HEAD get the document, OPTIONS gets 204,
+// and any other method gets 405, each naming the allowed methods.
 func (a *Adapter) PRMHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "max-age=3600")
-		_, _ = w.Write(a.resource.PRMJSON())
-	})
+	return a.resource.PRMHandler()
 }
 
 // WellKnownPRMPath returns the RFC 9728 well-known path for this resource,
@@ -79,23 +108,12 @@ func (a *Adapter) WellKnownPRMPath() string {
 }
 
 // writeAuthError writes the HTTP error response for an auth failure using
-// resource.AuthErrorResponseWithMetadata, which generates RFC 6750 compliant
+// Resource.AuthErrorResponse, which generates RFC 6750 compliant
 // status, WWW-Authenticate header, and JSON error body, with
 // `resource_metadata="..."` (RFC 9728 §5.1) appended so clients can
 // auto-discover the authorization server from a 401.
-//
-// The parameter used to be appended here, which meant core could emit a
-// challenge this adapter would then have to repair; the emitter now lives in
-// one place and this adapter only supplies the URL.
-//
-// A 401 additionally carries `scope="..."` listing the resource's configured
-// scopes (RFC 6750 §3) when any are set: the MCP authorization spec says the
-// server SHOULD name the scopes to request on the first challenge, before the
-// client holds any token at all. A 403 is left alone — its scope param
-// already names the route's required scopes via resource.ScopeError, which is
-// the more specific answer.
 func (a *Adapter) writeAuthError(w http.ResponseWriter, err error) {
-	status, headers, body := resource.AuthErrorResponseWithMetadata(err, a.resourceMetadataURL)
+	status, headers, body := a.resource.AuthErrorResponse(err, resource.WithChallengeMetadata(a.resourceMetadataURL))
 	if status == http.StatusUnauthorized && a.scopeHint != "" {
 		headers["WWW-Authenticate"] = appendChallengeParam(headers["WWW-Authenticate"], "scope", a.scopeHint)
 	}
@@ -104,10 +122,13 @@ func (a *Adapter) writeAuthError(w http.ResponseWriter, err error) {
 	// the last reference to err: every middleware failure site funnels through
 	// here and the adapter exposes no error hook. Without this line a
 	// misconfigured aud, iss or kid rotation is undebuggable on the adapter path
-	// — the operator sees the generic sentence and nothing anywhere else. DEBUG
-	// because it is per-request and only useful while diagnosing; slog.Default()
-	// is the sink, so slog.SetDefault routes or silences it.
-	slog.Default().Debug("authplane: rejecting request", "err", err, "status", status)
+	// — the operator sees the generic sentence and nothing anywhere else. A refused token logs
+	// at Debug, since it is per request and only useful while diagnosing; an outage logs at Error.
+	if status >= http.StatusInternalServerError && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		a.log().Error("authplane: cannot verify tokens", "err", err, "status", status)
+	} else {
+		a.log().Debug("authplane: rejecting request", "err", err, "status", status)
+	}
 	for k, v := range headers {
 		w.Header().Set(k, v)
 	}
@@ -125,22 +146,8 @@ func appendChallengeParam(challenge, name, value string) string {
 	if strings.Contains(challenge, "=") {
 		sep = ", "
 	}
-	return challenge + sep + fmt.Sprintf(`%s="%s"`, name, sanitizeParamValue(value)) //nolint:gocritic // RFC 6750 §3 requires literal double-quotes
+	return challenge + sep + fmt.Sprintf(`%s="%s"`, name, resource.SanitizeChallengeValue(value)) //nolint:gocritic // RFC 6750 §3 requires literal double-quotes
 }
-
-// sanitizeParamValue makes a value safe to splice into a WWW-Authenticate
-// quoted-string (RFC 9110 §5.6.4): CR, LF, `"` and `\` are each replaced by a
-// space, and the result is trimmed. Substitution rather than deletion is what
-// keeps `a"b` two scope tokens instead of silently fusing it into one — none
-// of these octets is legal in a scope-token (RFC 6749 §3.3) or in the URI
-// derived for resource_metadata, so no valid value is altered.
-func sanitizeParamValue(v string) string {
-	return strings.TrimSpace(paramValueSanitizer.ReplaceAllString(v, " "))
-}
-
-// A run collapses to one space: `\"` is one offense, not two, and should not
-// widen the value by an extra space.
-var paramValueSanitizer = regexp.MustCompile(`[\r\n"\\]+`)
 
 // buildRequestURL reconstructs the absolute URL used as the request side of
 // the RFC 9449 §4.3 `htu` comparison. The scheme and authority come from the
@@ -153,10 +160,6 @@ var paramValueSanitizer = regexp.MustCompile(`[\r\n"\\]+`)
 // are dropped — RFC 9449 §4.3 #5 defines `htu` as the target URI without
 // query or fragment; outbound `normalizeHTU` (`core/authplane/dpop.go`)
 // drops them too, so the inbound and outbound sides of the binding agree.
-//
-// Operators must mount this middleware **before** any prefix-stripping
-// router (`http.StripPrefix`) so `r.URL.EscapedPath()` still reflects the
-// path the client signed.
 func (a *Adapter) buildRequestURL(r *http.Request) string {
 	return a.resourceOrigin + r.URL.EscapedPath()
 }
@@ -182,38 +185,23 @@ func extractToken(authHeader string) (token string, isDPoP bool, err error) {
 	}
 }
 
+// AuthMiddleware wraps next with Middleware, in the shape the MCP adapters use.
+func (a *Adapter) AuthMiddleware(next http.Handler) http.Handler {
+	return a.Middleware()(next)
+}
+
 // Middleware returns standard net/http middleware that validates Bearer and DPoP
 // access tokens. On success, VerifiedClaims and the raw token are injected into
 // the request context (accessible via ClaimsFromContext and TokenFromContext).
 // On failure, an RFC 6750 error response is written.
-//
-// The PRM discovery endpoint (RFC 9728) is automatically excluded from
-// authentication — it must be publicly accessible so clients can discover
-// the resource's scopes and authorization server.
 func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 	prmPath := a.resource.WellKnownPRMPath()
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Compare the raw request path (EscapedPath), not the decoded
-			// r.URL.Path: WellKnownPRMPath returns an escaped path, so a
-			// resource identifier carrying a percent-encoded octet (e.g.
-			// "%2F") yields a prmPath with that octet intact. Comparing the
-			// decoded path here would let "%2F" collapse to "/", the two
-			// sides would disagree, and the PRM discovery endpoint would stop
-			// being bypassed and return 401 — RFC 9728 §3.2 requires it
-			// publicly reachable. This mirrors validateHTU, which likewise
-			// compares EscapedPath for the DPoP htu binding.
-			//
-			// This is deliberately stricter than RFC 3986 §6.2.2.1: a
-			// percent-encoded *unreserved* octet (e.g. "m%63p" for "mcp")
-			// compares unequal here even though §6.2.2.1 would treat it as
-			// equivalent to the decoded form. We accept that asymmetry — a
-			// conformant client derives the well-known path from the resource
-			// identifier it was given, so it signs the same octets the
-			// operator configured; the exact-match check keeps the bypass
-			// surface minimal rather than admitting encoding variants.
+			// Compare the raw request path (EscapedPath), not the decoded r.URL.Path, because
+			// WellKnownPRMPath returns an escaped path.
 			if r.URL.EscapedPath() == prmPath {
-				next.ServeHTTP(w, r)
+				a.prmServer.ServeHTTP(w, r)
 				return
 			}
 
@@ -239,6 +227,7 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 					a.writeAuthError(w, dpopErr)
 					return
 				}
+				dpopCtx.SchemeDPoP = true
 				verifyOpts = append(verifyOpts, resource.WithDPoP(dpopCtx))
 			}
 			claims, err := a.resource.VerifyToken(r.Context(), token, verifyOpts...)
@@ -257,13 +246,6 @@ func (a *Adapter) Middleware() func(http.Handler) http.Handler {
 // for all required scopes. Returns 403 with RFC 6750 WWW-Authenticate header
 // (including scope= parameter) if any scope is missing. Returns 401 if no claims
 // are in context (i.e., Middleware was not applied upstream).
-//
-// On failure the `scope="..."` challenge parameter names every missing scope
-// (not just the first), so a client can step up in one round trip. The fuller
-// diagnostic produced by a direct claims.RequireScopes call does not reach the
-// caller — the JSON body carries a fixed error_description, not the message.
-// The adapter logs it to slog.Default() at DEBUG instead, since it owns the
-// error here and hands it back to nobody.
 func (a *Adapter) RequireScopes(scopes ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

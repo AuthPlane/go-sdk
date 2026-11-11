@@ -2,8 +2,9 @@ package httputil
 
 import (
 	"net/http"
-	"regexp"
 	"strings"
+
+	"github.com/authplane/go-sdk/core/resource"
 )
 
 // WWWAuthenticateScopeHint wraps an http.ResponseWriter to append
@@ -12,17 +13,6 @@ import (
 // request on the first challenge; the MCP go-sdk's auth.RequireBearerToken
 // writes only `Bearer resource_metadata=...` and offers no hook for further
 // params, so the header is amended here before the status line goes out.
-//
-// Scope is the space-separated list to advertise; when empty the writer is a
-// pass-through. Only a 401 is amended — a 403 names route-specific scopes.
-//
-// The wrapper sits in front of the whole handler chain, so it also sees 401s
-// written by the wrapped application. Those are left alone: an amended
-// challenge is only correct for one this package knows the shape of, so the
-// header must already be present and carry the Bearer scheme.
-//
-// http.Flusher is forwarded so that SSE streaming used by the MCP streamable
-// transport continues to work correctly.
 type WWWAuthenticateScopeHint struct {
 	http.ResponseWriter
 	Scope string
@@ -42,7 +32,7 @@ func (w *WWWAuthenticateScopeHint) WriteHeader(code int) {
 			if strings.Contains(v, "=") {
 				sep = ", "
 			}
-			h.Set("WWW-Authenticate", v+sep+`scope="`+sanitizeParamValue(w.Scope)+`"`)
+			h.Set("WWW-Authenticate", v+sep+`scope="`+resource.SanitizeChallengeValue(w.Scope)+`"`)
 		}
 	}
 	w.ResponseWriter.WriteHeader(code)
@@ -57,20 +47,6 @@ func isBearerChallenge(v string) bool {
 	scheme, _, _ := strings.Cut(v, " ")
 	return strings.EqualFold(scheme, "Bearer")
 }
-
-// sanitizeParamValue makes a value safe to splice into a WWW-Authenticate
-// quoted-string (RFC 9110 §5.6.4): CR, LF, `"` and `\` are each replaced by a
-// space, and the result is trimmed. Substitution rather than deletion is what
-// keeps `a"b` two scope tokens instead of silently fusing it into one — none
-// of these octets is legal in a scope-token (RFC 6749 §3.3) or in the URI
-// derived for resource_metadata, so no valid value is altered.
-func sanitizeParamValue(v string) string {
-	return strings.TrimSpace(paramValueSanitizer.ReplaceAllString(v, " "))
-}
-
-// A run collapses to one space: `\"` is one offense, not two, and should not
-// widen the value by an extra space.
-var paramValueSanitizer = regexp.MustCompile(`[\r\n"\\]+`)
 
 // Flush forwards to the underlying ResponseWriter's Flusher if available.
 // Required for SSE streaming used by the MCP streamable HTTP transport.
