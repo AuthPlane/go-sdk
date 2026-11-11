@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.27.3
 
 require (
-	github.com/authplane/go-sdk/core v0.0.0
+	github.com/authplane/go-sdk/core v0.5.0
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
@@ -20,5 +20,3 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 )
-
-replace github.com/authplane/go-sdk/core => ../core
