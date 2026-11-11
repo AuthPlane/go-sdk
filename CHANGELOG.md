@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### Added
 - `core/authplane`: `OAuthError` gives a server error's code, description, status and retry delay; `ErrSSRFBlocked`, `ErrDNSResolution`, `ErrNoIntrospectionEndpoint`, `ErrMetadataUnavailable`, `ErrCredentialsNotConfigured` and `ErrClientClosed` are exported.
 - `core/authplane`: `FetchSettings` gains `Proxy`, `UserAgent` and `Observe`; `WithLogger`, `WithoutTokenVerification` and `NewClientAndResource` are new.
